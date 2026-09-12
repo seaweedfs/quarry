@@ -22,4 +22,5 @@
 pub mod cost;
 pub mod derived;
 pub mod place;
+pub mod registry;
 pub mod snapshot;

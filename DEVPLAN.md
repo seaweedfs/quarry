@@ -143,14 +143,27 @@ and a policy mismatch is refused.
 
 ---
 
-## Phase 5 — Registry `[ ]`
+## Phase 5 — Registry `[x]`
 
-- [ ] `Registry`: register, lookup candidates by table, drop
-- [ ] Candidate selection: cheapest admissible derived state wins
-- [ ] Eviction by bytes under a budget, least-valuable first
+- [x] `Registry`: register, remove, get, byte total
+- [x] `candidates` / `best`: cheapest admissible derived state wins
+- [x] Total, deterministic ordering — cost, then fewest extra files, then id
+- [x] `evict_to(max_bytes)`, least valuable first
+- [x] Use counting, to drive retirement later
 
-**Done when** a registry with several candidates picks the cheapest admissible
-one and never an inadmissible one.
+**Design constraint.** The registry holds no per-kind logic; everything it
+needs arrives through `Kind`. It also never second-guesses the rule — an
+inadmissible piece is omitted rather than ranked.
+
+Eviction currently ranks by uses per byte. The design calls for expected
+*remaining* value, which cannot be computed before realized benefit is
+measured in phase 10; the signature will not change when it is. Eviction is
+unconditionally safe because derived state is disposable, so the worst outcome
+is a slower query.
+
+**Done when** the cheapest admissible candidate wins, an inadmissible one is
+never returned, ordering is stable across ties, and eviction keeps the
+high-value entry.
 
 ---
 
