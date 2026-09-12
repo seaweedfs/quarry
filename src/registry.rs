@@ -72,6 +72,22 @@ impl Registry {
         }
     }
 
+    /// Every registered piece and the rule's verdict on it, admitted or not.
+    ///
+    /// Ordered by id so the result is stable, which matters because this is
+    /// what `EXPLAIN` reports: the most useful line of an explain output is
+    /// often *why* a piece of derived state was not used.
+    pub fn assess<'a>(
+        &'a self,
+        query: &Query,
+        graph: &SnapshotGraph,
+    ) -> Vec<(&'a Derived, Decision)> {
+        self.entries
+            .values()
+            .map(|derived| (derived, derived.may_serve(query, graph)))
+            .collect()
+    }
+
     /// Every piece that may serve `query`, cheapest first.
     ///
     /// Inadmissible pieces are omitted entirely: the rule
@@ -85,15 +101,13 @@ impl Registry {
         prices: &PriceTable,
     ) -> Vec<Candidate<'a>> {
         let mut found: Vec<Candidate<'a>> = self
-            .entries
-            .values()
-            .filter_map(|derived| {
-                let decision = derived.may_serve(query, graph);
-                decision.is_admitted().then(|| Candidate {
-                    derived,
-                    decision,
-                    cost: derived.cost(prices),
-                })
+            .assess(query, graph)
+            .into_iter()
+            .filter(|(_, decision)| decision.is_admitted())
+            .map(|(derived, decision)| Candidate {
+                derived,
+                decision,
+                cost: derived.cost(prices),
             })
             .collect();
 
@@ -361,5 +375,47 @@ mod tests {
         let mut r = Registry::new();
         r.record_use(&DerivedId("nope".into()));
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn assess_reports_refusals_too_so_explain_can_say_why() {
+        let mut r = Registry::new();
+        r.register(entry("usable", 1.0, 1, None));
+        r.register(entry("wrong-shape", 1.0, 1, Some(9)));
+
+        let verdicts = r.assess(&query(), &graph());
+        assert_eq!(
+            verdicts.len(),
+            2,
+            "refused entries are reported, not hidden"
+        );
+
+        let refused: Vec<_> = verdicts
+            .iter()
+            .filter(|(_, d)| !d.is_admitted())
+            .map(|(d, _)| d.id.clone())
+            .collect();
+        assert_eq!(refused, vec![DerivedId("wrong-shape".into())]);
+    }
+
+    #[test]
+    fn assess_is_ordered_by_id() {
+        let mut r = Registry::new();
+        for id in ["c", "a", "b"] {
+            r.register(entry(id, 1.0, 1, None));
+        }
+        let ids: Vec<_> = r
+            .assess(&query(), &graph())
+            .into_iter()
+            .map(|(d, _)| d.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                DerivedId("a".into()),
+                DerivedId("b".into()),
+                DerivedId("c".into())
+            ]
+        );
     }
 }
