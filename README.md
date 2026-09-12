@@ -16,19 +16,20 @@ Everything else is derived, priced, and disposable.
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done, and phase 9 is under way. The
 decision core is 90 tests with **no dependencies**; DataFusion sits behind
-`--features engine` and adds 20 tests, including SQL over real Parquet.
+`--features engine` and adds 29 more, including SQL over real Parquet.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine        # 110 tests, incl. SQL over real Parquet
+cargo test --features engine        # 119 tests, incl. SQL over real Parquet
 cargo run --example explain         # no dependencies; walks a table over 4 commits
 ```
 
-`SELECT * FROM events WHERE tenant_id = 1` reads only the files an index says
-can match — and still returns every row when that index is stale, is refused
-outright when it was built on a rolled-back branch, and never reads a file that
-compaction removed.
+`SELECT * FROM events WHERE tenant_id = 1` reads only the Parquet objects an
+index says can match — measurably fewer bytes off the store — and still returns
+every row when that index is stale, is refused outright when it was built on a
+rolled-back branch, and never opens a file that compaction removed. A byte
+budget aborts the scan rather than quietly returning fewer rows.
 
 The design is in [`../core-design.md`](../core-design.md); the longer documents
 beside it are rationale and detail. Two corrections to the design were found by
@@ -52,6 +53,7 @@ src/
   engine/             behind --features engine
     table.rs          a DataFusion TableProvider planned by the rule
     materialized.rs   a Kind holding Arrow batches, defined outside the core
+    store.rs          an object store that counts bytes and enforces budgets
 examples/
   explain.rs    end-to-end walkthrough
 tests/

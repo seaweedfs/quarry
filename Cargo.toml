@@ -11,7 +11,14 @@ description = "Self-optimizing query engine over Iceberg tables on object storag
 # logic that must be correct is testable without a query engine. Everything
 # that needs DataFusion lives behind this flag.
 default = []
-engine = ["dep:datafusion", "dep:async-trait", "dep:tokio"]
+engine = [
+    "dep:datafusion",
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:object_store",
+    "dep:futures",
+    "dep:url",
+]
 
 [dependencies]
 async-trait = { version = "0.1.92", optional = true }
@@ -21,6 +28,13 @@ datafusion = { version = "48.0.1", optional = true }
 # Only the engine tests need a runtime, but a dev-dependency would be built
 # even for the default feature set and slow the core test loop down.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"], optional = true }
+# Needed to implement object_store::ObjectStore for the metered wrapper.
+# Pinned to the version DataFusion resolves, so there is one store trait in
+# the build rather than two incompatible ones.
+object_store = { version = "0.12.5", optional = true }
+futures = { version = "0.3", optional = true }
+# Only to name the object store URL when registering it with a session.
+url = { version = "2", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

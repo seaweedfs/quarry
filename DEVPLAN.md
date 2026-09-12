@@ -303,6 +303,7 @@ behind `--features engine`.
 - [x] End-to-end SQL tests: pruning, staleness, rollback, compaction, policy
 - [x] `MaterializedResult`: a substituting kind holding real Arrow batches
 - [x] Parquet objects read through `object_store`, selected by the rule
+- [x] `MeteredStore`: counts bytes fetched, enforces a budget against real I/O
 - [ ] Metadata and block caches
 - [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
 
@@ -364,6 +365,30 @@ reaches for it at all.
 Substitution over a file-backed table unions a memory source of stored rows
 with the file source, which is sound only because the rule already refused any
 derived state whose rows are not table-shaped.
+
+**Two claims stopped being claims.** `MeteredStore` wraps any `ObjectStore`,
+counts what it fetches, and refuses reads once a budget is spent:
+
+```text
+pruning saves I/O    the same query, with and without an index, against a
+                     counting store: fewer bytes AND fewer requests, same
+                     answer. Previously an argument; now a number.
+
+budgets are real     a 64-byte ceiling aborts a Parquet scan with an error
+                     naming the breach. It FAILS rather than returning
+                     fewer rows, because a silently truncated answer looks
+                     complete, which is the worse failure.
+```
+
+Counting happens in `get_opts` only. Every other read path (`get`,
+`get_range`, `get_ranges`, `head`) reaches the store through it by default, so
+one counted method covers all of them, and `GetResult::range` gives the byte
+count without consuming the payload stream.
+
+Reads are priced hot and `Far` by default, which is what remote object storage
+is. A colocated store says otherwise via `with_locality`, and then the same
+money budget buys far more bytes — tested, and the first place `Distance` pays
+for itself outside a unit test.
 
 ---
 

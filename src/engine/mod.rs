@@ -18,7 +18,9 @@
 //! them changed to accommodate it.
 
 mod materialized;
+mod store;
 mod table;
 
 pub use materialized::{MaterializedResult, hash_plan};
+pub use store::{BudgetExceeded, MeteredStore, StoreStats};
 pub use table::{QuarryTable, ScanReport, hash_scalar};

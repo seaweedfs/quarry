@@ -21,9 +21,12 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use object_store::local::LocalFileSystem;
 
+use quarry::budget::Budget;
+use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{QuarryTable, hash_scalar};
+use quarry::engine::{MeteredStore, QuarryTable, hash_scalar};
 use quarry::kinds::Index;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -86,6 +89,23 @@ async fn run(table: Arc<QuarryTable>, sql: &str) -> Vec<RecordBatch> {
         .collect()
         .await
         .expect("execute")
+}
+
+/// Run against a store that counts what it fetches, returning the query's
+/// result alongside it so the I/O can be asserted on.
+async fn run_metered(
+    table: Arc<QuarryTable>,
+    sql: &str,
+    store: Arc<MeteredStore>,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    let ctx = SessionContext::new();
+    ctx.register_object_store(&url::Url::parse("file://").expect("url"), store);
+    ctx.register_table("events", table).expect("register");
+    ctx.sql(sql).await?.collect().await
+}
+
+fn metered_local() -> Arc<MeteredStore> {
+    Arc::new(MeteredStore::new(Arc::new(LocalFileSystem::new())))
 }
 
 fn total_rows(batches: &[RecordBatch]) -> usize {
@@ -289,4 +309,87 @@ async fn a_stale_index_reads_the_parquet_added_since() {
     let report = table.last_scan().expect("scan");
     assert_eq!(report.also_scanned, BTreeSet::from([c.clone()]));
     assert_eq!(report.files_read, BTreeSet::from([a, c]));
+}
+
+#[tokio::test]
+async fn pruning_measurably_reduces_bytes_fetched() {
+    // The same query, with and without an index, against a store that counts.
+    let dir = scratch("parquet_metered");
+    let (unindexed, [a, b, c]) = parquet_table(&dir, 810);
+
+    let full = metered_local();
+    let rows = run_metered(
+        Arc::new(unindexed),
+        "SELECT * FROM events WHERE tenant_id = 1",
+        Arc::clone(&full),
+    )
+    .await
+    .expect("full scan");
+    assert_eq!(total_rows(&rows), 3);
+
+    let (indexed, _) = parquet_table(&dir, 810);
+    let mut registry = Registry::new();
+    registry.register(tenant_index(810, &[(1, &a), (1, &c), (2, &b)]));
+
+    let pruned = metered_local();
+    let rows = run_metered(
+        Arc::new(indexed.with_registry(registry)),
+        "SELECT * FROM events WHERE tenant_id = 1",
+        Arc::clone(&pruned),
+    )
+    .await
+    .expect("pruned scan");
+    assert_eq!(total_rows(&rows), 3, "identical answer");
+
+    assert!(
+        pruned.stats().bytes_fetched < full.stats().bytes_fetched,
+        "pruned fetched {} bytes, full scan fetched {}",
+        pruned.stats().bytes_fetched,
+        full.stats().bytes_fetched
+    );
+    assert!(
+        pruned.stats().requests < full.stats().requests,
+        "pruning should mean fewer requests too: {} vs {}",
+        pruned.stats().requests,
+        full.stats().requests
+    );
+}
+
+#[tokio::test]
+async fn a_byte_budget_aborts_a_real_parquet_scan() {
+    let dir = scratch("parquet_budget");
+    let (table, _) = parquet_table(&dir, 810);
+
+    // Small enough that the footer reads alone will cross it.
+    let store = Arc::new(
+        MeteredStore::new(Arc::new(LocalFileSystem::new()))
+            .with_budget(Budget::bytes(64), PriceTable::default()),
+    );
+
+    let result = run_metered(Arc::new(table), "SELECT * FROM events", Arc::clone(&store)).await;
+
+    let error = result.expect_err("the query must fail, not return fewer rows");
+    assert!(
+        error.to_string().contains("budget exceeded"),
+        "unhelpful error: {error}"
+    );
+    assert!(!store.outcome().is_complete());
+}
+
+#[tokio::test]
+async fn a_generous_budget_lets_the_query_finish() {
+    let dir = scratch("parquet_budget_ok");
+    let (table, _) = parquet_table(&dir, 810);
+
+    let store = Arc::new(
+        MeteredStore::new(Arc::new(LocalFileSystem::new()))
+            .with_budget(Budget::bytes(10_000_000), PriceTable::default()),
+    );
+
+    let rows = run_metered(Arc::new(table), "SELECT * FROM events", Arc::clone(&store))
+        .await
+        .expect("within budget");
+    assert_eq!(total_rows(&rows), 4);
+    assert!(store.outcome().is_complete());
+    assert!(store.stats().bytes_fetched > 0, "something was read");
 }
