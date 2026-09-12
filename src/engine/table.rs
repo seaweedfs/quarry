@@ -17,7 +17,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 
 use crate::cost::PriceTable;
-use crate::derived::{Decision, FieldId, PolicyFingerprint, Predicate, Query, Rewrite};
+use crate::derived::{Decision, DerivedId, FieldId, PolicyFingerprint, Predicate, Query, Rewrite};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
 
@@ -46,6 +46,14 @@ pub struct ScanReport {
     pub used: Option<String>,
     /// Files read because they were added after that derived state was built.
     pub also_scanned: BTreeSet<FileId>,
+    /// Whether stored rows were read in place of the table.
+    pub substituted: bool,
+    /// Identity of the plan that was looked up.
+    ///
+    /// A caller wanting to *store* this query's result needs the same key the
+    /// table will look it up under, so it is reported rather than left to be
+    /// recomputed.
+    pub plan_hash: u64,
 }
 
 /// A table whose data files are in memory, planned through the rule.
@@ -65,6 +73,13 @@ pub struct QuarryTable {
     field_ids: BTreeMap<String, FieldId>,
     policy: PolicyFingerprint,
     prices: PriceTable,
+    /// Stored rows for substituting derived state, keyed by its id.
+    ///
+    /// Kept beside the registry rather than inside the kind so that no
+    /// downcasting is needed: the registry decides *whether* derived state may
+    /// be used, and the engine knows *how* to read it. Neither has to know the
+    /// other's types.
+    materialized: BTreeMap<DerivedId, Vec<RecordBatch>>,
     last_scan: Mutex<Option<ScanReport>>,
 }
 
@@ -91,6 +106,7 @@ impl QuarryTable {
             field_ids,
             policy: PolicyFingerprint(0),
             prices: PriceTable::default(),
+            materialized: BTreeMap::new(),
             last_scan: Mutex::new(None),
         }
     }
@@ -98,6 +114,15 @@ impl QuarryTable {
     /// Add a data file's contents.
     pub fn with_file(mut self, file: FileId, batches: Vec<RecordBatch>) -> Self {
         self.files.insert(file, batches);
+        self
+    }
+
+    /// Supply the stored rows for a piece of substituting derived state.
+    ///
+    /// The id must match one registered in the [`Registry`]; the rule decides
+    /// whether it may be used, and these are the rows read when it is.
+    pub fn with_materialized(mut self, id: DerivedId, batches: Vec<RecordBatch>) -> Self {
+        self.materialized.insert(id, batches);
         self
     }
 
@@ -180,46 +205,67 @@ impl QuarryTable {
             .map(|s| s.files().keys().cloned().collect())
             .unwrap_or_default();
 
+        let plan_hash = self.plan_hash(projection, filters);
         let query = Query {
             table: self.table.clone(),
             snapshot: self.snapshot,
             policy: self.policy,
-            plan_hash: self.plan_hash(projection, filters),
+            plan_hash,
             projected: self.projected_fields(projection),
             predicates: self.predicates(filters),
         };
 
-        // Only pruning rewrites can be executed today; see the module docs.
-        let pruning = self
+        // The cheapest candidate the engine can actually execute. A
+        // substituting one is executable only if its rows were supplied to
+        // `with_materialized`; otherwise it is skipped, which is the safe
+        // direction — the answer is right, merely slower.
+        let usable = self
             .registry
             .candidates(&query, &self.graph, &self.prices)
             .into_iter()
             .find_map(|candidate| {
-                let id = candidate.derived.id.0.clone();
-                match candidate.decision {
-                    Decision::Use(Rewrite::Prune { files }) => Some((id, files, BTreeSet::new())),
-                    Decision::UseWith {
-                        rewrite: Rewrite::Prune { files },
-                        also_scan,
-                    } => Some((id, files, also_scan)),
-                    _ => None,
+                let used = candidate.derived.id.0.clone();
+                let (rewrite, also_scanned) = match candidate.decision {
+                    Decision::Use(rewrite) => (rewrite, BTreeSet::new()),
+                    Decision::UseWith { rewrite, also_scan } => (rewrite, also_scan),
+                    Decision::Reject(_) => return None,
+                };
+                match rewrite {
+                    Rewrite::Prune { files } => Some(ScanReport {
+                        files_read: files,
+                        used: Some(used),
+                        also_scanned,
+                        substituted: false,
+                        plan_hash,
+                    }),
+                    Rewrite::Substitute { .. }
+                        if self.materialized.contains_key(&candidate.derived.id) =>
+                    {
+                        Some(ScanReport {
+                            files_read: BTreeSet::new(),
+                            used: Some(used),
+                            also_scanned,
+                            substituted: true,
+                            plan_hash,
+                        })
+                    }
+                    Rewrite::Substitute { .. } => None,
                 }
             });
 
-        match pruning {
+        match usable {
             None => ScanReport {
                 files_read: live,
                 used: None,
                 also_scanned: BTreeSet::new(),
+                substituted: false,
+                plan_hash,
             },
-            Some((used, pruned, also_scan)) => {
-                let mut files_read = pruned;
-                files_read.extend(also_scan.iter().cloned());
-                ScanReport {
-                    files_read,
-                    used: Some(used),
-                    also_scanned: also_scan,
-                }
+            Some(mut report) => {
+                report
+                    .files_read
+                    .extend(report.also_scanned.iter().cloned());
+                report
             }
         }
     }
@@ -302,11 +348,26 @@ impl TableProvider for QuarryTable {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let report = self.plan_files(projection, filters);
 
-        let partitions: Vec<Vec<RecordBatch>> = report
-            .files_read
-            .iter()
-            .filter_map(|file| self.files.get(file).cloned())
-            .collect();
+        // Stored rows first when substituting, then the files added since.
+        // Concatenating is only valid because the rule refused any derived
+        // state whose rows are not table-shaped.
+        let mut partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        if report.substituted {
+            if let Some(batches) = report
+                .used
+                .as_deref()
+                .map(|id| DerivedId(id.to_owned()))
+                .and_then(|id| self.materialized.get(&id))
+            {
+                partitions.push(batches.clone());
+            }
+        }
+        partitions.extend(
+            report
+                .files_read
+                .iter()
+                .filter_map(|file| self.files.get(file).cloned()),
+        );
 
         *self.last_scan.lock().expect("scan report lock") = Some(report);
 

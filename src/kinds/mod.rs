@@ -22,6 +22,6 @@ pub use result_cache::ResultCache;
 /// Derived state lives on storage the engine owns and keeps warm, so it is
 /// priced hot and local. If that ever stops being true — derived state spilled
 /// to a remote tier, say — this is the one place that changes.
-pub(crate) fn price_local(prices: &PriceTable, bytes: u64) -> Cost {
+pub fn price_local(prices: &PriceTable, bytes: u64) -> Cost {
     prices.price(bytes, Tier::Hot, Distance::Local, 0.0)
 }

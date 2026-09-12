@@ -15,13 +15,13 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done, and phase 9 is under way. The
-decision core is 89 tests with **no dependencies**; DataFusion sits behind
-`--features engine` and adds 10 end-to-end SQL tests.
+decision core is 90 tests with **no dependencies**; DataFusion sits behind
+`--features engine` and adds 14 end-to-end SQL tests.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine        # 99 tests, including SQL through DataFusion
+cargo test --features engine        # 104 tests, including SQL through DataFusion
 cargo run --example explain         # no dependencies; walks a table over 4 commits
 ```
 
@@ -51,6 +51,7 @@ src/
     index.rs          equality on one field, prunes files (pruning)
   engine/             behind --features engine
     table.rs          a DataFusion TableProvider planned by the rule
+    materialized.rs   a Kind holding Arrow batches, defined outside the core
 examples/
   explain.rs    end-to-end walkthrough
 tests/

@@ -9,14 +9,16 @@
 //! Behind the `engine` feature, so `cargo test` stays fast and the core stays
 //! honest about having no dependencies.
 //!
-//! # What is deliberately not here yet
+//! # A kind defined outside the core
 //!
-//! Only *pruning* rewrites reach the physical plan. A substituting candidate
-//! is skipped, because the bytes it would substitute are not stored anywhere
-//! the engine can read from yet — the [`ResultCache`](crate::kinds::ResultCache)
-//! kind records that a result exists and how big it is, not the result itself.
-//! Skipping is the safe direction: the answer is right, just slower.
+//! [`MaterializedResult`] lives here rather than in
+//! [`kinds`](crate::kinds) because it holds Arrow `RecordBatch`es. It is the
+//! test of the claim that adding a kind is a file rather than a refactor:
+//! nothing in `derived`, `registry`, or `explain` knows it exists, and none of
+//! them changed to accommodate it.
 
+mod materialized;
 mod table;
 
+pub use materialized::{MaterializedResult, hash_plan};
 pub use table::{QuarryTable, ScanReport, hash_scalar};

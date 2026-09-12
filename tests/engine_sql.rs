@@ -19,8 +19,8 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{QuarryTable, hash_scalar};
-use quarry::kinds::Index;
+use quarry::engine::{MaterializedResult, QuarryTable, hash_scalar};
+use quarry::kinds::{Index, ResultCache};
 use quarry::registry::Registry;
 use quarry::snapshot::{DeleteState, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 
@@ -382,6 +382,198 @@ async fn aggregation_over_a_pruned_scan_is_correct() {
     assert_eq!(
         table.last_scan().expect("scan").files_read,
         BTreeSet::from([file("a"), file("c")])
+    );
+}
+
+/// A materialised answer to `SELECT * FROM events WHERE tenant_id = 1`.
+///
+/// The plan hash has to match the one the table computes, so it is read back
+/// from a scan rather than guessed.
+async fn plan_hash_of(sql: &str, table: Arc<QuarryTable>) -> u64 {
+    run(Arc::clone(&table), sql).await;
+    table.last_scan().expect("scan").plan_hash
+}
+
+#[tokio::test]
+async fn a_materialised_result_is_read_instead_of_the_table() {
+    let graph = flat_graph(&["a", "b", "c"], 810);
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    // Learn the plan hash the table will look up.
+    let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(810)));
+    let hash = plan_hash_of(sql, probe).await;
+
+    let stored = vec![batch(&[(1, "cached-1"), (1, "cached-2"), (1, "cached-3")])];
+    let id = DerivedId("answer".into());
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        id.clone(),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        128,
+        Box::new(MaterializedResult::rows_of(hash, stored.clone())),
+    ));
+
+    let table = Arc::new(
+        table_with_three_files(graph, SnapshotId(810))
+            .with_registry(registry)
+            .with_materialized(id, stored),
+    );
+
+    let rows = run(Arc::clone(&table), sql).await;
+    assert_eq!(total_rows(&rows), 3);
+
+    let report = table.last_scan().expect("scan");
+    assert!(report.substituted, "the stored rows should have been read");
+    assert!(
+        report.files_read.is_empty(),
+        "no data file should be touched, read {:?}",
+        report.files_read
+    );
+}
+
+#[tokio::test]
+async fn a_stale_materialised_result_is_read_with_the_files_added_since() {
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let graph = SnapshotGraph::new()
+        .with(
+            Snapshot::root(SnapshotId(810))
+                .with_clean_file(file("a"))
+                .with_clean_file(file("b")),
+        )
+        .with(
+            Snapshot::child_of(SnapshotId(811), SnapshotId(810))
+                .with_clean_file(file("a"))
+                .with_clean_file(file("b"))
+                .with_clean_file(file("c")),
+        );
+
+    let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(811)));
+    let hash = plan_hash_of(sql, probe).await;
+
+    // Stored at 810: the two rows of tenant 1 that existed in file "a".
+    let stored = vec![batch(&[(1, "a1"), (1, "a2")])];
+    let id = DerivedId("answer".into());
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        id.clone(),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        128,
+        Box::new(MaterializedResult::rows_of(hash, stored.clone())),
+    ));
+
+    let table = Arc::new(
+        table_with_three_files(graph, SnapshotId(811))
+            .with_registry(registry)
+            .with_materialized(id, stored),
+    );
+
+    let rows = run(Arc::clone(&table), sql).await;
+    assert_eq!(
+        total_rows(&rows),
+        3,
+        "two stored rows plus the one in the file added since"
+    );
+
+    let report = table.last_scan().expect("scan");
+    assert!(report.substituted);
+    assert_eq!(report.also_scanned, BTreeSet::from([file("c")]));
+}
+
+#[tokio::test]
+async fn an_aggregated_result_is_refused_once_a_file_is_added() {
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let graph = SnapshotGraph::new()
+        .with(
+            Snapshot::root(SnapshotId(810))
+                .with_clean_file(file("a"))
+                .with_clean_file(file("b")),
+        )
+        .with(
+            Snapshot::child_of(SnapshotId(811), SnapshotId(810))
+                .with_clean_file(file("a"))
+                .with_clean_file(file("b"))
+                .with_clean_file(file("c")),
+        );
+
+    let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(811)));
+    let hash = plan_hash_of(sql, probe).await;
+
+    let stored = vec![batch(&[(1, "aggregated")])];
+    let id = DerivedId("cube".into());
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        id.clone(),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        16,
+        // The same rows, declared aggregated rather than table-shaped.
+        Box::new(MaterializedResult::aggregate_of(hash, stored.clone())),
+    ));
+
+    let table = Arc::new(
+        table_with_three_files(graph, SnapshotId(811))
+            .with_registry(registry)
+            .with_materialized(id, stored),
+    );
+
+    let rows = run(Arc::clone(&table), sql).await;
+    assert_eq!(
+        total_rows(&rows),
+        3,
+        "a full scan, not the stored row plus new files"
+    );
+
+    let report = table.last_scan().expect("scan");
+    assert_eq!(
+        report.used, None,
+        "an aggregate cannot be concatenated with raw rows"
+    );
+    assert!(!report.substituted);
+}
+
+#[tokio::test]
+async fn a_substituting_candidate_without_stored_rows_is_skipped() {
+    // The registry knows a result exists; the engine has no bytes for it.
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let graph = flat_graph(&["a", "b", "c"], 810);
+
+    let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(810)));
+    let hash = plan_hash_of(sql, probe).await;
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        DerivedId("recorded-only".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        1,
+        Box::new(ResultCache::rows_of(hash, 3, 1)),
+    ));
+
+    let table = Arc::new(table_with_three_files(graph, SnapshotId(810)).with_registry(registry));
+
+    let rows = run(Arc::clone(&table), sql).await;
+    assert_eq!(total_rows(&rows), 3);
+    assert_eq!(
+        table.last_scan().expect("scan").used,
+        None,
+        "skipping is the safe direction: right answer, merely slower"
     );
 }
 

@@ -301,7 +301,7 @@ behind `--features engine`.
 - [x] DataFusion `TableProvider` whose `scan` is planned by the rule
 - [x] DataFusion `Expr` → `Predicate` translation, operand order normalised
 - [x] End-to-end SQL tests: pruning, staleness, rollback, compaction, policy
-- [ ] Materialise substituting rewrites (needs stored bytes, see below)
+- [x] `MaterializedResult`: a substituting kind holding real Arrow batches
 - [ ] `object_store` for reads; metadata and block caches
 - [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
 
@@ -324,11 +324,21 @@ Kind: Send + Sync   a registry is shared across planning and execution
                     trait keeps a lock off the planning path.
 ```
 
-**Substituting rewrites are skipped for now.** `ResultCache` records that a
-result exists and how big it is, not the result itself, so there are no bytes
-for the engine to read. The engine takes the cheapest *pruning* candidate and
-ignores substituting ones — the safe direction, since the answer is right and
-merely slower. Storing batches is the next step.
+**The extension point holds.** `MaterializedResult` is a `Kind` defined in
+`src/engine/`, *outside* the core, because it holds Arrow batches. Nothing in
+`derived`, `registry`, or `explain` knows it exists and none of them changed to
+accommodate it. That was the design's central claim about adding a kind, and it
+survived contact with a real dependency.
+
+Stored rows are held by the table keyed on `DerivedId`, not inside the kind, so
+no downcasting is needed: the registry decides *whether* derived state may be
+used and the engine knows *how* to read it. Neither has to know the other's
+types.
+
+A substituting candidate whose rows were never supplied is skipped rather than
+failing — the safe direction, since the answer is right and merely slower.
+`ResultCache` remains useful for exactly that: recording that a result exists
+and what it would cost, which is enough to plan and explain with.
 
 **The compaction test earns its place.** Without the prune-set filtering added
 in the phase-4 follow-up, `SELECT * WHERE tenant_id = 1` returns two rows
