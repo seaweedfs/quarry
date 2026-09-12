@@ -37,7 +37,7 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// A cost of nothing: the identity for [`Cost::add`].
+    /// A cost of nothing: the identity for [`Add`](std::ops::Add).
     pub const ZERO: Cost = Cost {
         bytes: 0,
         cpu_seconds: 0.0,

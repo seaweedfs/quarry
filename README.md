@@ -32,6 +32,7 @@ src/
 cargo test
 cargo clippy --all-targets
 cargo fmt --check
+cargo doc --no-deps        # must be warning-free: broken links rot silently
 ```
 
 ## License
