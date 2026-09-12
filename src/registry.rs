@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use crate::cost::Cost;
     use crate::derived::{
-        Derived, DerivedId, FieldId, Kind, PolicyFingerprint, Refreshed, Rewrite, Source,
+        Derived, DerivedId, FieldId, Kind, PolicyFingerprint, Predicate, Refreshed, Rewrite, Source,
     };
     use crate::snapshot::{Diff, FileId, Snapshot, SnapshotId, TableId};
     use std::collections::BTreeSet;
@@ -199,7 +199,7 @@ mod tests {
             match self.wants {
                 None => Some(Rewrite::Substitute),
                 Some(field) => query
-                    .filtered
+                    .filtered_fields()
                     .contains(&field)
                     .then_some(Rewrite::Substitute),
             }
@@ -245,7 +245,7 @@ mod tests {
             policy: POLICY,
             plan_hash: 1,
             projected: BTreeSet::from([4]),
-            filtered: BTreeSet::from([4]),
+            predicates: vec![Predicate::Eq { field: 4, value: 7 }],
         }
     }
 

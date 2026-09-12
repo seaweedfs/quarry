@@ -37,12 +37,46 @@ pub struct PolicyFingerprint(pub u64);
 /// mismatch the derived state built from it.
 pub type FieldId = u32;
 
+/// A restriction a query places on a field.
+///
+/// Only equality is modelled, because only equality is currently *probed* by
+/// an index. Everything else is [`Predicate::Opaque`], which still marks the
+/// field as filtered but cannot be used to prune. Adding ranges later means
+/// adding a variant, not changing any signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Predicate {
+    /// `field = value`, where `value` is a hash of the literal.
+    ///
+    /// A hash rather than a value type: an equality index is probed by hash
+    /// anyway, and it keeps a value model out of the core for now.
+    Eq {
+        /// The field restricted.
+        field: FieldId,
+        /// Hash of the literal compared against.
+        value: u64,
+    },
+    /// A restriction on `field` whose form is not modelled.
+    Opaque {
+        /// The field restricted.
+        field: FieldId,
+    },
+}
+
+impl Predicate {
+    /// The field this restricts.
+    pub fn field(&self) -> FieldId {
+        match self {
+            Predicate::Eq { field, .. } | Predicate::Opaque { field } => *field,
+        }
+    }
+}
+
 /// What a query needs, reduced to what the rule and the kinds have to reason
 /// about.
 ///
 /// A stand-in for a real logical plan until the engine is wired up in phase 9.
-/// It carries identity (`plan_hash`), shape (`projected`, `filtered`), and the
-/// context that admissibility depends on (`table`, `snapshot`, `policy`).
+/// It carries identity (`plan_hash`), shape (`projected`, `predicates`), and
+/// the context that admissibility depends on (`table`, `snapshot`, `policy`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Query {
     /// The table being read.
@@ -57,8 +91,26 @@ pub struct Query {
     pub plan_hash: u64,
     /// Fields the query reads.
     pub projected: BTreeSet<FieldId>,
-    /// Fields the query has predicates on.
-    pub filtered: BTreeSet<FieldId>,
+    /// Restrictions the query places on fields.
+    pub predicates: Vec<Predicate>,
+}
+
+impl Query {
+    /// Every field this query restricts, however it restricts it.
+    pub fn filtered_fields(&self) -> BTreeSet<FieldId> {
+        self.predicates.iter().map(Predicate::field).collect()
+    }
+
+    /// The hashes this query compares `field` against with equality.
+    pub fn equalities(&self, field: FieldId) -> Vec<u64> {
+        self.predicates
+            .iter()
+            .filter_map(|p| match p {
+                Predicate::Eq { field: f, value } if *f == field => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// How derived state changes a plan.
@@ -336,9 +388,12 @@ mod tests {
             "index"
         }
         fn matches(&self, query: &Query) -> Option<Rewrite> {
-            query.filtered.contains(&4).then(|| Rewrite::Prune {
-                files: self.files.clone(),
-            })
+            query
+                .filtered_fields()
+                .contains(&4)
+                .then(|| Rewrite::Prune {
+                    files: self.files.clone(),
+                })
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {
             Cost::ZERO
@@ -404,7 +459,10 @@ mod tests {
             policy: POLICY,
             plan_hash: 99,
             projected: BTreeSet::from([4, 7]),
-            filtered: BTreeSet::from([4]),
+            predicates: vec![Predicate::Eq {
+                field: 4,
+                value: 0xABC,
+            }],
         }
     }
 
@@ -556,7 +614,7 @@ mod tests {
     fn a_kind_that_cannot_answer_is_refused() {
         let g = appends();
         let mut q = query_at(s(812));
-        q.filtered.clear(); // the fake index needs a predicate on field 4
+        q.predicates.clear(); // the fake index needs a predicate on field 4
         assert_eq!(
             index_at(s(812), &["a"]).may_serve(&q, &g),
             Decision::Reject(Reason::NoMatch)
