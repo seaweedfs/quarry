@@ -206,7 +206,12 @@ pub enum Refreshed {
 ///
 /// Three methods. Adding a kind should touch no other file: the registry, the
 /// rule, and `EXPLAIN` all work in terms of this trait.
-pub trait Kind: fmt::Debug {
+///
+/// `Send + Sync` because a registry is shared across the threads a query
+/// engine plans and executes on. Requiring it here rather than wrapping
+/// derived state in a lock keeps contention out of the planning path, which
+/// every query goes through.
+pub trait Kind: fmt::Debug + Send + Sync {
     /// A short name, for `EXPLAIN`.
     fn name(&self) -> &'static str;
 
