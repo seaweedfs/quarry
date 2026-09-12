@@ -19,15 +19,15 @@ passes and keeps passing.
 
 ---
 
-## Phase 1 — Place and Distance `[ ]`
+## Phase 1 — Place and Distance `[x]`
 
 The topology primitive. Every placement question in the system — which worker
 runs a task, which replica it reads, whether a shuffle crosses a boundary — is
 "how far, and what does that distance cost?"
 
-- [ ] `Place`: a hierarchical path (`/onprem/dc1/rack2/node7`)
-- [ ] `Distance`: `Local | Near | Far`, from longest common prefix
-- [ ] `Place::unknown()` → every distance is `Far`
+- [x] `Place`: a hierarchical path (`/onprem/dc1/rack2/node7`)
+- [x] `Distance`: `Local | Near | Far`, from longest common prefix
+- [x] `Place::unknown()` → every distance is `Far`
 
 **Design constraint.** Three distances now; the path representation means
 adding rack-awareness or a cross-cloud boundary later changes a price table,

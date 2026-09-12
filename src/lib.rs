@@ -18,3 +18,5 @@
 //! for the phase this code is currently in.
 
 #![forbid(unsafe_code)]
+
+pub mod place;
