@@ -207,17 +207,35 @@ disqualifies the result cache while leaving the index usable.
 
 ---
 
-## Phase 7 — Budgets `[ ]`
+## Phase 7 — Budgets `[x]`
 
-- [ ] `Budget`: byte and money ceilings
-- [ ] A metered reader that aborts at the ceiling
-- [ ] `Outcome`: `Complete | Aborted { at }`
+- [x] `Budget`: byte and money ceilings, either or both optional
+- [x] `Meter`: charges per read, refuses once a ceiling is breached
+- [x] `Permit`: `Continue | Stop(Exceeded)`
+- [x] `Outcome`: `Complete | Aborted(Exceeded)`
 
 **Design constraint.** Estimation informs plan choice and may be wrong.
 Enforcement stops execution and must not be. A budget that only feeds the
 planner is decoration.
 
-**Done when** a budget provably aborts mid-read rather than after.
+Three decisions worth recording, all about being honest after the fact:
+
+```text
+charge then check   the breaching read is charged before the ceiling is
+                    tested, so the report says 5 MB were read against a
+                    4 MB limit rather than pretending only 4 were
+
+stay stopped        a stopped meter charges nothing further and keeps
+                    returning the original breach, so the first cause
+                    is never overwritten by a later one
+
+bytes before money  when both ceilings breach at once, bytes are
+                    reported: it is the limit a caller set deliberately
+                    and the easier one to act on
+```
+
+**Done when** ten 1 MB reads against a 4 MB ceiling permit exactly four, the
+fifth stops, and the reported spend is 5 MB.
 
 ---
 

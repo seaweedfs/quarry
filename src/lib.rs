@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod cost;
 pub mod derived;
 pub mod kinds;
