@@ -161,7 +161,12 @@ pub trait Kind: fmt::Debug {
     /// job, not the kind's, so that no kind can forget them.
     fn matches(&self, query: &Query) -> Option<Rewrite>;
 
-    /// What keeping this costs.
+    /// What it costs to answer a query *using* this.
+    ///
+    /// The cost of *keeping* it is `bytes` times a retention rate, which the
+    /// registry computes; a kind does not need to know it. Selection compares
+    /// use-costs, retirement compares keeping-costs against realized benefit,
+    /// and both price in the same currency.
     fn cost(&self, prices: &PriceTable) -> Cost;
 
     /// Bring this up to date across `diff`.
@@ -231,7 +236,7 @@ impl Derived {
         self.uses = self.uses.saturating_add(1);
     }
 
-    /// What keeping it costs.
+    /// What it costs to answer a query using this.
     pub fn cost(&self, prices: &PriceTable) -> Cost {
         self.kind.cost(prices)
     }
