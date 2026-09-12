@@ -125,6 +125,10 @@ pub enum Rewrite {
     /// many files is merely slow. Naming too *few* would lose rows, which is
     /// why files added since the derived state was built are unioned back in
     /// by [`Derived::may_serve`].
+    ///
+    /// When returned by [`Derived::may_serve`], `files` is guaranteed to
+    /// contain only files live at the queried snapshot. A [`Kind`] computing
+    /// one from older metadata need not check that itself.
     Prune {
         /// Files that may contain matching rows.
         files: BTreeSet<FileId>,
@@ -327,9 +331,10 @@ impl Derived {
             return Decision::Reject(Reason::NoMatch);
         };
 
-        if graph.get(self.source.snapshot).is_none() || graph.get(query.snapshot).is_none() {
+        let (Some(_), Some(at)) = (graph.get(self.source.snapshot), graph.get(query.snapshot))
+        else {
             return Decision::Reject(Reason::UnknownSnapshot);
-        }
+        };
         if !graph.is_descendant_or_self(query.snapshot, self.source.snapshot) {
             return Decision::Reject(Reason::NotDescendant);
         }
@@ -337,6 +342,20 @@ impl Derived {
         if self.policy != query.policy {
             return Decision::Reject(Reason::PolicyMismatch);
         }
+
+        // A pruning rewrite was computed against an older file set, so it can
+        // name files the table no longer references. Drop them here rather
+        // than trusting every consumer to intersect with the live set:
+        // reading a file the table has dropped would resurrect deleted rows.
+        let rewrite = match rewrite {
+            Rewrite::Prune { files } => Rewrite::Prune {
+                files: files
+                    .into_iter()
+                    .filter(|file| at.files().contains_key(file))
+                    .collect(),
+            },
+            substituting => substituting,
+        };
 
         let Some(diff) = graph.diff(self.source.snapshot, query.snapshot) else {
             return Decision::Reject(Reason::UnknownSnapshot);
@@ -547,6 +566,44 @@ mod tests {
                 files: BTreeSet::from([f("a")])
             }),
             "pruning is safe: the engine still reads the file and applies deletes"
+        );
+    }
+
+    #[test]
+    fn a_prune_set_never_names_a_file_the_table_has_dropped() {
+        // Compaction replaces a and b with merged. The index still points at
+        // a, which no longer exists: reading it would resurrect its rows.
+        let g = SnapshotGraph::new()
+            .with(
+                Snapshot::root(s(810))
+                    .with_clean_file(f("a"))
+                    .with_clean_file(f("b")),
+            )
+            .with(Snapshot::child_of(s(811), s(810)).with_clean_file(f("merged")));
+
+        assert_eq!(
+            index_at(s(810), &["a"]).may_serve(&query_at(s(811)), &g),
+            Decision::UseWith {
+                rewrite: Rewrite::Prune {
+                    files: BTreeSet::new()
+                },
+                also_scan: BTreeSet::from([f("merged")]),
+            },
+            "the dropped file is filtered out; the new one is scanned"
+        );
+    }
+
+    #[test]
+    fn a_prune_set_keeps_files_that_are_still_live() {
+        let g = appends();
+        assert_eq!(
+            index_at(s(810), &["a"]).may_serve(&query_at(s(811)), &g),
+            Decision::UseWith {
+                rewrite: Rewrite::Prune {
+                    files: BTreeSet::from([f("a")])
+                },
+                also_scan: BTreeSet::from([f("b")]),
+            }
         );
     }
 
