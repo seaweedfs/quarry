@@ -94,26 +94,52 @@ abandoned branch.
 
 ---
 
-## Phase 4 — Derived state and the one rule `[ ]`
+## Phase 4 — Derived state and the one rule `[x]`
 
 The heart of the design.
 
-- [ ] `Derived`: id, kind, source `(table, snapshot)`, definition, policy
-      fingerprint, bytes, use counter
-- [ ] `Kind` trait: `matches`, `cost`, `refresh`
-- [ ] `Rewrite`: `Prune` (safe when stale) vs `Substitute` (is not)
-- [ ] `may_serve(&Derived, &Query, snapshot) -> Decision` implementing
+- [x] `Derived`: id, kind, source `(table, snapshot)`, policy fingerprint,
+      bytes, use counter
+- [x] `Kind` trait: `name`, `matches`, `cost`, `refresh`
+- [x] `Rewrite`: `Prune` vs `Substitute`
+- [x] `Derived::may_serve(&Query, &SnapshotGraph) -> Decision` implementing
       MATCH / LINEAGE / POLICY / RESIDUAL
-- [ ] `Decision::Union` carrying the residual for substituting kinds
+- [x] `Decision::UseWith` carrying the files to scan alongside
+- [x] `Reason` names the first condition that failed, for `EXPLAIN`
 
-**Design constraint.** One function, every kind. A stale *pruning* rewrite is
-sound because over-selection is conservative; a stale *substituting* rewrite
-returns wrong answers. The rule encodes that asymmetry so no kind has to
-remember it.
+**Design constraint.** One function, every kind. Kinds answer only about
+*shape* — which columns or plan they can serve. Lineage, policy and staleness
+are the rule's job, so no kind can forget them.
 
-**Done when** a stale index is still usable, a stale projection is not, a
-policy mismatch is refused, and a substituting kind at an advanced snapshot
-returns a union with the correct residual.
+**Found while implementing — "pruning is safe when stale" needs a caveat.**
+`core-design.md` says a pruning rewrite is safe even when stale, because
+over-selection is conservative. True, but the dangerous direction is
+*under*-selection: an index built at an older snapshot has never seen the
+files added since, so pruning to only the files it knows about silently drops
+their rows.
+
+```text
+Prune      tolerates ANY change, but files added since MUST be
+           scanned alongside it. Removed and re-deleted files are
+           harmless: the engine reads only live files and applies
+           deletes as it goes.
+
+Substitute tolerates ADDITIVE change only, also unioned with the
+           added files. Any subtractive change disqualifies it.
+```
+
+So condition 4 is rewrite-dependent, and `may_serve` encodes both halves. A
+pruning kind is strictly more permissive than a substituting one — which is
+the concrete reason indexes ship before projections and aggregates.
+
+Lineage is required for both, though a pruning rewrite could in principle
+tolerate a cross-branch source. Deliberately not exploited: cross-branch reuse
+only matters after a rollback, and one rule that is easy to verify is worth
+more than the rare hit.
+
+**Done when** a stale index is used with the added files, a delete-only commit
+disqualifies a cached result but not an index, an abandoned branch is refused,
+and a policy mismatch is refused.
 
 ---
 
