@@ -21,3 +21,4 @@
 
 pub mod cost;
 pub mod place;
+pub mod snapshot;

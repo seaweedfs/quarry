@@ -52,23 +52,45 @@ summing sub-costs equals costing the sum.
 
 ---
 
-## Phase 3 — Snapshots and lineage `[ ]`
+## Phase 3 — Snapshots and lineage `[x]`
 
 The `LINEAGE` condition of the rule needs an ancestry test, and `RESIDUAL`
 needs to know which files changed between two snapshots.
 
-- [ ] `TableId`, `SnapshotId`, `FileId`
-- [ ] `Snapshot`: id, parent, the set of live data files, delete-state per file
-- [ ] `SnapshotGraph`: `is_descendant(a, b)`, `changed_files(from, to)`
-- [ ] Rollback produces a sibling, not a descendant
+- [x] `TableId`, `SnapshotId`, `FileId`, `DeleteState`
+- [x] `Snapshot`: id, parent, the set of live data files, delete-state per file
+- [x] `SnapshotGraph`: `is_descendant_or_self`, `diff`
+- [x] Rollback produces a sibling, not a descendant
+- [x] Cycles and unknown snapshots return `false` rather than hanging
 
-**Design constraint.** `changed_files` must report a file whose *deletes*
-changed even though the file itself was neither added nor removed. A commit
-that only adds delete files changes which rows are live; missing this is a
-correctness bug, not an optimization miss.
+**Design constraint.** `diff` must report a file whose *deletes* changed even
+though the file itself was neither added nor removed. A commit that only adds
+delete files changes which rows are live; missing this is a correctness bug,
+not an optimization miss.
 
-**Done when** a delete-only commit shows up in `changed_files`, and a
-rolled-back snapshot is not a descendant of the abandoned branch.
+**Found while implementing — the design doc's rule was incomplete.**
+`core-design.md` states condition 4 as "residual is empty, or the rewrite
+becomes `Union(use(D), scan(residual))`". That holds only when every change
+since the derived state was built was *additive*:
+
+```text
+additive     files added
+             → derived state is still correct as far as it goes
+             → Union(use(D), scan(added)) is right
+
+subtractive  files removed, or their deletes changed
+             → derived state contains rows that are no longer live
+             → NO amount of extra reading removes them
+             → the derived state is unusable, not repairable
+```
+
+Hence `Diff` classifies rather than returning a flat file list, and
+`Diff::is_purely_additive()` is what condition 4 actually tests. Compaction
+and any row-level delete both land in the subtractive case.
+
+**Done when** a delete-only commit shows up in `diff`, a compaction is not
+purely additive, and a rolled-back snapshot is not a descendant of the
+abandoned branch.
 
 ---
 
