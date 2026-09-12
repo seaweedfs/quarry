@@ -167,15 +167,43 @@ high-value entry.
 
 ---
 
-## Phase 6 — First kinds `[ ]`
+## Phase 6 — First kinds `[x]`
 
 Two implementations of `Kind`, easiest first, to prove the trait before the
-hard cases.
+hard cases. Between them they cover both halves of the rule's staleness
+asymmetry.
 
-- [ ] `ResultCache`: matches an identical plan hash. Substituting.
-- [ ] `Index`: matches a predicate on indexed columns, prunes files. Pruning.
+- [x] `Predicate` in `Query`, so an index has something to probe
+- [x] `ResultCache`: matches an identical plan hash. Substituting.
+- [x] `Index`: equality on one field, prunes to matching files. Pruning.
 
-**Done when** adding a kind touches no core file.
+**Confirmed: adding a kind touched no core file.** `Index` and `ResultCache`
+live entirely under `src/kinds/`. The one core change was adding `Predicate`
+to `Query`, which is the *query* model rather than the derived-state model —
+and it was needed because an index cannot prune without knowing what a
+predicate compares against.
+
+Deliberate limits, each with the cheaper thing done first:
+
+```text
+result cache   exact plan match only. Subsumption (a 30-day filter
+               serving a 7-day query) is most of the reuse value and
+               is deferred until the exact-match hit rate justifies
+               building a matcher.
+
+index          equality on a single field. Ranges are a Predicate
+               variant away; composite indexes are a different
+               matching problem and belong in their own kind.
+
+refresh        both report NeedsRebuild for any change, since neither
+               can read data files. For the index this is an
+               efficiency concern only: a stale index stays usable
+               under the rule.
+```
+
+**Done when** an absent value prunes to the empty set rather than failing to
+match, an unmodelled predicate does not prune, and a delete-only commit
+disqualifies the result cache while leaving the index usable.
 
 ---
 
