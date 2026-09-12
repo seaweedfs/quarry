@@ -22,6 +22,8 @@
 pub mod budget;
 pub mod cost;
 pub mod derived;
+#[cfg(feature = "engine")]
+pub mod engine;
 pub mod explain;
 pub mod kinds;
 pub mod place;

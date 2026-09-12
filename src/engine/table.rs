@@ -1,0 +1,320 @@
+//! A [`TableProvider`] whose scan is planned by the rule.
+
+use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::Result as DfResult;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::scalar::ScalarValue;
+
+use crate::cost::PriceTable;
+use crate::derived::{Decision, FieldId, PolicyFingerprint, Predicate, Query, Rewrite};
+use crate::registry::Registry;
+use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
+
+/// Hash a literal the way [`QuarryTable`] does when probing an index.
+///
+/// Anything building an index must agree with this, or a probe will miss.
+/// Not stable across Rust releases, so derived state that outlives a process
+/// will eventually need a fixed hash rather than [`DefaultHasher`]; in-memory
+/// state does not care yet.
+pub fn hash_scalar(value: &ScalarValue) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What the rule decided for the most recent scan.
+///
+/// Recorded so a caller can see the decision after the fact — the same
+/// information `EXPLAIN` reports, kept here because a scan is where it is
+/// actually acted on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Files the plan reads.
+    pub files_read: BTreeSet<FileId>,
+    /// Which derived state was used, if any.
+    pub used: Option<String>,
+    /// Files read because they were added after that derived state was built.
+    pub also_scanned: BTreeSet<FileId>,
+}
+
+/// A table whose data files are in memory, planned through the rule.
+///
+/// Stands in for an Iceberg table until phase 9's later steps: the point is
+/// that `scan` consults [`Derived::may_serve`](crate::derived::Derived::may_serve)
+/// and reads only what it permits, which is the same path a real table will
+/// take.
+#[derive(Debug)]
+pub struct QuarryTable {
+    schema: SchemaRef,
+    table: TableId,
+    snapshot: SnapshotId,
+    graph: SnapshotGraph,
+    registry: Registry,
+    files: BTreeMap<FileId, Vec<RecordBatch>>,
+    field_ids: BTreeMap<String, FieldId>,
+    policy: PolicyFingerprint,
+    prices: PriceTable,
+    last_scan: Mutex<Option<ScanReport>>,
+}
+
+impl QuarryTable {
+    /// A table with no files and no derived state.
+    ///
+    /// `field_ids` maps column names to Iceberg field ids. Derived state is
+    /// keyed on field ids, never names, so that renaming a column cannot
+    /// silently mismatch it.
+    pub fn new(
+        schema: SchemaRef,
+        table: TableId,
+        snapshot: SnapshotId,
+        graph: SnapshotGraph,
+        field_ids: BTreeMap<String, FieldId>,
+    ) -> Self {
+        QuarryTable {
+            schema,
+            table,
+            snapshot,
+            graph,
+            registry: Registry::new(),
+            files: BTreeMap::new(),
+            field_ids,
+            policy: PolicyFingerprint(0),
+            prices: PriceTable::default(),
+            last_scan: Mutex::new(None),
+        }
+    }
+
+    /// Add a data file's contents.
+    pub fn with_file(mut self, file: FileId, batches: Vec<RecordBatch>) -> Self {
+        self.files.insert(file, batches);
+        self
+    }
+
+    /// Use this registry of derived state.
+    pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Read as this principal.
+    pub fn with_policy(mut self, policy: PolicyFingerprint) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The rule's decision for the most recent scan.
+    pub fn last_scan(&self) -> Option<ScanReport> {
+        self.last_scan.lock().expect("scan report lock").clone()
+    }
+
+    /// Translate DataFusion filters into the predicates the rule understands.
+    ///
+    /// A comparison of a known column against a literal becomes
+    /// [`Predicate::Eq`]; the operands are normalised so that `a = 1` and
+    /// `1 = a` produce the same predicate. Anything else touching a known
+    /// column becomes [`Predicate::Opaque`], which marks the column filtered
+    /// without claiming it can be probed. Filters on unknown columns are
+    /// dropped, since no derived state is keyed on them.
+    fn predicates(&self, filters: &[Expr]) -> Vec<Predicate> {
+        filters
+            .iter()
+            .filter_map(|expr| self.predicate(expr))
+            .collect()
+    }
+
+    fn predicate(&self, expr: &Expr) -> Option<Predicate> {
+        if let Expr::BinaryExpr(binary) = expr {
+            let flipped = match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v, _)) => Some((c, v)),
+                (Expr::Literal(v, _), Expr::Column(c)) => Some((c, v)),
+                _ => None,
+            };
+            if let Some((column, value)) = flipped {
+                let field = *self.field_ids.get(column.name())?;
+                return Some(match binary.op {
+                    Operator::Eq => Predicate::Eq {
+                        field,
+                        value: hash_scalar(value),
+                    },
+                    _ => Predicate::Opaque { field },
+                });
+            }
+        }
+        // Not a shape we model: mark every known column it mentions as
+        // filtered, so a kind needing an unfiltered column will not match.
+        let mut columns = Vec::new();
+        expr.apply(|node| {
+            if let Expr::Column(c) = node {
+                if let Some(field) = self.field_ids.get(c.name()) {
+                    columns.push(*field);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .ok()?;
+        columns
+            .first()
+            .map(|field| Predicate::Opaque { field: *field })
+    }
+
+    /// Which files this scan must read, and why.
+    ///
+    /// Consults the rule, and falls back to every live file when no derived
+    /// state applies. A full scan is always a correct answer, so every
+    /// failure path here leads to one.
+    fn plan_files(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> ScanReport {
+        let live: BTreeSet<FileId> = self
+            .graph
+            .get(self.snapshot)
+            .map(|s| s.files().keys().cloned().collect())
+            .unwrap_or_default();
+
+        let query = Query {
+            table: self.table.clone(),
+            snapshot: self.snapshot,
+            policy: self.policy,
+            plan_hash: self.plan_hash(projection, filters),
+            projected: self.projected_fields(projection),
+            predicates: self.predicates(filters),
+        };
+
+        // Only pruning rewrites can be executed today; see the module docs.
+        let pruning = self
+            .registry
+            .candidates(&query, &self.graph, &self.prices)
+            .into_iter()
+            .find_map(|candidate| {
+                let id = candidate.derived.id.0.clone();
+                match candidate.decision {
+                    Decision::Use(Rewrite::Prune { files }) => Some((id, files, BTreeSet::new())),
+                    Decision::UseWith {
+                        rewrite: Rewrite::Prune { files },
+                        also_scan,
+                    } => Some((id, files, also_scan)),
+                    _ => None,
+                }
+            });
+
+        match pruning {
+            None => ScanReport {
+                files_read: live,
+                used: None,
+                also_scanned: BTreeSet::new(),
+            },
+            Some((used, pruned, also_scan)) => {
+                let mut files_read = pruned;
+                files_read.extend(also_scan.iter().cloned());
+                ScanReport {
+                    files_read,
+                    used: Some(used),
+                    also_scanned: also_scan,
+                }
+            }
+        }
+    }
+
+    fn projected_fields(&self, projection: Option<&Vec<usize>>) -> BTreeSet<FieldId> {
+        let names: Vec<&str> = match projection {
+            None => self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect(),
+            Some(indices) => indices
+                .iter()
+                .filter_map(|i| self.schema.fields().get(*i).map(|f| f.name().as_str()))
+                .collect(),
+        };
+        names
+            .into_iter()
+            .filter_map(|name| self.field_ids.get(name).copied())
+            .collect()
+    }
+
+    /// A stand-in for a canonical plan hash.
+    ///
+    /// Hashes the projected fields and the translated predicates rather than
+    /// the `Expr` tree, which makes it insensitive to spelling — `a = 1` and
+    /// `1 = a` agree. It is *not* yet canonical in the full sense the design
+    /// asks for: a query that a rewrite could reduce to this one will hash
+    /// differently, so the result cache under-hits rather than mis-hits.
+    fn plan_hash(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.table.0.hash(&mut hasher);
+        self.projected_fields(projection).hash(&mut hasher);
+        let mut predicates = self.predicates(filters);
+        predicates.sort_by_key(|p| p.field());
+        for predicate in predicates {
+            match predicate {
+                Predicate::Eq { field, value } => (0u8, field, value).hash(&mut hasher),
+                Predicate::Opaque { field } => (1u8, field, 0u64).hash(&mut hasher),
+            }
+        }
+        hasher.finish()
+    }
+}
+
+#[async_trait]
+impl TableProvider for QuarryTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    /// Filters are used to *prune*, never to filter rows, so DataFusion must
+    /// re-apply them above the scan.
+    ///
+    /// [`TableProviderFilterPushDown::Inexact`] says exactly that. Claiming
+    /// `Exact` would be wrong: pruning is conservative, so a file the rule
+    /// admits still contains rows the predicate rejects.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let report = self.plan_files(projection, filters);
+
+        let partitions: Vec<Vec<RecordBatch>> = report
+            .files_read
+            .iter()
+            .filter_map(|file| self.files.get(file).cloned())
+            .collect();
+
+        *self.last_scan.lock().expect("scan report lock") = Some(report);
+
+        let source = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
+        Ok(source)
+    }
+}

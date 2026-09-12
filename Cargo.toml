@@ -6,7 +6,21 @@ rust-version = "1.85"
 license = "Apache-2.0"
 description = "Self-optimizing query engine over Iceberg tables on object storage"
 
+[features]
+# The decision core has no dependencies, so `cargo test` stays fast and the
+# logic that must be correct is testable without a query engine. Everything
+# that needs DataFusion lives behind this flag.
+default = []
+engine = ["dep:datafusion", "dep:async-trait", "dep:tokio"]
+
 [dependencies]
+async-trait = { version = "0.1.92", optional = true }
+# Arrow is reached through `datafusion::arrow` rather than depended on
+# directly, so there is one version to keep in step instead of two.
+datafusion = { version = "48.0.1", optional = true }
+# Only the engine tests need a runtime, but a dev-dependency would be built
+# even for the default feature set and slow the core test loop down.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"], optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

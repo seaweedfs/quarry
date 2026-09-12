@@ -14,19 +14,21 @@ Everything else is derived, priced, and disposable.
 
 ## Status
 
-Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done: the whole decision core, with
-89 tests and no external dependencies. Nothing executes SQL yet — that is
-phase 9, where DataFusion and Iceberg arrive.
+Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done, and phase 9 is under way. The
+decision core is 89 tests with **no dependencies**; DataFusion sits behind
+`--features engine` and adds 10 end-to-end SQL tests.
 
-What works today:
+Real SQL is planned by the rule today:
 
 ```sh
-cargo run --example explain
+cargo test --features engine        # 99 tests, including SQL through DataFusion
+cargo run --example explain         # no dependencies; walks a table over 4 commits
 ```
 
-walks one table through append, delete and compaction and explains the same
-query at each snapshot, showing the rule admit and refuse derived state as the
-table moves under it.
+`SELECT * FROM events WHERE tenant_id = 1` reads only the files an index says
+can match — and still returns every row when that index is stale, is refused
+outright when it was built on a rolled-back branch, and never reads a file that
+compaction removed.
 
 The design is in [`../core-design.md`](../core-design.md); the longer documents
 beside it are rationale and detail. Two corrections to the design were found by
@@ -47,8 +49,12 @@ src/
   kinds/
     result_cache.rs   a stored answer to one exact query (substituting)
     index.rs          equality on one field, prunes files (pruning)
+  engine/             behind --features engine
+    table.rs          a DataFusion TableProvider planned by the rule
 examples/
   explain.rs    end-to-end walkthrough
+tests/
+  engine_sql.rs SQL through DataFusion, asserting which files were read
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place
@@ -58,10 +64,11 @@ is where the correctness of the whole engine lives.
 ## Development
 
 ```sh
-cargo test
-cargo clippy --all-targets
+cargo test                                    # core, no dependencies, instant
+cargo test --features engine                  # adds the DataFusion tests
+cargo clippy --all-targets --features engine
 cargo fmt --check
-cargo doc --no-deps        # must be warning-free: broken links rot silently
+cargo doc --no-deps --features engine         # must be warning-free
 ```
 
 ## License

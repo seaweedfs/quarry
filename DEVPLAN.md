@@ -274,19 +274,48 @@ instead of being a boolean.
 
 ---
 
-## Phase 9 — Engine integration `[ ]`
+## Phase 9 — Engine integration `[~]`
 
-Where external dependencies arrive. Everything above stays dependency-free.
+Where external dependencies arrive. Everything above stays dependency-free,
+behind `--features engine`.
 
-- [ ] DataFusion: `TableProvider` over a toy in-memory table, end-to-end SQL
-- [ ] An optimizer rule that consults the registry and applies a `Rewrite`
+- [x] DataFusion `TableProvider` whose `scan` is planned by the rule
+- [x] DataFusion `Expr` → `Predicate` translation, operand order normalised
+- [x] End-to-end SQL tests: pruning, staleness, rollback, compaction, policy
+- [ ] Materialise substituting rewrites (needs stored bytes, see below)
 - [ ] `object_store` for reads; metadata and block caches
 - [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
 
 **Design constraint.** Use DataFusion's own extension points —
-`ObjectStore`, `TableProvider`, `Catalog` — not parallel ones. The only new
-trait is the one that has no DataFusion equivalent: what a backend can tell us
-beyond reading bytes.
+`ObjectStore`, `TableProvider`, `Catalog` — not parallel ones. Held: the only
+new trait so far is `Kind`, which has no DataFusion equivalent. No custom
+optimizer rule was needed either, because `TableProvider::scan` already
+receives the projection and filters, which is exactly what the rule wants.
+
+Two things worth recording:
+
+```text
+Inexact pushdown    filters are used to PRUNE, never to filter rows, so
+                    DataFusion re-applies them above the scan. Claiming
+                    Exact would be wrong: pruning is conservative, so an
+                    admitted file still holds rows the predicate rejects.
+
+Kind: Send + Sync   a registry is shared across planning and execution
+                    threads, so kinds must be too. Requiring it on the
+                    trait keeps a lock off the planning path.
+```
+
+**Substituting rewrites are skipped for now.** `ResultCache` records that a
+result exists and how big it is, not the result itself, so there are no bytes
+for the engine to read. The engine takes the cheapest *pruning* candidate and
+ignores substituting ones — the safe direction, since the answer is right and
+merely slower. Storing batches is the next step.
+
+**The compaction test earns its place.** Without the prune-set filtering added
+in the phase-4 follow-up, `SELECT * WHERE tenant_id = 1` returns two rows
+instead of one, because the index still points at a file compaction removed.
+That is a wrong answer reachable through plain SQL, which is what makes the
+"prevented by construction" rule worth having.
 
 ---
 
