@@ -22,6 +22,7 @@
 pub mod budget;
 pub mod cost;
 pub mod derived;
+pub mod explain;
 pub mod kinds;
 pub mod place;
 pub mod registry;

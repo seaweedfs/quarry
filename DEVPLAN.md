@@ -239,15 +239,38 @@ fifth stops, and the reported spend is 5 MB.
 
 ---
 
-## Phase 8 — Explain `[ ]`
+## Phase 8 — Explain `[x]`
 
-- [ ] A structured `Explain` value: plan, derived state used, residual, cost,
-      coverage
-- [ ] Text rendering
+- [x] `Explain::plan`: derived state chosen, files to also scan, cost, coverage
+- [x] `Refused`: what was considered and which rule condition it failed
+- [x] `Coverage`: `Exact | Incomplete(Exceeded)`
+- [x] Text rendering
+- [x] `Registry::assess`, so refusals are visible
 
 **Design constraint.** This is the entire introspection surface, and also the
 whole agent-facing API: `EXPLAIN` is `plan()` — free, and it returns cost and
-coverage before anything is spent.
+coverage before anything is spent. Tests pin both halves of that: planning
+twice gives an identical answer, and planning does not count as a use.
+
+Two things the output does on purpose:
+
+```text
+names refusals    a query that is slower than expected is usually one
+                  whose derived state was refused, and the reason is the
+                  only thing that tells a user what to fix. A candidate
+                  that merely lost on cost is NOT listed as refused.
+
+separates known   byte counts come from immutable metadata and are
+from estimated    reported as known. Latency is not modelled, so it is
+                  absent rather than guessed — it is the least reliable
+                  dimension and the one an agent would trust most.
+```
+
+`Coverage::Exact` is currently an invariant rather than a hope: the rule
+refuses anything that would be wrong, so the only way to lose exactness is a
+budget abort. Approximate kinds would add a `Bounded` variant carrying a
+confidence interval, which is why the type exists now with two variants
+instead of being a boolean.
 
 ---
 
