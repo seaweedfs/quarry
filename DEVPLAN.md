@@ -137,6 +137,25 @@ tolerate a cross-branch source. Deliberately not exploited: cross-branch reuse
 only matters after a rollback, and one rule that is easy to verify is worth
 more than the rare hit.
 
+**Found in phase 9 — the union half of condition 4 needs a shape check.**
+`core-design.md` repairs additive staleness with `Union(use(D), scan(added))`
+for every substituting kind. That is only sound when `D` holds *table-shaped*
+rows. Reading a pre-computed `count(*)` alongside newly appended raw rows is
+nonsense — combining those needs a merge step, not a concatenation.
+
+```text
+Substitute { unionable: true }   a filter or projection result
+                                 → residual may be read alongside it
+
+Substitute { unionable: false }  an aggregate
+                                 → admitted ONLY when nothing was added
+                                 → Reason::ResidualNotUnionable otherwise
+```
+
+So `ResultCache` has two constructors, `rows_of` and `aggregate_of`, and the
+caller has to say which it built. The conservative case is the one that needs
+declaring, which is the right way round for an aggregate kind arriving later.
+
 **Done when** a stale index is used with the added files, a delete-only commit
 disqualifies a cached result but not an index, an abandoned branch is refused,
 and a policy mismatch is refused.

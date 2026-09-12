@@ -137,13 +137,34 @@ pub enum Rewrite {
     ///
     /// Nothing downstream re-reads the table, so staleness is not slow, it is
     /// wrong.
-    Substitute,
+    Substitute {
+        /// Whether the derived rows are table-shaped.
+        ///
+        /// The rule repairs additive staleness by reading the derived state
+        /// *and* the files added since. That only produces the right answer
+        /// when the derived state holds rows of the same shape as the table,
+        /// so the two can simply be concatenated.
+        ///
+        /// An aggregate does not qualify: unioning a pre-computed `count(*)`
+        /// with raw rows is nonsense. Combining those needs a merge step the
+        /// engine does not have yet, so aggregated derived state is only
+        /// admitted when there is no residual at all.
+        unionable: bool,
+    },
 }
 
 impl Rewrite {
     /// Whether this rewrite replaces the data source rather than narrowing it.
     pub fn is_substituting(&self) -> bool {
-        matches!(self, Rewrite::Substitute)
+        matches!(self, Rewrite::Substitute { .. })
+    }
+
+    /// Whether a residual scan may simply be read alongside this rewrite.
+    pub fn can_union_residual(&self) -> bool {
+        match self {
+            Rewrite::Prune { .. } => true,
+            Rewrite::Substitute { unionable } => *unionable,
+        }
     }
 }
 
@@ -167,6 +188,10 @@ pub enum Reason {
     /// Rows have been removed since it was built, so it holds rows that are
     /// no longer live. Unusable, not repairable.
     SubtractiveChange,
+    /// Rows have been added since it was built, and its own rows cannot simply
+    /// be read alongside them — an aggregate would need merging, not
+    /// concatenating.
+    ResidualNotUnionable,
 }
 
 /// The rule's verdict.
@@ -326,7 +351,10 @@ impl Derived {
     ///   deletes as it goes. Over-selection is conservative.
     /// - [`Rewrite::Substitute`] tolerates only *additive* change. Once rows
     ///   have been removed, the derived state holds rows that are no longer
-    ///   live and no amount of extra reading removes them.
+    ///   live and no amount of extra reading removes them. And when rows have
+    ///   been *added*, only table-shaped derived state can be read alongside
+    ///   them; an aggregate would need merging rather than concatenating, so
+    ///   it is admitted only when there is no residual at all.
     pub fn may_serve(&self, query: &Query, graph: &SnapshotGraph) -> Decision {
         if self.source.table != query.table {
             return Decision::Reject(Reason::WrongTable);
@@ -371,12 +399,14 @@ impl Derived {
         }
 
         if diff.added.is_empty() {
-            Decision::Use(rewrite)
-        } else {
-            Decision::UseWith {
-                rewrite,
-                also_scan: diff.added,
-            }
+            return Decision::Use(rewrite);
+        }
+        if !rewrite.can_union_residual() {
+            return Decision::Reject(Reason::ResidualNotUnionable);
+        }
+        Decision::UseWith {
+            rewrite,
+            also_scan: diff.added,
         }
     }
 }
@@ -438,7 +468,7 @@ mod tests {
             "result"
         }
         fn matches(&self, query: &Query) -> Option<Rewrite> {
-            (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute)
+            (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute { unionable: true })
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {
             Cost::ZERO
@@ -544,9 +574,64 @@ mod tests {
         assert_eq!(
             decision,
             Decision::UseWith {
-                rewrite: Rewrite::Substitute,
+                rewrite: Rewrite::Substitute { unionable: true },
                 also_scan: BTreeSet::from([f("c")]),
             }
+        );
+    }
+
+    #[test]
+    fn an_aggregated_result_is_refused_once_rows_are_added() {
+        // Reading a pre-computed count(*) alongside newly added raw rows is
+        // nonsense: combining them needs a merge, not a concatenation.
+        #[derive(Debug)]
+        struct FakeAggregate;
+
+        impl Kind for FakeAggregate {
+            fn name(&self) -> &'static str {
+                "aggregate"
+            }
+            fn matches(&self, _query: &Query) -> Option<Rewrite> {
+                Some(Rewrite::Substitute { unionable: false })
+            }
+            fn cost(&self, _prices: &PriceTable) -> Cost {
+                Cost::ZERO
+            }
+            fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+                Refreshed::NeedsRebuild
+            }
+        }
+
+        let aggregate = Derived::new(
+            DerivedId("cube".into()),
+            Source {
+                table: t(),
+                snapshot: s(810),
+            },
+            POLICY,
+            32,
+            Box::new(FakeAggregate),
+        );
+
+        let g = appends();
+
+        // Nothing added yet: usable.
+        assert_eq!(
+            aggregate.may_serve(&query_at(s(810)), &g),
+            Decision::Use(Rewrite::Substitute { unionable: false })
+        );
+
+        // A file has been appended: refused, where a table-shaped result
+        // would have been admitted with a residual scan.
+        assert_eq!(
+            aggregate.may_serve(&query_at(s(811)), &g),
+            Decision::Reject(Reason::ResidualNotUnionable)
+        );
+        assert!(
+            result_at(s(810), 99)
+                .may_serve(&query_at(s(811)), &g)
+                .is_admitted(),
+            "a table-shaped result tolerates the same append"
         );
     }
 

@@ -19,18 +19,38 @@ pub struct ResultCache {
     plan_hash: u64,
     rows: u64,
     bytes: u64,
+    unionable: bool,
 }
 
 impl ResultCache {
-    /// Record that a plan's result has been stored.
+    /// A stored result whose rows have the same shape as the table's.
+    ///
+    /// The result of a filter or projection: rows added to the table after
+    /// this was stored can be read alongside it, so it stays usable as the
+    /// table grows.
     ///
     /// `plan_hash` must identify the *canonical* form of the plan, so that
     /// queries differing only in spelling hit the same entry.
-    pub fn new(plan_hash: u64, rows: u64, bytes: u64) -> Self {
+    pub fn rows_of(plan_hash: u64, rows: u64, bytes: u64) -> Self {
         ResultCache {
             plan_hash,
             rows,
             bytes,
+            unionable: true,
+        }
+    }
+
+    /// A stored result that has been aggregated.
+    ///
+    /// A `count(*)` or `sum(x)`, which cannot simply be read alongside newly
+    /// added rows — combining them needs a merge step. Usable only while the
+    /// table has not moved at all.
+    pub fn aggregate_of(plan_hash: u64, rows: u64, bytes: u64) -> Self {
+        ResultCache {
+            plan_hash,
+            rows,
+            bytes,
+            unionable: false,
         }
     }
 
@@ -48,6 +68,11 @@ impl ResultCache {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Whether the stored rows have the same shape as the table's.
+    pub fn is_unionable(&self) -> bool {
+        self.unionable
+    }
 }
 
 impl Kind for ResultCache {
@@ -62,7 +87,9 @@ impl Kind for ResultCache {
     /// deliberately: exact matching is cheap and obviously correct, and its
     /// measured hit rate is what should justify building a matcher.
     fn matches(&self, query: &Query) -> Option<Rewrite> {
-        (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute)
+        (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute {
+            unionable: self.unionable,
+        })
     }
 
     fn cost(&self, prices: &PriceTable) -> Cost {
@@ -108,34 +135,37 @@ mod tests {
 
     #[test]
     fn an_identical_plan_substitutes() {
-        let c = ResultCache::new(0xBEEF, 10, 100);
-        assert_eq!(c.matches(&query(0xBEEF)), Some(Rewrite::Substitute));
+        let c = ResultCache::rows_of(0xBEEF, 10, 100);
+        assert_eq!(
+            c.matches(&query(0xBEEF)),
+            Some(Rewrite::Substitute { unionable: true })
+        );
     }
 
     #[test]
     fn a_different_plan_does_not_match() {
-        let c = ResultCache::new(0xBEEF, 10, 100);
+        let c = ResultCache::rows_of(0xBEEF, 10, 100);
         assert_eq!(c.matches(&query(0xFEED)), None);
     }
 
     #[test]
     fn cost_scales_with_stored_bytes() {
         let prices = PriceTable::default();
-        let small = ResultCache::new(1, 1, 100).cost(&prices);
-        let large = ResultCache::new(1, 1, 100_000).cost(&prices);
+        let small = ResultCache::rows_of(1, 1, 100).cost(&prices);
+        let large = ResultCache::rows_of(1, 1, 100_000).cost(&prices);
         assert!(large.usd > small.usd);
         assert_eq!(small.bytes, 100);
     }
 
     #[test]
     fn an_unchanged_table_leaves_it_up_to_date() {
-        let mut c = ResultCache::new(1, 1, 1);
+        let mut c = ResultCache::rows_of(1, 1, 1);
         assert_eq!(c.refresh(&Diff::default()), Refreshed::UpToDate);
     }
 
     #[test]
     fn any_change_requires_a_rebuild() {
-        let mut c = ResultCache::new(1, 1, 1);
+        let mut c = ResultCache::rows_of(1, 1, 1);
 
         let appended = Diff {
             added: BTreeSet::from([FileId("new".into())]),
@@ -152,7 +182,7 @@ mod tests {
 
     #[test]
     fn accessors_report_what_was_stored() {
-        let c = ResultCache::new(7, 42, 4096);
+        let c = ResultCache::rows_of(7, 42, 4096);
         assert_eq!(c.plan_hash(), 7);
         assert_eq!(c.rows(), 42);
         assert_eq!(c.bytes(), 4096);

@@ -175,7 +175,7 @@ impl fmt::Display for Explain {
             Some(used) => {
                 let how = match used.rewrite {
                     Rewrite::Prune { .. } => "prunes",
-                    Rewrite::Substitute => "substitutes",
+                    Rewrite::Substitute { .. } => "substitutes",
                 };
                 writeln!(
                     f,
@@ -262,7 +262,7 @@ mod tests {
             source(at),
             POLICY,
             64,
-            Box::new(ResultCache::new(42, 3, 64)),
+            Box::new(ResultCache::rows_of(42, 3, 64)),
         )
     }
 
@@ -304,7 +304,7 @@ mod tests {
         let used = e.used.as_ref().expect("something was used");
         assert_eq!(used.id, DerivedId("res".into()));
         assert_eq!(used.kind, "result");
-        assert_eq!(used.rewrite, Rewrite::Substitute);
+        assert_eq!(used.rewrite, Rewrite::Substitute { unionable: true });
         assert_eq!(e.cost.bytes, 64);
         assert!(e.to_string().contains("substitutes"));
     }

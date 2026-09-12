@@ -76,7 +76,7 @@ fn main() {
         },
         POLICY,
         64,
-        Box::new(ResultCache::new(0xC0FFEE, 3, 64)),
+        Box::new(ResultCache::rows_of(0xC0FFEE, 3, 64)),
     ));
 
     // SELECT ... FROM events WHERE tenant_id = 42

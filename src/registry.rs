@@ -211,11 +211,11 @@ mod tests {
         }
         fn matches(&self, query: &Query) -> Option<Rewrite> {
             match self.wants {
-                None => Some(Rewrite::Substitute),
+                None => Some(Rewrite::Substitute { unionable: true }),
                 Some(field) => query
                     .filtered_fields()
                     .contains(&field)
-                    .then_some(Rewrite::Substitute),
+                    .then_some(Rewrite::Substitute { unionable: true }),
             }
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {
