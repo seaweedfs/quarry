@@ -11,9 +11,14 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::scalar::ScalarValue;
 
 use crate::cost::PriceTable;
@@ -56,10 +61,27 @@ pub struct ScanReport {
     pub plan_hash: u64,
 }
 
-/// A table whose data files are in memory, planned through the rule.
+/// Where a table's data actually lives.
+#[derive(Debug)]
+enum Files {
+    /// Batches held in memory. Convenient for tests and examples, and enough
+    /// to exercise every decision the rule makes.
+    Memory(BTreeMap<FileId, Vec<RecordBatch>>),
+    /// Parquet objects in an object store, addressed by path.
+    ///
+    /// [`FileId`] holds the object path, so the identity the rule reasons
+    /// about and the identity the store reads are the same string. That is
+    /// what an Iceberg data file path will be too.
+    Parquet {
+        url: ObjectStoreUrl,
+        sizes: BTreeMap<FileId, u64>,
+    },
+}
+
+/// A table planned through the rule.
 ///
-/// Stands in for an Iceberg table until phase 9's later steps: the point is
-/// that `scan` consults [`Derived::may_serve`](crate::derived::Derived::may_serve)
+/// Stands in for an Iceberg table until the catalog arrives: the point is that
+/// `scan` consults [`Derived::may_serve`](crate::derived::Derived::may_serve)
 /// and reads only what it permits, which is the same path a real table will
 /// take.
 #[derive(Debug)]
@@ -69,7 +91,7 @@ pub struct QuarryTable {
     snapshot: SnapshotId,
     graph: SnapshotGraph,
     registry: Registry,
-    files: BTreeMap<FileId, Vec<RecordBatch>>,
+    files: Files,
     field_ids: BTreeMap<String, FieldId>,
     policy: PolicyFingerprint,
     prices: PriceTable,
@@ -102,7 +124,7 @@ impl QuarryTable {
             snapshot,
             graph,
             registry: Registry::new(),
-            files: BTreeMap::new(),
+            files: Files::Memory(BTreeMap::new()),
             field_ids,
             policy: PolicyFingerprint(0),
             prices: PriceTable::default(),
@@ -111,9 +133,36 @@ impl QuarryTable {
         }
     }
 
-    /// Add a data file's contents.
+    /// Read data files as Parquet objects from `url` instead of from memory.
+    ///
+    /// Discards any in-memory files already added.
+    pub fn on_object_store(mut self, url: ObjectStoreUrl) -> Self {
+        self.files = Files::Parquet {
+            url,
+            sizes: BTreeMap::new(),
+        };
+        self
+    }
+
+    /// Add an in-memory data file's contents.
+    ///
+    /// Ignored if this table reads Parquet; see
+    /// [`QuarryTable::with_parquet_file`].
     pub fn with_file(mut self, file: FileId, batches: Vec<RecordBatch>) -> Self {
-        self.files.insert(file, batches);
+        if let Files::Memory(files) = &mut self.files {
+            files.insert(file, batches);
+        }
+        self
+    }
+
+    /// Register a Parquet object as a data file.
+    ///
+    /// `file` is the object path within the store, and `size` its length in
+    /// bytes, which the Parquet reader needs in order to locate the footer.
+    pub fn with_parquet_file(mut self, file: FileId, size: u64) -> Self {
+        if let Files::Parquet { sizes, .. } = &mut self.files {
+            sizes.insert(file, size);
+        }
         self
     }
 
@@ -348,10 +397,11 @@ impl TableProvider for QuarryTable {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let report = self.plan_files(projection, filters);
 
-        // Stored rows first when substituting, then the files added since.
-        // Concatenating is only valid because the rule refused any derived
-        // state whose rows are not table-shaped.
-        let mut partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        // Stored rows first when substituting, then whatever files the rule
+        // says must still be read. Concatenating the two is only valid because
+        // the rule refused any derived state whose rows are not table-shaped.
+        let mut parts: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+
         if report.substituted {
             if let Some(batches) = report
                 .used
@@ -359,23 +409,71 @@ impl TableProvider for QuarryTable {
                 .map(|id| DerivedId(id.to_owned()))
                 .and_then(|id| self.materialized.get(&id))
             {
-                partitions.push(batches.clone());
+                parts.push(self.memory_plan(std::slice::from_ref(batches), projection)?);
             }
         }
-        partitions.extend(
-            report
-                .files_read
-                .iter()
-                .filter_map(|file| self.files.get(file).cloned()),
-        );
+
+        if !report.files_read.is_empty() {
+            parts.push(self.file_plan(&report.files_read, projection)?);
+        }
 
         *self.last_scan.lock().expect("scan report lock") = Some(report);
 
-        let source = MemorySourceConfig::try_new_exec(
-            &partitions,
+        match parts.len() {
+            // Nothing to read: an empty plan of the right shape, not an error.
+            0 => self.memory_plan(&[], projection),
+            1 => Ok(parts.remove(0)),
+            _ => Ok(Arc::new(UnionExec::new(parts))),
+        }
+    }
+}
+
+impl QuarryTable {
+    fn memory_plan(
+        &self,
+        partitions: &[Vec<RecordBatch>],
+        projection: Option<&Vec<usize>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let exec = MemorySourceConfig::try_new_exec(
+            partitions,
             Arc::clone(&self.schema),
             projection.cloned(),
         )?;
-        Ok(source)
+        Ok(exec)
+    }
+
+    /// A plan reading exactly `files`, from wherever this table's data lives.
+    fn file_plan(
+        &self,
+        files: &BTreeSet<FileId>,
+        projection: Option<&Vec<usize>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        match &self.files {
+            Files::Memory(available) => {
+                let partitions: Vec<Vec<RecordBatch>> = files
+                    .iter()
+                    .filter_map(|file| available.get(file).cloned())
+                    .collect();
+                self.memory_plan(&partitions, projection)
+            }
+            Files::Parquet { url, sizes } => {
+                let mut builder = FileScanConfigBuilder::new(
+                    url.clone(),
+                    Arc::clone(&self.schema),
+                    Arc::new(ParquetSource::default()),
+                )
+                .with_projection(projection.cloned());
+
+                // One file group per file, so DataFusion can read them in
+                // parallel and the plan shows exactly what was selected.
+                for file in files {
+                    let size = sizes.get(file).copied().unwrap_or(0);
+                    builder = builder
+                        .with_file_group(vec![PartitionedFile::new(file.0.clone(), size)].into());
+                }
+
+                Ok(DataSourceExec::from_data_source(builder.build()))
+            }
+        }
     }
 }

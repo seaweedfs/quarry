@@ -16,12 +16,12 @@ Everything else is derived, priced, and disposable.
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done, and phase 9 is under way. The
 decision core is 90 tests with **no dependencies**; DataFusion sits behind
-`--features engine` and adds 14 end-to-end SQL tests.
+`--features engine` and adds 20 tests, including SQL over real Parquet.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine        # 104 tests, including SQL through DataFusion
+cargo test --features engine        # 110 tests, incl. SQL over real Parquet
 cargo run --example explain         # no dependencies; walks a table over 4 commits
 ```
 
@@ -55,7 +55,8 @@ src/
 examples/
   explain.rs    end-to-end walkthrough
 tests/
-  engine_sql.rs SQL through DataFusion, asserting which files were read
+  engine_sql.rs     SQL through DataFusion, asserting which files were read
+  engine_parquet.rs real Parquet on an object store, selected by the rule
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place

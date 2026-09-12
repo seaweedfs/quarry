@@ -302,7 +302,8 @@ behind `--features engine`.
 - [x] DataFusion `Expr` → `Predicate` translation, operand order normalised
 - [x] End-to-end SQL tests: pruning, staleness, rollback, compaction, policy
 - [x] `MaterializedResult`: a substituting kind holding real Arrow batches
-- [ ] `object_store` for reads; metadata and block caches
+- [x] Parquet objects read through `object_store`, selected by the rule
+- [ ] Metadata and block caches
 - [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
 
 **Design constraint.** Use DataFusion's own extension points —
@@ -345,6 +346,24 @@ in the phase-4 follow-up, `SELECT * WHERE tenant_id = 1` returns two rows
 instead of one, because the index still points at a file compaction removed.
 That is a wrong answer reachable through plain SQL, which is what makes the
 "prevented by construction" rule worth having.
+
+**Parquet reads go through DataFusion's own file source.** `FileScanConfig` +
+`ParquetSource` + `DataSourceExec`, with one file group per selected file. No
+Parquet reading was hand-rolled, which keeps row-group pruning, predicate
+pushdown and the reader's own optimisations for free.
+
+`FileId` holds the object path, so the identity the rule reasons about and the
+identity the store reads are the same string — as an Iceberg data file path
+will be.
+
+The test worth keeping is `a_pruned_object_is_never_opened`: it **deletes** the
+file the index excludes and asserts the query still succeeds. Counting bytes
+would show pruning saving I/O; deleting the object proves the plan never
+reaches for it at all.
+
+Substitution over a file-backed table unions a memory source of stored rows
+with the file source, which is sound only because the rule already refused any
+derived state whose rows are not table-shaped.
 
 ---
 
