@@ -19,4 +19,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cost;
 pub mod place;

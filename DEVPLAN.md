@@ -38,14 +38,14 @@ not a type.
 
 ---
 
-## Phase 2 — Cost and prices `[ ]`
+## Phase 2 — Cost and prices `[x]`
 
 One currency for every decision.
 
-- [ ] `Tier`: `Hot | Cold`
-- [ ] `Cost`: bytes, cpu-seconds, and a money total
-- [ ] `PriceTable`: byte price per `(Tier, Distance)`, cpu-second price
-- [ ] `Cost` addition, so plan costs compose
+- [x] `Tier`: `Hot | Cold`
+- [x] `Cost`: bytes, cpu-seconds, and a money total
+- [x] `PriceTable`: byte price per `(Tier, Distance)`, cpu-second price
+- [x] `Cost` addition, so plan costs compose
 
 **Done when** a cold/far byte prices strictly above a hot/local byte, and
 summing sub-costs equals costing the sum.
