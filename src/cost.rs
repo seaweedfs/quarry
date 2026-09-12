@@ -68,9 +68,16 @@ impl std::iter::Sum for Cost {
 /// What bytes and cpu-seconds cost here.
 ///
 /// Prices are configuration, not constants: retrieval and egress pricing is
-/// per-provider, tiered, and changes. An on-premises deployment sets the
-/// distance prices to zero and still gets useful *relative* ordering, because
-/// the latency asymmetry remains encoded in the multipliers.
+/// per-provider, tiered, and changes.
+///
+/// The distance multipliers deliberately blend two things that are really
+/// independent — bandwidth, which drives latency, and price, which drives the
+/// bill. An intra-rack transfer is slower than a node-local one but usually
+/// free; a cross-cloud transfer is slower *and* billed. Collapsing them into
+/// one "relative expense" per distance keeps the model to a single number and
+/// is enough to order choices correctly. Splitting them is a two-field change
+/// here and nowhere else, and is worth doing once a deployment cares about the
+/// difference between "slow" and "expensive".
 #[derive(Clone, Copy, Debug)]
 pub struct PriceTable {
     /// Price of one hot, local byte.
@@ -112,16 +119,18 @@ impl PriceTable {
 }
 
 impl Default for PriceTable {
-    /// Prices in the shape of a public cloud: cold retrieval and cross-boundary
-    /// traffic both cost real money, and local hot reads are nearly free.
+    /// Prices in the shape of a public cloud: cold retrieval and crossing a
+    /// boundary both cost real money, and local hot reads are nearly free.
     ///
     /// The absolute values matter less than the ratios, which are what order
-    /// the optimizer's choices.
+    /// the optimizer's choices. Every distance is strictly more expensive than
+    /// the one inside it, including `Near`, so that a scheduler with a choice
+    /// between a node-local and a rack-local replica prefers the closer one.
     fn default() -> Self {
         PriceTable {
             hot_byte_usd: 1e-11,
             cold_multiplier: 1_000.0,
-            near_multiplier: 1.0,
+            near_multiplier: 2.0,
             far_multiplier: 100.0,
             cpu_second_usd: 1e-5,
         }
@@ -149,11 +158,26 @@ mod tests {
     }
 
     #[test]
-    fn distance_prices_are_monotonic() {
+    fn distance_prices_strictly_increase_by_default() {
+        // Strict, so that a scheduler choosing between a node-local and a
+        // rack-local replica has a reason to prefer the closer one.
         let p = PriceTable::default();
         let at = |d| p.byte_usd(Tier::Hot, d);
-        assert!(at(Distance::Local) <= at(Distance::Near));
-        assert!(at(Distance::Near) <= at(Distance::Far));
+        assert!(at(Distance::Local) < at(Distance::Near));
+        assert!(at(Distance::Near) < at(Distance::Far));
+    }
+
+    #[test]
+    fn an_on_prem_table_may_price_every_distance_the_same() {
+        // Nothing requires the ordering to be strict; a deployment with no
+        // egress billing and a flat fabric can say so.
+        let flat = PriceTable {
+            near_multiplier: 1.0,
+            far_multiplier: 1.0,
+            ..PriceTable::default()
+        };
+        let at = |d| flat.byte_usd(Tier::Hot, d);
+        assert_eq!(at(Distance::Local), at(Distance::Far));
     }
 
     #[test]
