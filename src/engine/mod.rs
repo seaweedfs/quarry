@@ -33,4 +33,4 @@ pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_
 pub use materialized::{MaterializedResult, hash_plan};
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
-pub use table::{QuarryTable, ScanReport, hash_scalar};
+pub use table::{QuarryTable, ScanReport, SharedRegistry, hash_scalar, shared};

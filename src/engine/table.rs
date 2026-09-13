@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
@@ -26,6 +26,18 @@ use crate::derived::{Decision, DerivedId, FieldId, PolicyFingerprint, Predicate,
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
 use crate::workload::{Fingerprint, Observation};
+
+/// A registry several things can hold at once.
+///
+/// A plain `RwLock`: planning takes a read guard and never awaits while
+/// holding it, and the optimizer takes a write guard between rounds. An async
+/// lock would buy nothing and make the planning path await.
+pub type SharedRegistry = Arc<RwLock<Registry>>;
+
+/// Wrap a registry so it can be shared.
+pub fn shared(registry: Registry) -> SharedRegistry {
+    Arc::new(RwLock::new(registry))
+}
 
 /// Hash a literal the way [`QuarryTable`] does when probing an index.
 ///
@@ -123,7 +135,12 @@ pub struct QuarryTable {
     table: TableId,
     snapshot: SnapshotId,
     graph: SnapshotGraph,
-    registry: Registry,
+    /// Shared, because derived state changes while the table lives.
+    ///
+    /// The optimizer registers what it builds and drops what it retires
+    /// without the table being rebuilt — which is the difference between a
+    /// system that *can* be optimized and one that optimizes itself.
+    registry: SharedRegistry,
     files: Files,
     field_ids: BTreeMap<String, FieldId>,
     policy: PolicyFingerprint,
@@ -156,7 +173,7 @@ impl QuarryTable {
             table,
             snapshot,
             graph,
-            registry: Registry::new(),
+            registry: shared(Registry::new()),
             files: Files::Memory(BTreeMap::new()),
             field_ids,
             policy: PolicyFingerprint(0),
@@ -210,8 +227,19 @@ impl QuarryTable {
 
     /// Use this registry of derived state.
     pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = shared(registry);
+        self
+    }
+
+    /// Share an existing registry, so changes to it reach this table.
+    pub fn with_shared_registry(mut self, registry: SharedRegistry) -> Self {
         self.registry = registry;
         self
+    }
+
+    /// The registry this table consults.
+    pub fn registry(&self) -> &SharedRegistry {
+        &self.registry
     }
 
     /// Read as this principal.
@@ -348,8 +376,9 @@ impl QuarryTable {
         // substituting one is executable only if its rows were supplied to
         // `with_materialized`; otherwise it is skipped, which is the safe
         // direction — the answer is right, merely slower.
-        let usable = self
-            .registry
+        // A read guard, held only across planning, which does no I/O.
+        let registry = self.registry.read().expect("registry lock");
+        let usable = registry
             .candidates(&query, &self.graph, &self.prices)
             .into_iter()
             .find_map(|candidate| {
