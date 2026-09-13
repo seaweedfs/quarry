@@ -14,14 +14,14 @@ Everything else is derived, priced, and disposable.
 
 ## Status
 
-Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done, and phase 9 is under way. The
-decision core is 90 tests with **no dependencies**; DataFusion sits behind
-`--features engine` and adds 44 more, including SQL over real Parquet.
+Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
+decision core is 98 tests with **no dependencies**; DataFusion sits behind
+`--features engine` and adds 46 more, including SQL over real Parquet.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine        # 134 tests, incl. SQL over real Parquet
+cargo test --features engine        # 144 tests, incl. SQL over real Parquet
 cargo run --example explain         # no dependencies; walks a table over 4 commits
 ```
 
@@ -48,6 +48,7 @@ src/
   registry.rs   what exists, and which piece to use
   budget.rs     ceilings that stop execution, not estimates
   explain.rs    what a query will cost and why
+  facts.rs      what a backend can say about tiers and placement
   kinds/
     result_cache.rs   a stored answer to one exact query (substituting)
     index.rs          equality on one field, prunes files (pruning)

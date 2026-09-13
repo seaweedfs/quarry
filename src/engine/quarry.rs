@@ -35,6 +35,8 @@ use url::Url;
 
 use crate::budget::{Budget, Outcome};
 use crate::cost::{Cost, PriceTable};
+use crate::facts::{OpaqueStorage, StorageFacts};
+use crate::place::Place;
 
 use super::{CacheStats, MeteredStore, QuarryTable, RangeCache, StoreStats};
 
@@ -50,6 +52,8 @@ pub struct Quarry {
     origin_meter: Arc<MeteredStore>,
     cache: Option<Arc<RangeCache>>,
     prices: PriceTable,
+    facts: Arc<dyn StorageFacts>,
+    here: Place,
 }
 
 impl Quarry {
@@ -62,6 +66,8 @@ impl Quarry {
             origin_meter,
             cache: None,
             prices: PriceTable::default(),
+            facts: Arc::new(OpaqueStorage),
+            here: Place::unknown(),
         }
     }
 
@@ -81,12 +87,26 @@ impl Quarry {
             origin_meter,
             cache: Some(cache),
             prices: PriceTable::default(),
+            facts: Arc::new(OpaqueStorage),
+            here: Place::unknown(),
         }
     }
 
     /// Price reads differently — a colocated store, or one with no egress bill.
     pub fn with_prices(mut self, prices: PriceTable) -> Self {
         self.prices = prices;
+        self
+    }
+
+    /// Let the backend report where its objects are and which are cold.
+    ///
+    /// Without this everything is priced hot and far, which is what plain
+    /// object storage is. With it, a colocated or tiered backend costs less
+    /// where it should — and nothing here or in the optimizer learns which
+    /// backend it is talking to.
+    pub fn with_facts(mut self, facts: Arc<dyn StorageFacts>, here: Place) -> Self {
+        self.facts = facts;
+        self.here = here;
         self
     }
 
@@ -122,8 +142,11 @@ impl Quarry {
     /// fails rather than returning fewer rows, because a truncated answer
     /// looks complete.
     pub fn session_with_budget(&self, budget: Budget) -> Session {
-        let meter =
-            Arc::new(MeteredStore::new(Arc::clone(&self.shared)).with_budget(budget, self.prices));
+        let meter = Arc::new(
+            MeteredStore::new(Arc::clone(&self.shared))
+                .with_facts(Arc::clone(&self.facts), self.here.clone())
+                .with_budget(budget, self.prices),
+        );
         let ctx = SessionContext::new();
         ctx.register_object_store(&self.url, Arc::clone(&meter) as _);
         Session { ctx, meter }
@@ -263,6 +286,41 @@ mod tests {
 
         // Both draw on the same cache, so the shared one is what persists.
         assert!(quarry.cache_stats().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_reporting_backend_costs_less_than_an_opaque_one() {
+        use crate::facts::{PlacedStorage, Placement};
+        use object_store::PutPayload;
+        use object_store::path::Path;
+
+        let here = Place::parse("/onprem/dc1/rack2/node7");
+
+        /// Read one object through a session and report what it was charged.
+        async fn read_cost(quarry: &Quarry) -> f64 {
+            let session = quarry.session_with_budget(Budget::UNLIMITED);
+            session
+                .meter
+                .put(&Path::from("a"), PutPayload::from(vec![0u8; 1000]))
+                .await
+                .expect("put");
+            session.meter.get(&Path::from("a")).await.expect("get");
+            session.spent().usd
+        }
+
+        let opaque = Quarry::new(url(), Arc::new(InMemory::new()));
+        let placed = Quarry::new(url(), Arc::new(InMemory::new())).with_facts(
+            Arc::new(PlacedStorage::new().with_fallback(Placement::hot(here.clone()))),
+            here,
+        );
+
+        let opaque_cost = read_cost(&opaque).await;
+        let placed_cost = read_cost(&placed).await;
+
+        assert!(
+            placed_cost < opaque_cost,
+            "a backend that reports locality should cost less: {placed_cost} vs {opaque_cost}"
+        );
     }
 
     #[tokio::test]

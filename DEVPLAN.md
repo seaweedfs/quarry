@@ -460,15 +460,46 @@ once: origin bytes unchanged, cache hits above zero, session bytes above zero.
 
 ---
 
-## Phase 10 — Facts, telemetry, and the loop `[ ]`
+## Phase 10 — Facts, telemetry, and the loop `[~]`
 
-- [ ] `StorageFacts`: `tier`, `distance`, `commit_feed`, all `Option`
-- [ ] Two implementations: plain S3 (all `None`) and a locality-aware backend
+- [x] `StorageFacts`: `tier` and `distance`, both `Option`
+- [x] Two implementations: `OpaqueStorage` (all `None`) and `PlacedStorage`
+- [x] `resolve`: the one place defaults are applied
+- [x] Wired through `MeteredStore` and `Quarry`
+- [ ] `commit_notifications`, when there is something to consume it
 - [ ] Iceberg `ScanReport` ingestion; query telemetry
 - [ ] `auto_optimize`: build, measure realized benefit, retire
 
 **Done when** the optimizer contains no backend name, and an unused derived
-state is retired on its own.
+state is retired on its own. The first half holds: `MeteredStore` used to
+hardcode hot-and-far, and now asks the backend. Nothing outside `facts.rs`
+mentions a backend.
+
+**Found while implementing — "assume the worst" is wrong for one dimension.**
+`core-design.md` says an unanswered capability should default to "unknown,
+assume worst". That is right for distance and actively harmful for tier:
+
+```text
+unknown distance → Far
+    correct, and usually true. If a backend cannot say where an object
+    is, claiming locality would be a lie.
+
+unknown tier → Hot, NOT Cold
+    a backend that cannot report tiers almost certainly does not HAVE
+    them; plain S3 is uniformly hot. Defaulting to Cold multiplies every
+    price by the cold factor, overprices every read, and would abort
+    budgeted queries that should have succeeded.
+```
+
+Pessimism about a dimension a backend does not have is not caution, it is a
+made-up cost. `Resolved` carries an `assumed` flag so a caller can tell a
+reported answer from a defaulted one.
+
+**`commit_notifications` deliberately deferred.** The design names it as the
+third method and calls it the capability that decides whether derived state is
+maintainable. It is omitted until phase 10's loop can consume it: a method
+nothing reads is the speculative generality this project has already deleted
+once (`ByteRange`, phase 9).
 
 ---
 

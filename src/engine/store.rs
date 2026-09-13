@@ -22,8 +22,9 @@ use object_store::{
 };
 
 use crate::budget::{Budget, Exceeded, Meter, Outcome, Permit};
-use crate::cost::{PriceTable, Tier};
-use crate::place::Distance;
+use crate::cost::PriceTable;
+use crate::facts::{OpaqueStorage, StorageFacts, resolve};
+use crate::place::Place;
 
 /// What a [`MeteredStore`] has fetched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,14 +37,15 @@ pub struct StoreStats {
 
 /// Wraps an object store to count reads and enforce a budget.
 ///
-/// Reads are priced as hot and [`Distance::Far`] by default, which is what
-/// remote object storage is. A colocated store should say otherwise via
-/// [`MeteredStore::with_locality`], and then the same budget buys far more
-/// bytes — which is the whole point of pricing distance.
+/// What a read *costs* comes from asking the backend, through
+/// [`StorageFacts`]. A backend that cannot answer resolves to hot and
+/// [`Far`](crate::place::Distance::Far), which is what plain object storage is;
+/// one that reports placement makes the same budget buy far more bytes. Either
+/// way this type consults [`resolve`] and never asks which backend it has.
 pub struct MeteredStore {
     inner: Arc<dyn ObjectStore>,
-    tier: Tier,
-    distance: Distance,
+    facts: Arc<dyn StorageFacts>,
+    reader: Place,
     state: Mutex<State>,
 }
 
@@ -54,11 +56,14 @@ struct State {
 
 impl MeteredStore {
     /// Count reads against `inner`, without any ceiling.
+    ///
+    /// The backend is assumed to know nothing about placement; see
+    /// [`MeteredStore::with_facts`].
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
         MeteredStore {
             inner,
-            tier: Tier::Hot,
-            distance: Distance::Far,
+            facts: Arc::new(OpaqueStorage),
+            reader: Place::unknown(),
             state: Mutex::new(State {
                 stats: StoreStats::default(),
                 meter: None,
@@ -75,10 +80,10 @@ impl MeteredStore {
         self
     }
 
-    /// Declare how far away, and how cold, this store's bytes are.
-    pub fn with_locality(mut self, tier: Tier, distance: Distance) -> Self {
-        self.tier = tier;
-        self.distance = distance;
+    /// Ask `facts` what each object costs, from a reader at `reader`.
+    pub fn with_facts(mut self, facts: Arc<dyn StorageFacts>, reader: Place) -> Self {
+        self.facts = facts;
+        self.reader = reader;
         self
     }
 
@@ -112,11 +117,17 @@ impl MeteredStore {
             .unwrap_or(Outcome::Complete)
     }
 
-    /// Account for a read, and refuse it if the budget is spent.
+    /// Account for a read of `object`, and refuse it if the budget is spent.
     ///
     /// Charged *before* the ceiling is tested, so the reported spend reflects
     /// what was consumed rather than the last amount that happened to fit.
-    fn charge(&self, bytes: u64) -> OsResult<()> {
+    ///
+    /// The price comes from the backend rather than from a field here, so a
+    /// colocated hot object and a cold remote one are charged differently
+    /// without this code knowing which is which.
+    fn charge(&self, object: &Path, bytes: u64) -> OsResult<()> {
+        let resolved = resolve(self.facts.as_ref(), object.as_ref(), &self.reader);
+
         let mut state = self.state.lock().expect("store state");
         state.stats.bytes_fetched = state.stats.bytes_fetched.saturating_add(bytes);
         state.stats.requests += 1;
@@ -124,7 +135,7 @@ impl MeteredStore {
         let Some(meter) = state.meter.as_mut() else {
             return Ok(());
         };
-        match meter.charge(bytes, self.tier, self.distance) {
+        match meter.charge(bytes, resolved.tier, resolved.distance) {
             Permit::Continue => Ok(()),
             Permit::Stop(exceeded) => Err(object_store::Error::Generic {
                 store: "quarry",
@@ -163,8 +174,8 @@ impl fmt::Debug for MeteredStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MeteredStore")
             .field("inner", &self.inner)
-            .field("tier", &self.tier)
-            .field("distance", &self.distance)
+            .field("facts", &self.facts)
+            .field("reader", &self.reader)
             .field("stats", &self.stats())
             .finish()
     }
@@ -187,7 +198,7 @@ impl ObjectStore for MeteredStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let result = self.inner.get_opts(location, options).await?;
         let fetched = result.range.end.saturating_sub(result.range.start);
-        self.charge(fetched)?;
+        self.charge(location, fetched)?;
         Ok(result)
     }
 
@@ -232,6 +243,8 @@ impl ObjectStore for MeteredStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost::Tier;
+    use crate::place::Distance;
     use object_store::memory::InMemory;
 
     fn store() -> Arc<dyn ObjectStore> {
@@ -306,32 +319,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distance_decides_how_many_bytes_a_money_budget_buys() {
+    async fn what_the_backend_reports_decides_how_much_a_budget_buys() {
+        use crate::facts::{PlacedStorage, Placement};
+
         let prices = PriceTable::default();
         let budget = Budget::usd(prices.byte_usd(Tier::Hot, Distance::Far) * 150.0);
+        let here = Place::parse("/onprem/dc1/rack2/node7");
 
-        let far = MeteredStore::new(store())
-            .with_locality(Tier::Hot, Distance::Far)
+        // A backend that says nothing: everything is far.
+        let opaque = MeteredStore::new(store()).with_budget(budget, prices);
+
+        // A backend that reports the object as sitting on this very node.
+        let colocated = MeteredStore::new(store())
+            .with_facts(
+                Arc::new(PlacedStorage::new().with_fallback(Placement::hot(here.clone()))),
+                here,
+            )
             .with_budget(budget, prices);
-        let local = MeteredStore::new(store())
-            .with_locality(Tier::Hot, Distance::Local)
-            .with_budget(budget, prices);
 
-        put(&far, "a", &[0u8; 100]).await;
-        put(&local, "a", &[0u8; 100]).await;
+        put(&opaque, "a", &[0u8; 100]).await;
+        put(&colocated, "a", &[0u8; 100]).await;
 
-        assert!(far.get(&Path::from("a")).await.is_ok());
+        assert!(opaque.get(&Path::from("a")).await.is_ok());
         assert!(
-            far.get(&Path::from("a")).await.is_err(),
-            "200 far bytes cost more than the ceiling"
+            opaque.get(&Path::from("a")).await.is_err(),
+            "200 unplaced bytes are priced as far and exceed the ceiling"
         );
 
         for _ in 0..10 {
             assert!(
-                local.get(&Path::from("a")).await.is_ok(),
-                "the same money buys far more local bytes"
+                colocated.get(&Path::from("a")).await.is_ok(),
+                "the same money buys far more bytes the backend says are local"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_cold_object_is_charged_more_than_a_hot_one() {
+        use crate::facts::{PlacedStorage, Placement};
+
+        let here = Place::parse("/onprem/dc1/rack2/node7");
+        let facts = Arc::new(
+            PlacedStorage::new()
+                .with_prefix("hot/", Placement::hot(here.clone()))
+                .with_prefix("cold/", Placement::cold(here.clone())),
+        );
+
+        let metered = MeteredStore::new(store())
+            .with_facts(facts, here)
+            .with_budget(Budget::UNLIMITED, PriceTable::default());
+
+        put(&metered, "hot/a", &[0u8; 100]).await;
+        metered.get(&Path::from("hot/a")).await.expect("hot read");
+        let after_hot = metered.spent().usd;
+
+        put(&metered, "cold/a", &[0u8; 100]).await;
+        metered.get(&Path::from("cold/a")).await.expect("cold read");
+        let cold_cost = metered.spent().usd - after_hot;
+
+        assert!(
+            cold_cost > after_hot,
+            "the same 100 bytes cost {cold_cost} cold against {after_hot} hot"
+        );
     }
 
     #[tokio::test]

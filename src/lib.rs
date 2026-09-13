@@ -25,6 +25,7 @@ pub mod derived;
 #[cfg(feature = "engine")]
 pub mod engine;
 pub mod explain;
+pub mod facts;
 pub mod kinds;
 pub mod place;
 pub mod registry;
