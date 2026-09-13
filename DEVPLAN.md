@@ -308,7 +308,7 @@ behind `--features engine`.
 - [x] `Quarry` / `Session`: one place that assembles the stack
 - [x] `from_iceberg`: a `SnapshotGraph` derived from real Iceberg metadata
 - [x] `table_from_iceberg`: SQL over a real Iceberg table, planned by the rule
-- [ ] Iceberg REST catalog client
+- [x] `table_from_catalog`: SQL over a table loaded from a REST catalog
 
 **Design constraint.** Use DataFusion's own extension points —
 `ObjectStore`, `TableProvider`, `Catalog` — not parallel ones. Held: the only
@@ -506,6 +506,24 @@ becomes `data/a.parquet`, and the bucket travels with the store's URL. Doing it
 once, in the bridge, means `FileId` means the same thing to the rule and to the
 scan, and neither converts. This was a latent mismatch: the engine tests had
 been using absolute local paths, which happened to work.
+
+**The catalog needed no dependency.** `table_from_catalog` takes
+`iceberg::table::Table`, which every catalog implementation hands back carrying
+both the metadata and a `FileIO` configured for wherever the table lives. So
+the library depends on no catalog at all — REST, in-memory, Glue and anything
+else work through the same three-line function. `iceberg-catalog-rest` and
+`mockito` are pulled in only by the `rest-catalog` feature, for the test.
+
+The test is worth having anyway, because it exercises the deployment shape that
+matters: a catalog URI, a table name, a query. `iceberg-catalog-rest` talks
+real HTTP over a real socket to a mock server answering `/v1/config` and
+`loadTable`, and the table below it is on disk. Pruning through the catalog path
+is asserted to match pruning through the local path exactly.
+
+One configuration detail that would have cost an afternoon: the mock's
+`/v1/config` returns **no** `warehouse` override. The client derives its
+`FileIO` from `warehouse.or(metadata_location)`, so an `s3://` warehouse would
+send it looking for S3 credentials for a table sitting on local disk.
 
 **One API trap worth recording.** `ManifestWriter::add_delete_file` reads as
 though it adds a delete file. It does not — it sets the entry's status to

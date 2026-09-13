@@ -27,7 +27,7 @@ mod table;
 
 pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
-pub use iceberg_table::{arrow_schema, field_ids, table_from_iceberg};
+pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};
 pub use materialized::{MaterializedResult, hash_plan};
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};

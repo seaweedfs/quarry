@@ -15,14 +15,15 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
-decision core is 98 tests with **no dependencies**. Two optional features add
-67 more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
-table metadata, and together they query a genuine Iceberg table.
+decision core is 98 tests with **no dependencies**. Optional features add 71
+more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
+table metadata, and `rest-catalog` queries a table loaded from a live Iceberg
+REST catalog over HTTP.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine,iceberg   # 165 tests
+cargo test --features rest-catalog     # 169 tests, incl. a live REST catalog
 cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 
@@ -68,6 +69,7 @@ tests/
   engine_parquet.rs real Parquet on an object store, selected by the rule
   iceberg_bridge.rs a genuine Iceberg table: metadata, manifest lists, manifests
   iceberg_sql.rs    SQL over that table, with the rule choosing objects
+  iceberg_rest.rs   the same, loaded from a REST catalog over a real socket
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place

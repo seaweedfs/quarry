@@ -16,6 +16,7 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::spec::TableMetadata;
+use iceberg::table::Table;
 
 use crate::derived::FieldId;
 use crate::from_iceberg::{current_snapshot, live_data_files, snapshot_graph, table_id};
@@ -55,6 +56,35 @@ pub async fn table_from_iceberg(
         table = table.with_parquet_file(file, size);
     }
     Ok(table)
+}
+
+/// Build a [`QuarryTable`] over a table loaded from any Iceberg catalog.
+///
+/// Takes [`iceberg::table::Table`] rather than a particular catalog type,
+/// which is why this crate depends on no catalog implementation at all: REST,
+/// in-memory, Glue and anything else all hand back the same `Table`, carrying
+/// the metadata and the `FileIO` configured for wherever it lives.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use datafusion::datasource::object_store::ObjectStoreUrl;
+/// # use iceberg::{Catalog, TableIdent};
+/// # async fn example(catalog: &dyn Catalog) -> iceberg::Result<()> {
+/// let table = catalog.load_table(&TableIdent::from_strs(["db", "events"])?).await?;
+/// let queryable = quarry::engine::table_from_catalog(
+///     &table,
+///     ObjectStoreUrl::local_filesystem(),
+///     None,
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn table_from_catalog(
+    table: &Table,
+    url: ObjectStoreUrl,
+    at: Option<SnapshotId>,
+) -> iceberg::Result<QuarryTable> {
+    table_from_iceberg(table.metadata(), table.file_io(), url, at).await
 }
 
 /// The table's Arrow schema.
