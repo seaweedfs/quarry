@@ -555,7 +555,7 @@ deletes vanish rather than fail, and it was the bridge's
 - [ ] Publishing to Iceberg `TableMetadata.statistics`
 - [x] Credits and the shape aggregate persisted, with a retirement grace window
 - [ ] `commit_notifications`, so a round knows the table moved without asking
-- [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
+- [x] Telemetry from other engines, so the workload is the table's, not ours
 
 **Done when** the optimizer contains no backend name, and an unused derived
 state is retired on its own. **Both halves now hold.** `MeteredStore` used to
@@ -1333,3 +1333,52 @@ Parquet records bounds for it, but comparing the *width* of two string ranges
 would invent a distance that does not exist, so the estimate refuses them.
 Types whose values are ordered but not measurable get no automatic index,
 which is a real limitation and an honest one.
+
+
+---
+
+## Phase 18 — Cross-engine telemetry `[x]`
+
+The optimizer only ever saw queries that came through this engine, which in a
+real lakehouse is a minority of them. Spark and Trino read the same tables, and
+an index built for what *we* happen to serve optimizes for a sample rather than
+for the workload.
+
+### Not Iceberg's `ScanReport`, because there isn't one
+
+`iceberg-rust` 0.6 has no metrics reporting at all — no `ScanReport`, no
+`MetricsReporter`. There was nothing to adapt from, and coupling to an absent
+API would have been the wrong shape anyway: the point is to accept telemetry
+from *any* engine. `ForeignScan` mirrors the fields Iceberg's REST
+`report-metrics` payload carries, so a handler for it can populate this
+directly, without the type being Iceberg's.
+
+### Two things a foreign engine does not have to be trusted with
+
+```text
+literals        a Fingerprint keeps only WHICH fields were restricted and
+                whether an equality could probe them. Nothing depends on
+                another engine hashing values the way this one does, and no
+                value crosses the boundary.
+
+the baseline    bytes_if_full_scan comes from the table's own file sizes,
+                not from the report. It is what every saving is measured
+                against, so a reporter that under-states what it read
+                cannot inflate a saving.
+```
+
+And `used` is always `None`: another engine cannot have been served by derived
+state it does not know about. If foreign scans could credit an index, a useless
+one would look busy and survive retirement forever.
+
+### The property it all rests on
+
+A scan reported by another engine must land in the *same* shape as the identical
+query run here. If it did not, cross-engine telemetry would aggregate nothing
+and the optimizer would still see only its own traffic.
+`a_foreign_scan_shares_a_shape_with_an_identical_local_query` asserts the
+fingerprints are equal and that two observations collapse to one shape.
+
+`another_engines_traffic_alone_justifies_an_index` is the end-to-end case: not a
+single query runs through this engine, and a round still builds a real index
+that a later local query uses.

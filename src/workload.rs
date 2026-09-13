@@ -44,7 +44,7 @@ use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, Predicate, Query};
 use crate::layout::Spread;
 use crate::registry::Registry;
-use crate::snapshot::TableId;
+use crate::snapshot::{SnapshotId, TableId};
 
 /// The shape of a query, with literals stripped.
 ///
@@ -106,6 +106,70 @@ impl Observation {
     /// as having saved nothing rather than as a negative saving.
     pub fn bytes_saved(&self) -> u64 {
         self.bytes_if_full_scan.saturating_sub(self.bytes_read)
+    }
+}
+
+/// A scan another engine ran, as it can describe it.
+///
+/// The optimizer only sees queries that came through this engine, which in a
+/// real lakehouse is a minority of them: Spark and Trino read the same tables
+/// and their traffic is invisible here. An index built for what *we* happen to
+/// serve optimizes for a sample, not for the workload.
+///
+/// # Why this is not Iceberg's `ScanReport`
+///
+/// `iceberg-rust` 0.6 has no metrics reporting at all — no `ScanReport`, no
+/// `MetricsReporter` — so there is no type to adapt from. Coupling to an absent
+/// API would be worse than this in any case: the point is to accept telemetry
+/// from *any* engine. The shape below deliberately mirrors the fields Iceberg's
+/// REST `report-metrics` payload carries, so a handler for it can populate this
+/// directly.
+///
+/// # What a foreign engine does not have to share
+///
+/// Notably, not literal values. A [`Fingerprint`] keeps only *which* fields
+/// were restricted and whether an equality could probe them — literals are
+/// dropped, so nothing here depends on another engine hashing values the way
+/// this one does, and no value crosses the boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignScan {
+    /// The table read.
+    pub table: TableId,
+    /// The snapshot read.
+    pub snapshot: SnapshotId,
+    /// Fields the query read.
+    pub projected: BTreeSet<FieldId>,
+    /// Fields compared for equality, which an index could probe.
+    pub equalities: BTreeSet<FieldId>,
+    /// Fields restricted some other way.
+    pub restrictions: BTreeSet<FieldId>,
+    /// Bytes the scan read.
+    pub bytes_read: u64,
+}
+
+impl ForeignScan {
+    /// What to record about this scan.
+    ///
+    /// `bytes_if_full_scan` is the caller's to supply from the table's own file
+    /// sizes rather than the reporter's to claim — it is the baseline every
+    /// saving is measured against, and a foreign engine has no reason to be
+    /// trusted with it.
+    ///
+    /// `used` is always `None`: another engine cannot have been served by
+    /// derived state it does not know about, so these scans inform *what to
+    /// build* without ever crediting anything.
+    pub fn observation(&self, bytes_if_full_scan: u64) -> Observation {
+        Observation {
+            fingerprint: Fingerprint {
+                table: self.table.clone(),
+                probeable: self.equalities.clone(),
+                opaque: self.restrictions.clone(),
+                projected: self.projected.clone(),
+            },
+            bytes_read: self.bytes_read,
+            bytes_if_full_scan,
+            used: None,
+        }
     }
 }
 
@@ -484,6 +548,71 @@ mod tests {
             bytes_if_full_scan: bytes,
             used: None,
         }
+    }
+
+    fn foreign(fields: &[FieldId], bytes: u64) -> ForeignScan {
+        ForeignScan {
+            table: table(),
+            snapshot: SnapshotId(1),
+            projected: BTreeSet::from([7]),
+            equalities: fields.iter().copied().collect(),
+            restrictions: BTreeSet::new(),
+            bytes_read: bytes,
+        }
+    }
+
+    /// The property the whole thing rests on.
+    ///
+    /// If a scan reported by Spark does not land in the same bucket as the same
+    /// query run here, cross-engine telemetry aggregates nothing and the
+    /// optimizer still only sees its own traffic.
+    #[test]
+    fn a_foreign_scan_shares_a_shape_with_an_identical_local_query() {
+        let local = unaided(&[4], GB);
+        let remote = foreign(&[4], GB).observation(GB);
+        assert_eq!(
+            local.fingerprint, remote.fingerprint,
+            "the same question asked by two engines is one shape"
+        );
+
+        let mut workload = Workload::new();
+        workload.observe(local);
+        workload.observe(remote);
+        assert_eq!(workload.shapes(), 1, "they must aggregate, not sit apart");
+        assert_eq!(workload.observed(), 2);
+    }
+
+    #[test]
+    fn foreign_traffic_alone_can_justify_an_index() {
+        // A table this engine barely serves, and another hammers.
+        let mut workload = Workload::new();
+        for _ in 0..10 {
+            workload.observe(foreign(&[4], GB).observation(GB));
+        }
+
+        let proposals = workload.proposals(&PriceTable::default(), 5);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].field, 4);
+        assert_eq!(proposals[0].queries, 10);
+    }
+
+    #[test]
+    fn a_foreign_scan_credits_nothing() {
+        // Another engine cannot have used derived state it does not know
+        // about, so these observations must never make an index look useful.
+        let mut workload = Workload::new();
+        workload.observe(foreign(&[4], GB / 10).observation(GB));
+        assert!(workload.credits().next().is_none());
+    }
+
+    #[test]
+    fn the_baseline_is_the_callers_to_supply_not_the_reporters() {
+        // A reporter that under-states what it read cannot inflate a saving,
+        // because the baseline comes from the table's own file sizes.
+        let scan = foreign(&[4], GB / 4);
+        let observation = scan.observation(GB);
+        assert_eq!(observation.bytes_if_full_scan, GB);
+        assert_eq!(observation.bytes_saved(), GB - GB / 4);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 #![cfg(feature = "engine")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use quarry::kinds::Index;
 use quarry::layout::Spread;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
-use quarry::workload::{Policy, Workload};
+use quarry::workload::{ForeignScan, Policy, Workload};
 
 const TENANT_FIELD: u32 = 4;
 const MESSAGE_FIELD: u32 = 7;
@@ -1300,4 +1300,105 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         bytes_if_full_scan: bytes,
         used: None,
     }
+}
+
+/// Traffic from another engine building an index this one never asked for.
+///
+/// The optimizer only ever saw queries that came through here, which in a real
+/// lakehouse is a minority of them. A table that Spark hammers and this engine
+/// barely touches would have been left unoptimized.
+#[tokio::test]
+async fn another_engines_traffic_alone_justifies_an_index() {
+    let fixture = fixture("loop_foreign");
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30).with_min_queries(3),
+    )
+    .for_reader(POLICY)
+    .with_spreads(BTreeMap::from([(
+        TENANT_FIELD,
+        Spread {
+            files: 4,
+            files_by_bounds: 4.0,
+            files_by_index: 1.0,
+        },
+    )]));
+
+    // Not one query runs through this engine. Everything below is reported.
+    let reported = ForeignScan {
+        table: TableId("events".into()),
+        snapshot: SnapshotId(1),
+        projected: BTreeSet::from([TENANT_FIELD]),
+        equalities: BTreeSet::from([TENANT_FIELD]),
+        restrictions: BTreeSet::new(),
+        bytes_read: fixture.sizes.values().sum(),
+    };
+    let baseline = served.live_bytes();
+    for _ in 0..5 {
+        optimizer.observe(reported.observation(baseline));
+    }
+
+    assert_eq!(
+        optimizer.proposals().len(),
+        1,
+        "foreign traffic should be enough to propose"
+    );
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(
+        round.built.len(),
+        1,
+        "and enough to build, without this engine running anything: {round:?}"
+    );
+
+    // The index is real, and a query here now uses it.
+    let rows: usize = session
+        .sql("SELECT * FROM events WHERE tenant_id = 1")
+        .await
+        .expect("query")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 500);
+    let report = served.last_scan().expect("scan");
+    assert_eq!(report.used.as_deref(), Some(round.built[0].0.as_str()));
+}
+
+#[tokio::test]
+async fn a_foreign_scan_never_credits_an_index() {
+    // Another engine cannot have been served by derived state it does not know
+    // about. If its scans credited an index, a useless one would look busy and
+    // survive retirement forever.
+    let fixture = fixture("loop_foreign_credit");
+    let registry = shared(Registry::new());
+    let mut optimizer = Optimizer::new(Arc::clone(&registry), Policy::automatic(1 << 30));
+
+    let reported = ForeignScan {
+        table: TableId("events".into()),
+        snapshot: SnapshotId(1),
+        projected: BTreeSet::from([TENANT_FIELD]),
+        equalities: BTreeSet::from([TENANT_FIELD]),
+        restrictions: BTreeSet::new(),
+        bytes_read: 1,
+    };
+    for _ in 0..200 {
+        optimizer.observe(reported.observation(fixture.sizes.values().sum()));
+    }
+
+    assert!(
+        optimizer
+            .workload()
+            .credited(&index_id(&TableId("events".into()), TENANT_FIELD))
+            .is_none(),
+        "no foreign scan may credit anything"
+    );
 }
