@@ -285,6 +285,29 @@ impl QuarryTable {
         self.snapshot
     }
 
+    /// The table's snapshot history.
+    pub fn graph(&self) -> &SnapshotGraph {
+        &self.graph
+    }
+
+    /// Bytes of live data at the queried snapshot.
+    ///
+    /// The unaided cost of a query, and the denominator for asking how much of
+    /// the table a stale piece of derived state can no longer help with.
+    pub fn live_bytes(&self) -> u64 {
+        let Some(snapshot) = self.graph.get(self.snapshot) else {
+            return 0;
+        };
+        match &self.files {
+            Files::Parquet { sizes, .. } => snapshot
+                .files()
+                .keys()
+                .filter_map(|file| sizes.get(file))
+                .sum(),
+            Files::Memory(_) => 0,
+        }
+    }
+
     /// This table's identity.
     pub fn table_id(&self) -> &TableId {
         &self.table

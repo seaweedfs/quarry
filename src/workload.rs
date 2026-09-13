@@ -175,6 +175,18 @@ pub struct Policy {
     /// Most builds in one round, so a cold start cannot build everything at
     /// once.
     pub max_builds_per_round: usize,
+    /// How much of a table derived state may fall behind before it is rebuilt,
+    /// as a percentage.
+    ///
+    /// A pruning index stays *correct* as a table grows — the rule reads the
+    /// files added since alongside it — but it helps less and less, because
+    /// that residual is scanned every query. Left alone it decays toward
+    /// useless while still being credited with the savings it once earned, so
+    /// retirement will not catch it.
+    ///
+    /// Measured against bytes rather than commits: ten tiny appends matter
+    /// less than one large one, and the file sizes are known exactly.
+    pub max_residual_pct: f64,
 }
 
 impl Policy {
@@ -185,6 +197,7 @@ impl Policy {
         min_queries: 10,
         horizon_days: 30.0,
         max_builds_per_round: 1,
+        max_residual_pct: 25.0,
     };
 
     /// Act, keeping derived state under `budget_bytes`.

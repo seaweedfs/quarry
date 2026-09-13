@@ -21,10 +21,10 @@
 //! estimation informs, enforcement decides. A build that turns out too large
 //! for the remaining budget is discarded rather than kept and apologised for.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
-use crate::derived::{DerivedId, PolicyFingerprint};
+use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::workload::{Observation, Policy, Proposal, Workload};
 
 use super::{QuarryTable, Session, SharedRegistry, build_proposed_index, index_id};
@@ -34,6 +34,8 @@ use super::{QuarryTable, Session, SharedRegistry, build_proposed_index, index_id
 pub struct Round {
     /// Derived state built and registered.
     pub built: Vec<DerivedId>,
+    /// Derived state rebuilt because the table had moved out from under it.
+    pub refreshed: Vec<DerivedId>,
     /// Derived state dropped because it had not paid for itself.
     pub retired: Vec<DerivedId>,
     /// Proposals not acted on, and why.
@@ -43,7 +45,7 @@ pub struct Round {
 impl Round {
     /// Whether anything changed.
     pub fn changed_anything(&self) -> bool {
-        !self.built.is_empty() || !self.retired.is_empty()
+        !self.built.is_empty() || !self.refreshed.is_empty() || !self.retired.is_empty()
     }
 }
 
@@ -70,6 +72,18 @@ pub struct Optimizer {
     policy: Policy,
     prices: PriceTable,
     reader: PolicyFingerprint,
+    /// What this optimizer built, and on which field.
+    ///
+    /// Needed to rebuild a piece that has fallen behind, and kept here rather
+    /// than asked of the piece itself: a `Kind` describes what it can answer,
+    /// not how to remake it, and growing that trait to carry build
+    /// instructions would make every kind pay for this one's convenience.
+    ///
+    /// A consequence worth naming: the optimizer maintains only what it built.
+    /// Derived state registered by hand is left alone, which is the right
+    /// default — and it is lost on restart, along with the in-memory registry
+    /// itself.
+    built: BTreeMap<DerivedId, FieldId>,
 }
 
 impl Optimizer {
@@ -84,6 +98,7 @@ impl Optimizer {
             policy,
             prices: PriceTable::default(),
             reader: PolicyFingerprint(0),
+            built: BTreeMap::new(),
         }
     }
 
@@ -166,7 +181,29 @@ impl Optimizer {
             }
         }
 
-        // 2. Build, most at stake first.
+        // 2. Refresh what the table has moved out from under.
+        //
+        // Not reachable through proposals: the stale piece is still serving
+        // queries, so its shape counts as helped and nothing asks for it
+        // again. Left alone it decays while still being credited with what it
+        // once saved, which is why retirement does not catch it either.
+        for (id, field) in self.stale(table) {
+            let rebuilt =
+                build_proposed_index(session, table, field, id.clone(), self.reader).await;
+            let Ok(derived) = rebuilt else {
+                round.declined.push((id, Declined::BuildFailed));
+                continue;
+            };
+            // Replaced only once the replacement exists, so a failed rebuild
+            // leaves the stale-but-correct piece in place rather than nothing.
+            self.registry
+                .write()
+                .expect("registry lock")
+                .register(derived);
+            round.refreshed.push(id);
+        }
+
+        // 3. Build, most at stake first.
         let existing: BTreeSet<DerivedId> = self
             .registry
             .read()
@@ -198,9 +235,9 @@ impl Optimizer {
                 continue;
             };
 
-            // 3. The ceiling, applied to what was produced. An index's size
-            //    cannot be known before building it, so this is the only
-            //    honest place to check.
+            // The ceiling, applied to what was produced. An index's size
+            // cannot be known before building it, so this is the only honest
+            // place to check.
             let held = self.registry.read().expect("registry lock").bytes();
             if held + derived.bytes > self.policy.budget_bytes {
                 round.declined.push((id, Declined::OverBudget));
@@ -211,10 +248,54 @@ impl Optimizer {
                 .write()
                 .expect("registry lock")
                 .register(derived);
+            self.built.insert(id.clone(), proposal.field);
             round.built.push(id);
         }
 
         round
+    }
+
+    /// Derived state this optimizer built that has fallen too far behind.
+    ///
+    /// Staleness is the fraction of the table the piece cannot help with —
+    /// the files added since it was built, which every query must scan
+    /// alongside it. Bytes rather than commits, because ten tiny appends
+    /// matter less than one large one, and both are known exactly.
+    fn stale(&self, table: &QuarryTable) -> Vec<(DerivedId, FieldId)> {
+        let live = table.live_bytes();
+        if live == 0 {
+            return Vec::new();
+        }
+        let Some((_, sizes)) = table.parquet_files() else {
+            return Vec::new();
+        };
+        let limit = self.policy.max_residual_pct / 100.0;
+        let registry = self.registry.read().expect("registry lock");
+
+        self.built
+            .iter()
+            .filter(|(id, _)| registry.get(id).is_some())
+            .filter(|(id, _)| {
+                let Some(derived) = registry.get(id) else {
+                    return false;
+                };
+                if derived.source.table != *table.table_id() {
+                    return false;
+                }
+                let Some(diff) = table
+                    .graph()
+                    .diff(derived.source.snapshot, table.snapshot())
+                else {
+                    // Lineage the graph cannot relate: the rule already
+                    // refuses it, so it saves nothing and retirement will
+                    // drop it. Rebuilding is not this step's job.
+                    return false;
+                };
+                let residual: u64 = diff.added.iter().filter_map(|file| sizes.get(file)).sum();
+                residual as f64 / live as f64 > limit
+            })
+            .map(|(id, field)| (id.clone(), *field))
+            .collect()
     }
 }
 

@@ -83,9 +83,33 @@ fn write_parquet(dir: &Path, name: &str, tenant: i64, rows: usize) -> (FileId, u
 }
 
 struct Fixture {
+    dir: PathBuf,
     sizes: BTreeMap<FileId, u64>,
     graph: SnapshotGraph,
     files: Vec<FileId>,
+    at: SnapshotId,
+}
+
+impl Fixture {
+    /// Commit a new snapshot appending one file of `rows` rows for `tenant`.
+    ///
+    /// What a table does between rounds, and what makes an index built earlier
+    /// progressively less useful.
+    fn append(&mut self, tenant: i64, rows: usize) -> FileId {
+        let name = format!("appended-{}.parquet", self.files.len());
+        let (file, size) = write_parquet(&self.dir, &name, tenant, rows);
+        self.sizes.insert(file.clone(), size);
+        self.files.push(file.clone());
+
+        let next = SnapshotId(self.at.0 + 1);
+        let mut snapshot = Snapshot::child_of(next, self.at);
+        for existing in &self.files {
+            snapshot = snapshot.with_clean_file(existing.clone());
+        }
+        self.graph.insert(snapshot);
+        self.at = next;
+        file
+    }
 }
 
 /// Four files: tenant 1 in the first, tenants 2..5 in the rest.
@@ -106,9 +130,11 @@ fn fixture(name: &str) -> Fixture {
     }
 
     Fixture {
+        dir,
         sizes,
         graph: SnapshotGraph::new().with(snapshot),
         files,
+        at: SnapshotId(1),
     }
 }
 
@@ -425,11 +451,14 @@ async fn a_budget_of_nothing_declines_the_build() {
 }
 
 /// A table sharing `registry`, so the optimizer's builds reach it.
+///
+/// Reads whatever snapshot the fixture is currently at, as a table rebuilt
+/// from a catalog would.
 fn shared_table(fixture: &Fixture, registry: quarry::engine::SharedRegistry) -> QuarryTable {
     let mut table = QuarryTable::new(
         schema(),
         TableId("events".into()),
-        SnapshotId(1),
+        fixture.at,
         fixture.graph.clone(),
         field_ids(),
     )
@@ -440,6 +469,149 @@ fn shared_table(fixture: &Fixture, registry: quarry::engine::SharedRegistry) -> 
         table = table.with_parquet_file(file.clone(), *size);
     }
     table
+}
+
+/// An index the table has grown past is rebuilt, not left to decay.
+#[tokio::test]
+async fn a_stale_index_is_refreshed_when_the_table_grows() {
+    let mut fixture = fixture("loop_refresh");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let registry = shared(Registry::new());
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        // A tenth of the table is as far behind as an index may fall.
+        Policy {
+            max_residual_pct: 10.0,
+            ..Policy::automatic(1 << 30).with_min_queries(3)
+        },
+    )
+    .for_reader(POLICY);
+
+    // Build an index at snapshot 1.
+    {
+        let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+        let session = quarry().session();
+        session
+            .register("events", Arc::clone(&served))
+            .expect("register");
+        for _ in 0..5 {
+            session.sql(sql).await.expect("query");
+            let report = served.last_scan().expect("scan");
+            optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+        }
+        let round = optimizer.round(&session, &served).await;
+        assert_eq!(round.built.len(), 1, "built at snapshot 1: {round:?}");
+    }
+
+    // The table grows substantially, with more rows for tenant 1 in the new
+    // file. The old index cannot know about it.
+    let appended = fixture.append(1, 2_000);
+    assert_eq!(fixture.at, SnapshotId(2));
+
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    // Correct but decayed: the stale index still serves, and the appended file
+    // is read alongside it every single query.
+    let rows: usize = session
+        .sql(sql)
+        .await
+        .expect("query")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 2_500, "every tenant-1 row, old and new");
+    let report = served.last_scan().expect("scan");
+    assert!(
+        report.also_scanned.contains(&appended),
+        "the appended file must be scanned alongside a stale index"
+    );
+    optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+
+    // The round rebuilds it at the new snapshot.
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.refreshed.len(), 1, "should refresh: {round:?}");
+    assert!(round.built.is_empty(), "a refresh is not a new build");
+
+    // Now the appended file is indexed, not merely tolerated.
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+    let rows: usize = session
+        .sql(sql)
+        .await
+        .expect("query")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 2_500, "the answer must not change");
+
+    let report = served.last_scan().expect("scan");
+    assert!(
+        report.also_scanned.is_empty(),
+        "nothing should be residual now: {report:?}"
+    );
+    assert!(
+        report.files_read.contains(&appended),
+        "the appended file is now reached through the index"
+    );
+    assert_eq!(
+        report.files_read.len(),
+        2,
+        "only the two files holding tenant 1"
+    );
+}
+
+#[tokio::test]
+async fn a_small_append_does_not_trigger_a_rebuild() {
+    let mut fixture = fixture("loop_no_refresh");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let registry = shared(Registry::new());
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy {
+            max_residual_pct: 25.0,
+            ..Policy::automatic(1 << 30).with_min_queries(3)
+        },
+    )
+    .for_reader(POLICY);
+
+    {
+        let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+        let session = quarry().session();
+        session
+            .register("events", Arc::clone(&served))
+            .expect("register");
+        for _ in 0..5 {
+            session.sql(sql).await.expect("query");
+            let report = served.last_scan().expect("scan");
+            optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+        }
+        assert_eq!(optimizer.round(&session, &served).await.built.len(), 1);
+    }
+
+    // A handful of rows against four files of five hundred: well inside the
+    // threshold, and rebuilding would cost more than it recovers.
+    fixture.append(9, 5);
+
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round.refreshed.is_empty(),
+        "a trivial append is not worth a rebuild: {round:?}"
+    );
 }
 
 #[tokio::test]

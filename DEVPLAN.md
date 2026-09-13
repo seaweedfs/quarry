@@ -548,9 +548,9 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] The loop, tested end to end on real queries over real Parquet
 - [x] `build_index`: building a proposed index by reading the data
 - [x] `Policy` and `Optimizer`: a driver that runs the loop on its own
-- [ ] `commit_notifications`, when there is something to consume it
+- [x] Refresh: rebuilding derived state the table has grown past
+- [ ] `commit_notifications`, so a round knows the table moved without asking
 - [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
-- [ ] Rebuilding derived state when the table's snapshot moves
 
 **Done when** the optimizer contains no backend name, and an unused derived
 state is retired on its own. **Both halves now hold.** `MeteredStore` used to
@@ -650,6 +650,44 @@ Rebuilding after a freshly-built index would otherwise happen every round: the
 index has not served a query yet, so the workload still sees the shape as
 unaided. The round checks by id, which is why `index_id` is derived from
 `(table, field)` rather than being random.
+
+**Decay: the failure the driver made visible.** An index is built against one
+snapshot. When the table commits, the rule keeps using it — correctly, reading
+the files added since alongside it — so the answer stays right. But that
+residual is scanned by *every* query, growing with the table, until the index is
+doing almost nothing.
+
+Neither existing mechanism catches this:
+
+```text
+retirement   won't: the index is still credited with savings, just
+             less and less of them
+
+proposals    won't: the shape is being served, so it counts as helped
+             and nothing asks for an index again
+```
+
+So `round()` gained a **refresh** step between retiring and building. Staleness
+is measured as the fraction of the table the piece cannot help with — the added
+files' bytes over the live bytes — because ten tiny appends matter less than one
+large one and both sizes are known exactly. `Policy::max_residual_pct` is the
+threshold.
+
+The replacement is registered only once it exists, so a failed rebuild leaves
+the stale-but-correct piece in place rather than nothing.
+
+**Rebuilding needs to know what to rebuild, and the `Kind` will not say.** A
+kind describes what it can *answer*, not how to remake itself, and growing that
+trait to carry build instructions would make every kind pay for this one's
+convenience. So the optimizer remembers what it built. The consequence, stated
+plainly: it maintains only its own work — derived state registered by hand is
+left alone — and it forgets on restart, along with the in-memory registry.
+
+**The rollback case turns out to self-heal, because retirement runs first.** A
+piece built on an abandoned branch is refused by the rule, so it saves nothing,
+so retirement drops it; the eligible-to-build set is computed *after* that, so
+the same round rebuilds it. That ordering was chosen to free budget and happens
+to fix this too.
 
 **A unit test was deleted for asserting on constants.** `Policy::ADVISORY` is a
 `const`, so `assert!(!Policy::ADVISORY.auto_optimize)` is constant-folded and

@@ -15,7 +15,7 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
-decision core is 113 tests with **no dependencies**. Optional features add 84
+decision core is 112 tests with **no dependencies**. Optional features add 87
 more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
 table metadata, and `rest-catalog` queries a table loaded from a live Iceberg
 REST catalog over HTTP.
@@ -23,7 +23,7 @@ REST catalog over HTTP.
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features rest-catalog     # 197 tests, incl. a live REST catalog
+cargo test --features rest-catalog     # 199 tests, incl. a live REST catalog
 cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 
@@ -37,7 +37,8 @@ query twice and the second fetches zero bytes from storage.
 And the loop runs itself. Set a policy and the optimizer watches what queries
 ask for, proposes the index that would help, builds it by reading only that
 column, registers it against the live table, credits it with what it measurably
-saved, and retires derived state that has not paid for keeping it:
+saved, rebuilds it once the table has grown past it, and retires derived state
+that has not paid for keeping it:
 
 ```rust
 let mut optimizer = Optimizer::new(registry, Policy::automatic_pct(table_bytes, 5.0));
@@ -71,7 +72,7 @@ src/
     table.rs          a DataFusion TableProvider planned by the rule
     iceberg_table.rs  a QuarryTable over a real Iceberg table
     build.rs          builds the index the loop proposed, by reading the data
-    optimizer.rs      runs the loop: retire, build, enforce the budget
+    optimizer.rs      runs the loop: retire, refresh, build, enforce the budget
     materialized.rs   a Kind holding Arrow batches, defined outside the core
     store.rs          an object store that counts bytes and enforces budgets
     cache.rs          a read-through cache for ranges of immutable objects
