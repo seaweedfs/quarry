@@ -1201,5 +1201,67 @@ genuine Iceberg table, default policy, nothing supplied, and it reaches
   meaningfully rather than by an upper bound that measured 1775x off.
 - Bounds for non-Iceberg Parquet tables, from footer statistics. Without them
   the gate declines on a plain Parquet table.
-- Overlap is sampled from two files. A wider sample would cost more and be
-  more accurate; nothing has measured whether two is enough.
+- Nothing measures whether the *ranking* of proposals is any good, only
+  whether individual decisions are.
+
+
+---
+
+## Phase 15 — Calibrating the gate `[x]`
+
+The sample size was the last unmeasured guess in a mechanism built to stop
+guessing, so `examples/measure.rs` grew a ground truth: the built index's
+postings over distinct values *is* the average files a value occupies. The gate
+has to reach that number from a handful of column reads.
+
+A fourth regime was added for it — PARTIAL, each value in three files of twenty
+— because the existing three all sit at the extremes and would have flattered
+any estimator.
+
+### Wrong twice, in opposite directions
+
+```text
+sample                       PARTIAL estimate   truth
+first and last only               13.7           3.0
+four files, evenly spread          1.0           3.0
+three adjacent pairs               3.5           3.0
+```
+
+The first sampled two files, chosen on the reasoning that neighbouring files in
+an ingestion-ordered table resemble each other and would flatter any column.
+Wrong twice over: "first and last" is distant only in *path order*, which need
+not relate to content, and in that table they were neighbours.
+
+Spreading the sample out failed the opposite way. A value spanning three
+consecutive files shows **zero** overlap between files five apart, so widely
+separated samples cannot see local clustering and report every value as living
+in one file.
+
+Both errors are invisible without ground truth. The first would have predicted
+a 31% advantage where 85% was realized — a wrong *decision* at any threshold
+above a third.
+
+### The sample that works
+
+A few positions across the list, each contributing a file **and its
+neighbour**: adjacent pairs reveal local clustering, distant pairs reveal
+global spread. Six files, fifteen pairs.
+
+```text
+              estimate   truth   predicted   realized   decision
+CLUSTERED       1.00      1.00      0.0%       1.1%      refuse
+SCATTERED      20.00     20.00      0.0%       0.0%      refuse
+SELECTIVE       1.19      1.10     94.0%      95.0%      BUILD
+PARTIAL         3.53      3.00     82.0%      85.0%      BUILD
+```
+
+Every decision correct, and every prediction within three points of what was
+realized — against a `ceiling_usd` that was 1775x out on the first row.
+
+Adjacent pairs are slightly over-represented compared with a uniform sample of
+pairs, which biases toward *more* files per value, so less advantage and fewer
+indexes built. The conservative direction, and deliberate.
+
+`overlap_is_estimated_correctly_under_partial_clustering` pins the regime that
+broke it twice, comparing the sampled estimate against the index's own
+postings.

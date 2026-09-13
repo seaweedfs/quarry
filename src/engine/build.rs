@@ -30,6 +30,13 @@ use crate::snapshot::FileId;
 
 use super::{QuarryTable, Session, hash_scalar};
 
+/// How many *positions* in the file list to sample around.
+///
+/// Each position contributes a file and its neighbour, so the sample contains
+/// both adjacent and widely separated pairs. Three positions is six files and
+/// fifteen pairs.
+const SAMPLE_POSITIONS: usize = 3;
+
 /// Build an index over `field` by reading that column from `table`'s objects.
 ///
 /// Reads only the indexed column. Null values are skipped: `x = NULL` matches
@@ -107,17 +114,39 @@ pub async fn build_proposed_index(
 /// the whole table. Building the index to find out whether the index is worth
 /// building would defeat the point.
 ///
-/// Returns `None` when there are fewer than two files, or when a sampled file
-/// holds no values of the field — in neither case is there an overlap to
+/// Returns `None` when there are fewer than two files, or when no sampled file
+/// holds any value of the field — in neither case is there an overlap to
 /// measure, and inventing one would be worse than admitting ignorance.
 ///
-/// Two files is a small sample and this is an estimate. The direction of its
-/// error matters more than its size: over-reporting overlap makes the gate
-/// refuse, which costs a slow query, while under-reporting makes it build,
-/// which costs storage forever. Adjacent files are deliberately *not* chosen —
-/// the first and last are, since neighbouring files in an ingestion-ordered
-/// table are the most likely to resemble each other and would make almost any
-/// column look clustered.
+/// # Which files to sample, arrived at by being wrong twice
+///
+/// Against a table where each value occupied three files of twenty:
+///
+/// ```text
+/// sample                    estimate   truth
+/// first and last only         13.7      3.0
+/// four files, evenly spread    1.0      3.0
+/// three adjacent pairs         ~3.5      3.0
+/// ```
+///
+/// The first was chosen on the reasoning that neighbouring files in an
+/// ingestion-ordered table resemble each other and would flatter any column.
+/// That was wrong twice over: "first and last" is only distant in *path
+/// order*, which need not relate to content, and in that table they were
+/// neighbours.
+///
+/// Spreading the sample out then failed the opposite way. A value spanning
+/// three consecutive files shows **zero** overlap between files five apart, so
+/// widely separated samples cannot see locality among nearby ones and report
+/// every value as living in one file.
+///
+/// So the sample contains both: a few positions across the list, each
+/// contributing a file *and its neighbour*. Adjacent pairs reveal local
+/// clustering, distant pairs reveal global spread, and averaging over all of
+/// them lands close. Adjacent pairs are slightly over-represented relative to
+/// a uniform sample of pairs, which biases the estimate toward *more* files
+/// per value — less advantage, so fewer indexes built. The conservative
+/// direction.
 pub async fn estimate_overlap(
     session: &Session,
     table: &QuarryTable,
@@ -138,24 +167,53 @@ pub async fn estimate_overlap(
         return exec_err!("column {column} is not in the table's schema");
     };
 
-    let mut ends = files.iter();
-    let first = ends.next().expect("at least two files");
-    let last = ends.next_back().expect("at least two files");
+    let all: Vec<(&FileId, &u64)> = files.iter().collect();
 
-    let one: HashSet<u64> = read_column(session, url, &schema, position, first.0, *first.1)
-        .await?
-        .into_iter()
-        .collect();
-    if one.is_empty() {
+    // A file and its neighbour at each of a few positions, so the pairs span
+    // both spacings. Deduplicated, since the positions coincide on a short
+    // list.
+    let positions = SAMPLE_POSITIONS.min(all.len());
+    let stride = (all.len() / positions).max(1);
+    let mut chosen: Vec<usize> = Vec::new();
+    for step in 0..positions {
+        let at = step * stride;
+        for index in [at, at + 1] {
+            if index < all.len() && !chosen.contains(&index) {
+                chosen.push(index);
+            }
+        }
+    }
+
+    let mut samples: Vec<HashSet<u64>> = Vec::with_capacity(chosen.len());
+    for index in chosen {
+        let (file, size) = all[index];
+        let values: HashSet<u64> = read_column(session, url, &schema, position, file, *size)
+            .await?
+            .into_iter()
+            .collect();
+        if !values.is_empty() {
+            samples.push(values);
+        }
+    }
+    if samples.len() < 2 {
         return Ok(None);
     }
-    let other: HashSet<u64> = read_column(session, url, &schema, position, last.0, *last.1)
-        .await?
-        .into_iter()
-        .collect();
 
-    let shared = one.iter().filter(|value| other.contains(value)).count();
-    Ok(Some(shared as f64 / one.len() as f64))
+    // Of one file's values, what fraction does another hold? Averaged over
+    // every pair, in both directions, since the two are not symmetric when
+    // the files hold different numbers of distinct values.
+    let mut total = 0.0;
+    let mut pairs = 0u32;
+    for (position, one) in samples.iter().enumerate() {
+        for other in samples.iter().skip(position + 1) {
+            let shared = one.iter().filter(|value| other.contains(value)).count();
+            total += shared as f64 / one.len() as f64;
+            let shared = other.iter().filter(|value| one.contains(value)).count();
+            total += shared as f64 / other.len() as f64;
+            pairs += 2;
+        }
+    }
+    Ok(Some(total / pairs as f64))
 }
 
 /// Every non-null value of one column of one object, hashed.

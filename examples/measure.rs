@@ -40,8 +40,9 @@ use url::Url;
 
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, PolicyFingerprint, Source};
-use quarry::engine::{Quarry, QuarryTable, build_index, index_id};
+use quarry::engine::{Quarry, QuarryTable, build_index, estimate_overlap, index_id};
 use quarry::kinds::Index;
+use quarry::layout::Spread;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 use quarry::workload::{Policy, Workload};
@@ -82,6 +83,12 @@ enum Layout {
     /// This is the case a file-level index exists for, and leaving it out of
     /// the measurement would have flattered the two above.
     Selective,
+    /// Each value lives in a handful of files rather than one or all.
+    ///
+    /// The realistic middle, and where a two-file sample is weakest: whether
+    /// the two sampled files happen to share a value is close to a coin toss,
+    /// so this is the regime that can show the estimator up.
+    Partial,
 }
 
 /// A cheap deterministic generator, so runs are comparable.
@@ -90,6 +97,10 @@ fn next(state: &mut u64) -> u64 {
     *state >> 33
 }
 
+/// Writes one file and reports its size and its tenant range.
+///
+/// The range is what an Iceberg writer records as `lower_bounds` and
+/// `upper_bounds`, and it is the input the index gate needs.
 fn write_file(
     dir: &Path,
     index: usize,
@@ -98,7 +109,7 @@ fn write_file(
     files: usize,
     layout: Layout,
     state: &mut u64,
-) -> (FileId, u64) {
+) -> (FileId, u64, (f64, f64)) {
     let path = dir.join(format!("part-{index:05}.parquet"));
     let file = fs::File::create(&path).expect("create parquet");
     let mut writer = ArrowWriter::try_new(file, schema(), None).expect("writer");
@@ -117,6 +128,16 @@ fn write_file(
             // given value is rare, while neighbouring rows are unrelated so
             // every file's range spans the whole space.
             Layout::Selective => next(state) % (tenants * 1_000),
+            // Each tenant confined to three files, so ranges still overlap
+            // but a value is not everywhere. Chosen by inverting the mapping
+            // rather than searching for it, so generation stays linear.
+            Layout::Partial => {
+                let offset = next(state) % 3;
+                let home = (index as u64 + files as u64 - offset) % files as u64;
+                let stride = files as u64;
+                let block = next(state) % (tenants / stride).max(1);
+                (home + block * stride) % tenants
+            }
         };
         tenant_ids.push(tenant as i64);
         timestamps.push((index * rows + row) as i64);
@@ -125,6 +146,11 @@ fn write_file(
              message column the bulky one, as it usually is"
         ));
     }
+
+    let low_high = (
+        *tenant_ids.iter().min().unwrap_or(&0) as f64,
+        *tenant_ids.iter().max().unwrap_or(&0) as f64,
+    );
 
     let batch = RecordBatch::try_new(
         schema(),
@@ -139,13 +165,15 @@ fn write_file(
     writer.close().expect("close");
 
     let size = fs::metadata(&path).expect("stat").len();
-    (FileId(path.to_string_lossy().into_owned()), size)
+    (FileId(path.to_string_lossy().into_owned()), size, low_high)
 }
 
 struct Table {
     sizes: BTreeMap<FileId, u64>,
     graph: SnapshotGraph,
     bytes: u64,
+    /// Per-file tenant ranges, as a catalog would record them.
+    bounds: Vec<(f64, f64)>,
 }
 
 fn generate(dir: &Path, files: usize, rows: usize, tenants: u64, layout: Layout) -> Table {
@@ -154,17 +182,20 @@ fn generate(dir: &Path, files: usize, rows: usize, tenants: u64, layout: Layout)
 
     let mut state = 0x2545F4914F6CDD1D;
     let mut sizes = BTreeMap::new();
+    let mut bounds = Vec::new();
     let mut snapshot = Snapshot::root(SnapshotId(1));
     for index in 0..files {
-        let (file, size) = write_file(dir, index, rows, tenants, files, layout, &mut state);
+        let (file, size, range) = write_file(dir, index, rows, tenants, files, layout, &mut state);
         snapshot = snapshot.with_clean_file(file.clone());
         sizes.insert(file, size);
+        bounds.push(range);
     }
 
     Table {
         bytes: sizes.values().sum(),
         sizes,
         graph: SnapshotGraph::new().with(snapshot),
+        bounds,
     }
 }
 
@@ -242,11 +273,17 @@ async fn main() {
         files * rows
     );
 
-    for layout in [Layout::Clustered, Layout::Scattered, Layout::Selective] {
+    for layout in [
+        Layout::Clustered,
+        Layout::Scattered,
+        Layout::Selective,
+        Layout::Partial,
+    ] {
         let name = match layout {
             Layout::Clustered => "CLUSTERED (each file holds a tenant range)",
             Layout::Scattered => "SCATTERED (every file holds every tenant)",
             Layout::Selective => "SELECTIVE (high cardinality, ranges overlap)",
+            Layout::Partial => "PARTIAL (each tenant in three files of twenty)",
         };
         println!("=== {name}");
 
@@ -257,6 +294,7 @@ async fn main() {
                 Layout::Clustered => "clustered",
                 Layout::Scattered => "scattered",
                 Layout::Selective => "selective",
+                Layout::Partial => "partial",
             });
 
         let started = Instant::now();
@@ -306,6 +344,33 @@ async fn main() {
             postings as f64 / index.values().max(1) as f64
         );
 
+        // --- Is the gate's estimate any good?
+        //
+        // The built index is ground truth: postings over distinct values is
+        // exactly the average files a value occupies. The gate has to reach
+        // that number from two file reads and the per-file ranges.
+        let truth = postings as f64 / index.values().max(1) as f64;
+        let sampled = estimate_overlap(&session, &bare, TENANT_FIELD)
+            .await
+            .expect("estimate")
+            .expect("more than one file");
+        let spread = Spread::from_overlap(files as u64, &table.bounds, sampled);
+        println!(
+            "  gate estimate    {:.2} files per value, truth {:.2}  ({})",
+            spread.files_by_index,
+            truth,
+            if (spread.files_by_index - truth).abs() <= 0.5 * truth.max(1.0) {
+                "close enough"
+            } else {
+                "*** WRONG ***"
+            }
+        );
+        println!(
+            "  gate advantage   {:.1}% from two sampled files (overlap {:.3})",
+            spread.index_advantage_pct(),
+            sampled
+        );
+
         // --- What it saves, on a query for one tenant.
         // A value that exists: for the selective layout most of the space is
         // empty, so read one out of the data rather than guessing.
@@ -336,10 +401,19 @@ async fn main() {
         );
 
         let saved = full.bytes.saturating_sub(with_index.bytes);
+        let realized_pct = 100.0 * saved as f64 / full.bytes.max(1) as f64;
         println!(
-            "  realized saving  {:.1} MB ({:.1}% of what a full scan fetched)",
+            "  realized saving  {:.1} MB ({realized_pct:.1}% of what a full scan fetched)",
             mb(saved),
-            100.0 * saved as f64 / full.bytes.max(1) as f64
+        );
+        println!(
+            "  gate verdict     {}  (predicted {:.1}%, realized {realized_pct:.1}%)",
+            if spread.index_advantage_pct() >= Policy::ADVISORY.min_index_advantage_pct {
+                "BUILD"
+            } else {
+                "refuse"
+            },
+            spread.index_advantage_pct(),
         );
 
         // --- What the proposer would have promised.

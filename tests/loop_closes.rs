@@ -1043,3 +1043,86 @@ async fn a_single_file_table_has_no_overlap_to_measure() {
         "one file cannot overlap with anything, and guessing would be worse"
     );
 }
+
+/// Partial clustering: the case that broke the overlap estimator twice.
+///
+/// Each tenant lives in three consecutive files of eight. Sampling only
+/// distant files reports every value as living in one file; sampling only
+/// neighbours reports far too many. The estimate has to land near three.
+#[tokio::test]
+async fn overlap_is_estimated_correctly_under_partial_clustering() {
+    let dir = scratch("spread_partial");
+    let files = 8usize;
+    let tenants = 64i64;
+
+    let mut sizes = BTreeMap::new();
+    let mut ids = Vec::new();
+    for index in 0..files {
+        // Tenants whose home is this file, the one before, or the one before
+        // that — so every tenant occupies exactly three consecutive files.
+        let mine: Vec<i64> = (0..tenants)
+            .filter(|tenant| {
+                let home = (*tenant as usize) % files;
+                [home, (home + 1) % files, (home + 2) % files].contains(&index)
+            })
+            .collect();
+
+        let path = dir.join(format!("{index}.parquet"));
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(file, schema(), None).expect("writer");
+        let tenant_ids: Int64Array = (0..400).map(|row| mine[row % mine.len()]).collect();
+        let messages: StringArray = (0..400).map(|row| Some(format!("m{row}"))).collect();
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(tenant_ids), Arc::new(messages)])
+            .expect("batch");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let id = FileId(path.to_string_lossy().into_owned());
+        sizes.insert(id.clone(), std::fs::metadata(&path).expect("stat").len());
+        ids.push(id);
+    }
+
+    let mut snapshot = Snapshot::root(SnapshotId(1));
+    for id in &ids {
+        snapshot = snapshot.with_clean_file(id.clone());
+    }
+    let fixture = Fixture {
+        dir,
+        sizes,
+        graph: SnapshotGraph::new().with(snapshot),
+        files: ids,
+        at: SnapshotId(1),
+    };
+
+    let session = quarry().session();
+    let table = table(&fixture, Registry::new());
+
+    // Ground truth, from the index itself.
+    let index = build_index(&session, &table, TENANT_FIELD)
+        .await
+        .expect("build");
+    let postings: u64 = index.postings().map(|(_, f)| f.len() as u64).sum();
+    let truth = postings as f64 / index.values() as f64;
+    assert!(
+        (truth - 3.0).abs() < 0.2,
+        "the fixture should put each tenant in three files, got {truth}"
+    );
+
+    // And what the gate estimates from a sample, without building anything.
+    let overlap = estimate_overlap(&session, &table, TENANT_FIELD)
+        .await
+        .expect("estimate")
+        .expect("eight files");
+    let everywhere: Vec<(f64, f64)> = (0..files).map(|_| (0.0, tenants as f64)).collect();
+    let spread = Spread::from_overlap(files as u64, &everywhere, overlap);
+
+    assert!(
+        (spread.files_by_index - truth).abs() < 1.5,
+        "estimated {:.2} files per value against a true {truth:.2}; sampling \
+         only distant files gives 1.0 and only neighbours gives far too many",
+        spread.files_by_index
+    );
+    // Three of eight files is still well worth an index.
+    assert!(spread.index_advantage_pct() > 40.0);
+}
