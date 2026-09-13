@@ -436,6 +436,7 @@ mod tests {
             snapshot: SnapshotId(1),
             policy: PolicyFingerprint(1),
             plan_hash: 1,
+            plan: None,
             projected: BTreeSet::from([7]),
             predicates: fields
                 .iter()

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use quarry::budget::{Budget, Meter, Permit};
 use quarry::cost::{PriceTable, Tier};
-use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Predicate, Query, Source};
+use quarry::derived::{Derived, DerivedId, Plan, PolicyFingerprint, Predicate, Query, Source};
 use quarry::explain::Explain;
 use quarry::kinds::{Index, ResultCache};
 use quarry::place::{Distance, Place};
@@ -22,6 +22,11 @@ const POLICY: PolicyFingerprint = PolicyFingerprint(7);
 
 fn file(name: &str) -> FileId {
     FileId(name.to_owned())
+}
+
+/// The one plan the cached answer in this example was built for.
+fn cached_plan() -> Plan {
+    Plan::new(BTreeSet::from([TENANT]), ["tenant_id = 42".to_owned()])
 }
 
 fn main() {
@@ -76,15 +81,20 @@ fn main() {
         },
         POLICY,
         64,
-        Box::new(ResultCache::rows_of(0xC0FFEE, 3, 64)),
+        Box::new(ResultCache::rows_of(cached_plan(), 3, 64)),
     ));
 
     // SELECT ... FROM events WHERE tenant_id = 42
+    //
+    // The plan, not its hash, is what a stored result is matched against: two
+    // different plans can share a hash, and serving on that would hand one
+    // query another's answer.
     let query_at = |snapshot: i64| Query {
         table: table.clone(),
         snapshot: SnapshotId(snapshot),
         policy: POLICY,
         plan_hash: 0xC0FFEE,
+        plan: Some(cached_plan()),
         projected: BTreeSet::from([TENANT]),
         predicates: vec![Predicate::Eq {
             field: TENANT,

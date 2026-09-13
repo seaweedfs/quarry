@@ -22,7 +22,9 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::scalar::ScalarValue;
 
 use crate::cost::PriceTable;
-use crate::derived::{Decision, DerivedId, FieldId, PolicyFingerprint, Predicate, Query, Rewrite};
+use crate::derived::{
+    Decision, DerivedId, FieldId, Plan, PolicyFingerprint, Predicate, Query, Rewrite,
+};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
 use crate::stable_hash::StableHasher;
@@ -83,6 +85,11 @@ pub struct ScanReport {
     pub bytes_if_full_scan: u64,
     /// The shape of the query, with literals stripped.
     pub fingerprint: Fingerprint,
+    /// What this scan computes, when it can be described exactly.
+    ///
+    /// A caller storing this query's result needs it: a stored result is
+    /// matched by plan, not by name.
+    pub plan: Option<Plan>,
 }
 
 impl ScanReport {
@@ -384,6 +391,7 @@ impl QuarryTable {
             snapshot: self.snapshot,
             policy: self.policy,
             plan_hash,
+            plan: self.exact_plan(projection, filters),
             projected: self.projected_fields(projection),
             predicates: self.predicates(filters),
         };
@@ -423,6 +431,7 @@ impl QuarryTable {
                         plan_hash,
                         bytes_if_full_scan,
                         fingerprint: fingerprint.clone(),
+                        plan: query.plan.clone(),
                     }),
                     Rewrite::Substitute { .. }
                         if self.materialized.contains_key(&candidate.derived.id) =>
@@ -435,6 +444,7 @@ impl QuarryTable {
                             plan_hash,
                             bytes_if_full_scan,
                             fingerprint: fingerprint.clone(),
+                            plan: query.plan.clone(),
                         })
                     }
                     Rewrite::Substitute { .. } => None,
@@ -450,6 +460,7 @@ impl QuarryTable {
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint,
+                plan: query.plan.clone(),
             },
             Some(mut report) => {
                 report
@@ -479,25 +490,72 @@ impl QuarryTable {
             .collect()
     }
 
-    /// A stand-in for a canonical plan hash.
+    /// An exact description of this scan, or `None` if one cannot be made.
     ///
-    /// Hashes the projected fields and the translated predicates rather than
-    /// the `Expr` tree, which makes it insensitive to spelling — `a = 1` and
-    /// `1 = a` agree. It is *not* yet canonical in the full sense the design
-    /// asks for: a query that a rewrite could reduce to this one will hash
-    /// differently, so the result cache under-hits rather than mis-hits.
+    /// Substituting derived state is admitted only on an exact match, so this
+    /// must never approximate. It returns `None` when a projected column has
+    /// no field id, because the mapping is not injective in that case: an
+    /// unknown column silently vanishes, and two different projections would
+    /// describe identically.
+    fn exact_plan(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> Option<Plan> {
+        let mut projected = BTreeSet::new();
+        let indices: Vec<usize> = match projection {
+            None => (0..self.schema.fields().len()).collect(),
+            Some(indices) => indices.clone(),
+        };
+        for index in indices {
+            let field = self.schema.fields().get(index)?;
+            projected.insert(self.field_ids.get(field.name()).copied()?);
+        }
+
+        Some(Plan::new(
+            projected,
+            filters.iter().map(|expr| self.canonical_filter(expr)),
+        ))
+    }
+
+    /// A faithful rendering of one filter.
+    ///
+    /// `Debug` rather than `Display`, because `Display` erases types: an
+    /// `Int64(1)` and a `Utf8("1")` both print as `1`, so two different
+    /// filters would render the same string and compare equal. `Debug` names
+    /// the variant, which makes the rendering injective for the purpose it is
+    /// used for.
+    ///
+    /// Column-against-literal comparisons are normalised to a fixed operand
+    /// order, and only for the symmetric operators, so that `status = 500` and
+    /// `500 = status` are one plan. Failing to normalise something costs a
+    /// missed match; normalising it *wrongly* would cost a wrong answer, so
+    /// anything else is left exactly as written.
+    fn canonical_filter(&self, expr: &Expr) -> String {
+        if let Expr::BinaryExpr(binary) = expr {
+            let symmetric = matches!(binary.op, Operator::Eq | Operator::NotEq);
+            if symmetric {
+                if let (Expr::Literal(value, _), Expr::Column(column)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                {
+                    return format!("{} {} {:?}", column.name(), binary.op, value);
+                }
+                if let (Expr::Column(column), Expr::Literal(value, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                {
+                    return format!("{} {} {:?}", column.name(), binary.op, value);
+                }
+            }
+        }
+        format!("{expr:?}")
+    }
+
+    /// A short name for this scan's plan.
+    ///
+    /// Hashes the *exact* plan, not the lossy predicate translation, so the
+    /// name at least corresponds to the identity it labels. Queries with no
+    /// exact plan all share one value, which is harmless: nothing decides
+    /// anything from this, and matching compares plans.
     fn plan_hash(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> u64 {
         let mut hasher = StableHasher::new();
         self.table.0.hash(&mut hasher);
-        self.projected_fields(projection).hash(&mut hasher);
-        let mut predicates = self.predicates(filters);
-        predicates.sort_by_key(|p| p.field());
-        for predicate in predicates {
-            match predicate {
-                Predicate::Eq { field, value } => (0u8, field, value).hash(&mut hasher),
-                Predicate::Opaque { field } => (1u8, field, 0u64).hash(&mut hasher),
-            }
-        }
+        self.exact_plan(projection, filters).hash(&mut hasher);
         hasher.finish()
     }
 }

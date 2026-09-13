@@ -15,13 +15,13 @@ use std::hash::{Hash, Hasher};
 use datafusion::arrow::array::RecordBatch;
 
 use crate::cost::{Cost, PriceTable};
-use crate::derived::{Kind, Query, Refreshed, Rewrite};
+use crate::derived::{Kind, Plan, Query, Refreshed, Rewrite};
 use crate::snapshot::Diff;
 
 /// A stored answer to one canonical plan, with the rows.
 #[derive(Clone, Debug)]
 pub struct MaterializedResult {
-    plan_hash: u64,
+    plan: Plan,
     batches: Vec<RecordBatch>,
     bytes: u64,
     unionable: bool,
@@ -32,10 +32,15 @@ impl MaterializedResult {
     ///
     /// Rows appended to the table afterwards can be read alongside these, so
     /// this stays usable as the table grows.
-    pub fn rows_of(plan_hash: u64, batches: Vec<RecordBatch>) -> Self {
+    /// The stored rows must be the **complete** answer to `plan`. DataFusion
+    /// passes `scan` a row limit as a hint and applies `LIMIT` above the scan
+    /// itself, so returning more rows than asked for is safe and returning
+    /// fewer is not: storing a truncated result here would silently shorten
+    /// every later query that matches.
+    pub fn rows_of(plan: Plan, batches: Vec<RecordBatch>) -> Self {
         let bytes = batches.iter().map(batch_bytes).sum();
         MaterializedResult {
-            plan_hash,
+            plan,
             batches,
             bytes,
             unionable: true,
@@ -46,10 +51,10 @@ impl MaterializedResult {
     ///
     /// Usable only while the table has not moved, since merging is not
     /// concatenating.
-    pub fn aggregate_of(plan_hash: u64, batches: Vec<RecordBatch>) -> Self {
+    pub fn aggregate_of(plan: Plan, batches: Vec<RecordBatch>) -> Self {
         let bytes = batches.iter().map(batch_bytes).sum();
         MaterializedResult {
-            plan_hash,
+            plan,
             batches,
             bytes,
             unionable: false,
@@ -61,29 +66,24 @@ impl MaterializedResult {
         &self.batches
     }
 
-    /// The canonical plan this answers.
-    pub fn plan_hash(&self) -> u64 {
-        self.plan_hash
+    /// The plan this answers.
+    pub fn plan(&self) -> &Plan {
+        &self.plan
     }
 }
 
-/// Hash a canonical plan description the way a query's `plan_hash` is built.
+/// A short name for a plan, for keying stored bytes.
 ///
-/// Exposed so a caller storing a result can key it the same way the table
-/// will look it up.
+/// # This names; it does not identify
 ///
-/// # A collision here is not safe
+/// Two different plans can share a 64-bit hash. Nothing decides that a query
+/// may be served from stored rows on the strength of this value — matching
+/// compares the [`Plan`] itself — so a collision here costs a redundant
+/// lookup, never a wrong answer.
 ///
-/// Unlike an index probe, where a collision costs extra I/O, two *different*
-/// plans hashing alike means one query is served the other's stored answer —
-/// a wrong result, silently. Being 64-bit and non-cryptographic, this is
-/// vanishingly unlikely by accident and trivial to arrange on purpose.
-///
-/// Substituting derived state therefore must not be persisted or shared
-/// between principals until a match is *verified* rather than assumed, by
-/// keeping the plan description beside the hash and comparing it. Pruning
-/// kinds have no such restriction, which is why they are the ones being
-/// written to storage first.
+/// That was not always true. Matching used to compare hashes, which meant a
+/// collision handed one query another's result, silently: vanishingly unlikely
+/// by accident and trivial to arrange deliberately.
 pub fn hash_plan<H: Hash>(parts: &H) -> u64 {
     let mut hasher = crate::stable_hash::StableHasher::new();
     parts.hash(&mut hasher);
@@ -100,7 +100,7 @@ impl Kind for MaterializedResult {
     }
 
     fn matches(&self, query: &Query) -> Option<Rewrite> {
-        (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute {
+        (query.plan.as_ref() == Some(&self.plan)).then_some(Rewrite::Substitute {
             unionable: self.unionable,
         })
     }

@@ -71,12 +71,54 @@ impl Predicate {
     }
 }
 
+/// An exact description of what a query computes.
+///
+/// # Why this is not built from [`Predicate`]
+///
+/// `Predicate` is deliberately lossy. It exists to decide which files *might*
+/// contain matching rows, where over-approximating is safe, and it throws away
+/// everything not needed for that:
+///
+/// ```text
+/// Opaque { field }        a > 5 and a < 3 are indistinguishable
+/// Eq { value: u64 }       the literal is a hash, so colliding literals
+///                         are indistinguishable
+/// only the first column   a complex filter over two columns records one
+/// unknown columns         drop out of the projection entirely
+/// ```
+///
+/// Every one of those is harmless for pruning and fatal for deciding that two
+/// queries are the *same* query — which is what a substituting kind does
+/// before handing one query the other's stored answer. So plan identity is
+/// carried separately, exactly, and is absent rather than approximate when
+/// the engine cannot render it faithfully.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Plan {
+    /// Fields the query reads.
+    pub projected: BTreeSet<FieldId>,
+    /// One faithful rendering per filter, sorted.
+    ///
+    /// Sorted so that `a = 1 AND b = 2` and `b = 2 AND a = 1` are one plan;
+    /// a conjunction has no meaningful order.
+    pub filters: Vec<String>,
+}
+
+impl Plan {
+    /// A plan reading `projected` under `filters`, canonicalised.
+    pub fn new(projected: BTreeSet<FieldId>, filters: impl IntoIterator<Item = String>) -> Self {
+        let mut filters: Vec<String> = filters.into_iter().collect();
+        filters.sort();
+        Plan { projected, filters }
+    }
+}
+
 /// What a query needs, reduced to what the rule and the kinds have to reason
 /// about.
 ///
-/// A stand-in for a real logical plan until the engine is wired up in phase 9.
-/// It carries identity (`plan_hash`), shape (`projected`, `predicates`), and
+/// Carries identity ([`Query::plan`]), shape (`projected`, `predicates`), and
 /// the context that admissibility depends on (`table`, `snapshot`, `policy`).
+/// Identity and shape are separate on purpose: shape may over-approximate,
+/// identity may not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Query {
     /// The table being read.
@@ -85,10 +127,19 @@ pub struct Query {
     pub snapshot: SnapshotId,
     /// The effective policy of the principal issuing the query.
     pub policy: PolicyFingerprint,
-    /// Identity of the canonical logical plan.
+    /// A short name for the plan, for keying stored bytes.
     ///
-    /// Canonical, so that `status = 500` and `500 = status` hash equal.
+    /// **Not** an identity. Two different plans can share a 64-bit hash, and
+    /// treating a hash match as a plan match would hand one query another's
+    /// answer. Use [`Query::plan`] to decide sameness; use this only to name
+    /// something whose identity has already been established.
     pub plan_hash: u64,
+    /// What this query computes, when it can be described exactly.
+    ///
+    /// `None` means the engine could not render the plan faithfully, so no
+    /// substituting derived state may claim to answer it. Pruning is
+    /// unaffected: it never needs to know that two queries are the same.
+    pub plan: Option<Plan>,
     /// Fields the query reads.
     pub projected: BTreeSet<FieldId>,
     /// Restrictions the query places on fields.
@@ -512,6 +563,7 @@ mod tests {
             snapshot,
             policy: POLICY,
             plan_hash: 99,
+            plan: None,
             projected: BTreeSet::from([4, 7]),
             predicates: vec![Predicate::Eq {
                 field: 4,

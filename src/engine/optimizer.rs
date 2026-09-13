@@ -352,6 +352,7 @@ mod tests {
             snapshot: SnapshotId(1),
             policy: PolicyFingerprint(0),
             plan_hash: 1,
+            plan: None,
             projected: BTreeSet::from([field]),
             predicates: vec![Predicate::Eq { field, value: 1 }],
         };

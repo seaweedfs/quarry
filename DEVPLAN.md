@@ -890,3 +890,82 @@ it nor recognise it as already built, and would build a second one beside it.
 Nothing that causes harm. The raw observation stream is dropped, which only
 affects how quickly proposals re-converge, and it is the one thing here large
 enough that writing it down would need compaction.
+
+
+---
+
+## Phase 12 — Plan identity `[x]`
+
+A stored result was served to a query on the strength of a **hash match**. That
+is a wrong answer, silently, and it was reachable through plain SQL.
+
+### The bug was not the hash
+
+The obvious reading is "64-bit hash, birthday bound, unlucky". That was the
+smaller half. The hash was computed over the *translated predicates*, and
+`Predicate` is deliberately lossy — it exists to decide which files might match,
+where over-approximating is safe:
+
+```text
+Opaque { field }      tenant_id > 1 and tenant_id < 3 are the SAME predicate
+Eq { value: u64 }     the literal is a hash, so colliding literals are one
+columns.first()       a filter over two columns records only the first
+filter_map on ids     a projected column with no field id vanishes
+no known column       the filter vanishes entirely
+```
+
+Five losses, every one harmless for pruning and fatal for deciding two queries
+are the same. So `tenant_id > 1` and `tenant_id < 3` hashed **equal by
+construction**, not by coincidence: a result stored for one was returned for the
+other, every time, with no collision required.
+
+Fixing only the hash would have left that untouched. Comparing `Predicate`
+structurally instead of hashing it would also have left it untouched.
+
+### Identity and shape are now separate
+
+`Query` carries both, and they answer different questions:
+
+```text
+predicates, projected   SHAPE. May over-approximate. Decides which files
+                        might contain matching rows.
+
+plan: Option<Plan>      IDENTITY. May not approximate at all. Decides that
+                        two queries compute the same thing.
+```
+
+`Plan` holds the projected field ids and one faithful rendering per filter,
+sorted so a conjunction has no order. `ResultCache` and `MaterializedResult`
+store a `Plan` and compare it. `plan_hash` survives as a *name* for keying
+stored bytes, documented as naming rather than identifying, and now hashes the
+exact plan so the name corresponds to what it labels.
+
+`Option` is the load-bearing part: when the engine cannot render a plan
+faithfully — a projected column with no field id, so the mapping is not
+injective — the plan is **absent**, and every substituting kind refuses.
+Refusing costs a scan; approximating costs the wrong rows.
+
+Renderings use `Debug`, not `Display`, because `Display` erases types:
+`Int64(1)` and `Utf8("1")` both print as `1`. Operand order is normalised only
+for the symmetric operators, since normalising `1 < a` wrongly would cost a
+wrong answer while failing to normalise it only costs a missed match.
+
+### The test asserts why, not just what
+
+`two_different_filters_do_not_share_a_cached_answer` does the thing the fix is
+for, and also asserts the *reason*: that the two queries have **identical
+fingerprints**, because the lossy shape genuinely cannot tell them apart. A
+test that only checked the outcome would not record why the outcome needs
+defending.
+
+### What this unblocks
+
+Substituting derived state can now be persisted and shared between principals,
+which the earlier note on `hash_plan` explicitly ruled out. Not done here, but
+no longer unsound.
+
+One precondition remains a caller's to keep and is documented on
+`MaterializedResult::rows_of`: stored rows must be the **complete** answer to
+the plan. DataFusion passes `scan` a row limit as a hint and applies `LIMIT`
+above the scan, so returning more rows than asked is safe and returning fewer
+is not.

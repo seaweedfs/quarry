@@ -238,12 +238,18 @@ mod tests {
             snapshot: SnapshotId(at),
             policy: POLICY,
             plan_hash: 42,
+            plan: Some(the_plan()),
             projected: BTreeSet::from([TENANT]),
             predicates: vec![Predicate::Eq {
                 field: TENANT,
                 value: 100,
             }],
         }
+    }
+
+    /// The one plan these tests use, so a result cache can match a query.
+    fn the_plan() -> crate::derived::Plan {
+        crate::derived::Plan::new(BTreeSet::from([TENANT]), ["tenant = 100".to_owned()])
     }
 
     fn index_derived(at: i64) -> Derived {
@@ -262,7 +268,7 @@ mod tests {
             source(at),
             POLICY,
             64,
-            Box::new(ResultCache::rows_of(42, 3, 64)),
+            Box::new(ResultCache::rows_of(the_plan(), 3, 64)),
         )
     }
 

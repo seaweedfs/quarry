@@ -15,7 +15,7 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
-decision core is 120 tests with **no dependencies**. Optional features add 109
+decision core is 124 tests with **no dependencies**. Optional features add 110
 more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
 table metadata, and `rest-catalog` queries a table loaded from a live Iceberg
 REST catalog over HTTP.
@@ -23,7 +23,7 @@ REST catalog over HTTP.
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features rest-catalog     # 229 tests, incl. a live REST catalog
+cargo test --features rest-catalog     # 234 tests, incl. a live REST catalog
 cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 

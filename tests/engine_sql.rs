@@ -18,7 +18,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
-use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
+use quarry::derived::{Derived, DerivedId, Plan, PolicyFingerprint, Source};
 use quarry::engine::{MaterializedResult, QuarryTable, hash_scalar};
 use quarry::kinds::{Index, ResultCache};
 use quarry::registry::Registry;
@@ -385,13 +385,95 @@ async fn aggregation_over_a_pruned_scan_is_correct() {
     );
 }
 
-/// A materialised answer to `SELECT * FROM events WHERE tenant_id = 1`.
+/// The exact plan the table computes for `sql`.
 ///
-/// The plan hash has to match the one the table computes, so it is read back
-/// from a scan rather than guessed.
-async fn plan_hash_of(sql: &str, table: Arc<QuarryTable>) -> u64 {
+/// Read back from a real scan rather than guessed: a stored result is matched
+/// against the plan itself, not against a hash of it, so the plan has to be
+/// the one the table actually produces.
+async fn plan_of(sql: &str, table: Arc<QuarryTable>) -> Plan {
     run(Arc::clone(&table), sql).await;
-    table.last_scan().expect("scan").plan_hash
+    table
+        .last_scan()
+        .expect("scan")
+        .plan
+        .expect("this query is exactly describable")
+}
+
+/// Two different filters must not share one cached answer.
+///
+/// This was a real wrong answer reachable through plain SQL, not a theoretical
+/// one. Plan identity used to be a hash of the *translated predicates*, and
+/// `Predicate` collapses everything it does not model to `Opaque { field }` —
+/// so `tenant_id > 1` and `tenant_id < 3` were the same predicate, hashed to
+/// the same value, and a result stored for one was served for the other.
+///
+/// Nothing about hashing caused it: the representation being hashed was lossy.
+/// The fix compares an exact rendering of the plan instead.
+#[tokio::test]
+async fn two_different_filters_do_not_share_a_cached_answer() {
+    let graph = flat_graph(&["a", "b", "c"], 810);
+    let stored_for = "SELECT * FROM events WHERE tenant_id > 1";
+    let asked = "SELECT * FROM events WHERE tenant_id < 3";
+
+    let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(810)));
+
+    run(Arc::clone(&probe), stored_for).await;
+    let for_gt = probe.last_scan().expect("scan");
+    run(Arc::clone(&probe), asked).await;
+    let for_lt = probe.last_scan().expect("scan");
+
+    // The reason an exact plan is needed, asserted rather than argued: the
+    // lossy shape cannot tell these two queries apart. Both filters collapse
+    // to `Opaque { tenant_id }`, so anything derived from `Predicate` — a
+    // hash of it very much included — calls them the same query.
+    assert_eq!(
+        for_gt.fingerprint, for_lt.fingerprint,
+        "the lossy shape is expected to be blind to the difference"
+    );
+
+    // The exact plan is not.
+    let stored_plan = for_gt.plan.clone().expect("describable");
+    let asked_plan = for_lt.plan.clone().expect("describable");
+    assert_ne!(stored_plan, asked_plan);
+
+    // The table holds tenants 1, 1, 2, 1 — so `< 3` is all four rows and
+    // `> 1` is one. These stored rows are neither, which is what makes the
+    // assertions below able to tell substitution from a real scan.
+    let stored = vec![batch(&[(2, "gt-1"), (3, "gt-1")])];
+    let id = DerivedId("answer".into());
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        id.clone(),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        128,
+        Box::new(MaterializedResult::rows_of(stored_plan, stored.clone())),
+    ));
+
+    let table = Arc::new(
+        table_with_three_files(graph, SnapshotId(810))
+            .with_registry(registry)
+            .with_materialized(id, stored),
+    );
+
+    let rows = run(Arc::clone(&table), asked).await;
+    let report = table.last_scan().expect("scan");
+    assert!(
+        !report.substituted,
+        "a result stored for `tenant_id > 1` must not answer `tenant_id < 3`"
+    );
+
+    // And the answer is the table's own: every row, since all four tenants
+    // recorded are below three.
+    assert_eq!(total_rows(&rows), 4);
+    assert!(
+        !report.files_read.is_empty(),
+        "it should have gone to the table"
+    );
 }
 
 #[tokio::test]
@@ -401,7 +483,7 @@ async fn a_materialised_result_is_read_instead_of_the_table() {
 
     // Learn the plan hash the table will look up.
     let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(810)));
-    let hash = plan_hash_of(sql, probe).await;
+    let plan = plan_of(sql, probe).await;
 
     let stored = vec![batch(&[(1, "cached-1"), (1, "cached-2"), (1, "cached-3")])];
     let id = DerivedId("answer".into());
@@ -415,7 +497,7 @@ async fn a_materialised_result_is_read_instead_of_the_table() {
         },
         POLICY,
         128,
-        Box::new(MaterializedResult::rows_of(hash, stored.clone())),
+        Box::new(MaterializedResult::rows_of(plan.clone(), stored.clone())),
     ));
 
     let table = Arc::new(
@@ -453,7 +535,7 @@ async fn a_stale_materialised_result_is_read_with_the_files_added_since() {
         );
 
     let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(811)));
-    let hash = plan_hash_of(sql, probe).await;
+    let plan = plan_of(sql, probe).await;
 
     // Stored at 810: the two rows of tenant 1 that existed in file "a".
     let stored = vec![batch(&[(1, "a1"), (1, "a2")])];
@@ -468,7 +550,7 @@ async fn a_stale_materialised_result_is_read_with_the_files_added_since() {
         },
         POLICY,
         128,
-        Box::new(MaterializedResult::rows_of(hash, stored.clone())),
+        Box::new(MaterializedResult::rows_of(plan.clone(), stored.clone())),
     ));
 
     let table = Arc::new(
@@ -506,7 +588,7 @@ async fn an_aggregated_result_is_refused_once_a_file_is_added() {
         );
 
     let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(811)));
-    let hash = plan_hash_of(sql, probe).await;
+    let plan = plan_of(sql, probe).await;
 
     let stored = vec![batch(&[(1, "aggregated")])];
     let id = DerivedId("cube".into());
@@ -521,7 +603,10 @@ async fn an_aggregated_result_is_refused_once_a_file_is_added() {
         POLICY,
         16,
         // The same rows, declared aggregated rather than table-shaped.
-        Box::new(MaterializedResult::aggregate_of(hash, stored.clone())),
+        Box::new(MaterializedResult::aggregate_of(
+            plan.clone(),
+            stored.clone(),
+        )),
     ));
 
     let table = Arc::new(
@@ -552,7 +637,7 @@ async fn a_substituting_candidate_without_stored_rows_is_skipped() {
     let graph = flat_graph(&["a", "b", "c"], 810);
 
     let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(810)));
-    let hash = plan_hash_of(sql, probe).await;
+    let plan = plan_of(sql, probe).await;
 
     let mut registry = Registry::new();
     registry.register(Derived::new(
@@ -563,7 +648,7 @@ async fn a_substituting_candidate_without_stored_rows_is_skipped() {
         },
         POLICY,
         1,
-        Box::new(ResultCache::rows_of(hash, 3, 1)),
+        Box::new(ResultCache::rows_of(plan.clone(), 3, 1)),
     ));
 
     let table = Arc::new(table_with_three_files(graph, SnapshotId(810)).with_registry(registry));

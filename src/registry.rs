@@ -263,6 +263,7 @@ mod tests {
             snapshot: SnapshotId(810),
             policy: POLICY,
             plan_hash: 1,
+            plan: None,
             projected: BTreeSet::from([4]),
             predicates: vec![Predicate::Eq { field: 4, value: 7 }],
         }
