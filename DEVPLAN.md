@@ -1382,3 +1382,62 @@ fingerprints are equal and that two observations collapse to one shape.
 `another_engines_traffic_alone_justifies_an_index` is the end-to-end case: not a
 single query runs through this engine, and a round still builds a real index
 that a later local query uses.
+
+
+---
+
+## Phase 19 — Calibration `[x]`
+
+The last three invented constants, against rates published in January 2026
+(AWS, US East N. Virginia):
+
+```text
+                  guessed    derived    verdict
+hot_byte_usd       1e-11     4.0e-13    25x too high
+cold_multiplier    1000      26         38x too high
+near_multiplier    2.0       1.0        in-region transfer is free
+far_multiplier     100       51         about right (cross-region)
+byte_day_usd       7e-13     7.67e-13   about right
+```
+
+`hot_byte_usd` is a GET at $0.0004 per 1,000 spread over a 1 MB read, because
+same-region transfer from S3 to compute is not billed at all. `cold_multiplier`
+adds $0.01 per GB of retrieval. `far_multiplier` adds egress: $0.02 per GB
+cross-region, $0.09 to the internet.
+
+`PriceTable::from_rates` takes the five numbers a user can read off an invoice —
+storage, GET rate, average read size, egress, cold retrieval — so nobody has to
+understand the multipliers to replace them. `aws_s3_same_region`,
+`aws_s3_cross_region` and `aws_s3_internet` are that function with published
+rates filled in, and `Default` is now the first of them rather than a guess.
+
+**The `cold_multiplier` error was the one worth catching.** At 1000x, anything
+priced in money would refuse to read cold data under practically any
+circumstances. The real ratio is about 26: a reason to prefer hot data, not a
+reason never to touch cold.
+
+### A design assumption turned out to be false
+
+Three tests asserted that distance costs money, and two more that reporting
+locality makes reads cheaper. All five failed, because **AWS bills nothing for
+transfer from S3 to compute in the same region**, whatever availability zone
+either is in.
+
+So by default `Local`, `Near` and `Far` are the same price, and the reason to
+prefer local data there is **latency**, which `Cost` does not model. That is a
+real gap in the cost model, and pricing distance as though money were the reason
+would have hidden it behind a number nobody could defend.
+
+The tests now assert what is true — distance is free within a region, costs
+money once bytes leave it — and the two that need distance to be priced say so
+and use `aws_s3_internet`. `a_deployment_can_price_distance_however_it_likes`
+covers the on-premises case, where cross-rack traffic contends for a shared
+uplink even though nobody sends an invoice for it.
+
+### Absolute figures are now plausible
+
+Reading a 130 MB table ten times costs about half a thousandth of a dollar,
+dominated by request charges. Under the guessed table it was $1.20. The
+*decisions* are unchanged — all four measured regimes still get the same
+verdict — because those turn on ratios between candidates, which is why the
+constants mattered less than the structural errors found earlier.

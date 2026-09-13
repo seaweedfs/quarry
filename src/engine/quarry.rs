@@ -308,11 +308,18 @@ mod tests {
             session.spent().usd
         }
 
-        let opaque = Quarry::new(url(), Arc::new(InMemory::new()));
-        let placed = Quarry::new(url(), Arc::new(InMemory::new())).with_facts(
-            Arc::new(PlacedStorage::new().with_fallback(Placement::hot(here.clone()))),
-            here,
-        );
+        // Priced for bytes leaving the region: under same-region rates
+        // transfer is free, so reporting locality changes nothing about the
+        // money and there would be nothing to assert. The point being tested
+        // is that facts reach the price, not that distance always costs.
+        let prices = crate::cost::PriceTable::aws_s3_internet();
+        let opaque = Quarry::new(url(), Arc::new(InMemory::new())).with_prices(prices);
+        let placed = Quarry::new(url(), Arc::new(InMemory::new()))
+            .with_prices(prices)
+            .with_facts(
+                Arc::new(PlacedStorage::new().with_fallback(Placement::hot(here.clone()))),
+                here,
+            );
 
         let opaque_cost = read_cost(&opaque).await;
         let placed_cost = read_cost(&placed).await;

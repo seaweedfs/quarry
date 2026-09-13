@@ -100,6 +100,69 @@ pub struct PriceTable {
 }
 
 impl PriceTable {
+    /// A table derived from the numbers on a storage bill.
+    ///
+    /// Every other constructor here is this one with published rates filled
+    /// in. Taking the inputs a user can actually read off an invoice means
+    /// they never have to understand the multipliers to replace them.
+    ///
+    /// `average_read_bytes` is how a per-request charge becomes a per-byte
+    /// one, and it matters: the same GET fee spread over a 4 KB footer read is
+    /// 250 times the per-byte cost of spreading it over a 1 MB column chunk.
+    pub fn from_rates(
+        storage_usd_per_gb_month: f64,
+        get_usd_per_1k_requests: f64,
+        average_read_bytes: f64,
+        egress_usd_per_gb: f64,
+        cold_retrieval_usd_per_gb: f64,
+    ) -> Self {
+        const GB: f64 = 1e9;
+        let per_request = get_usd_per_1k_requests / 1_000.0;
+        let hot_local = per_request / average_read_bytes.max(1.0);
+
+        PriceTable {
+            hot_byte_usd: hot_local,
+            cold_multiplier: (cold_retrieval_usd_per_gb / GB + hot_local) / hot_local,
+            // Transfer within a region is not billed, so a byte from the next
+            // rack costs exactly what a local one does. See the note on
+            // `near_multiplier`.
+            near_multiplier: 1.0,
+            far_multiplier: (egress_usd_per_gb / GB + hot_local) / hot_local,
+            cpu_second_usd: 1.1e-5,
+            byte_day_usd: storage_usd_per_gb_month / (GB * 30.0),
+        }
+    }
+
+    /// AWS S3 Standard, read by compute in the same region.
+    ///
+    /// Published US East (N. Virginia) rates, checked January 2026:
+    ///
+    /// ```text
+    /// storage            $0.023 per GB-month
+    /// GET requests       $0.0004 per 1,000
+    /// transfer to EC2    free, same region, any availability zone
+    /// cold retrieval     $0.01 per GB  (Standard-IA / One Zone-IA)
+    /// ```
+    ///
+    /// Rates move; this is a starting point, not a promise. `from_rates` is
+    /// there to be given current ones.
+    pub fn aws_s3_same_region() -> Self {
+        PriceTable::from_rates(0.023, 0.0004, 1e6, 0.0, 0.01)
+    }
+
+    /// AWS S3 Standard, read across regions at about $0.02 per GB.
+    pub fn aws_s3_cross_region() -> Self {
+        PriceTable::from_rates(0.023, 0.0004, 1e6, 0.02, 0.01)
+    }
+
+    /// AWS S3 Standard, served to the public internet at $0.09 per GB.
+    ///
+    /// The most expensive common case by a wide margin, and the one where
+    /// pruning pays for itself fastest.
+    pub fn aws_s3_internet() -> Self {
+        PriceTable::from_rates(0.023, 0.0004, 1e6, 0.09, 0.01)
+    }
+
     /// Price of a single byte at a given tier and distance.
     pub fn byte_usd(&self, tier: Tier, distance: Distance) -> f64 {
         let tier_multiplier = match tier {
@@ -131,22 +194,26 @@ impl PriceTable {
 }
 
 impl Default for PriceTable {
-    /// Prices in the shape of a public cloud: cold retrieval and crossing a
-    /// boundary both cost real money, and local hot reads are nearly free.
+    /// AWS S3 read in the same region.
     ///
-    /// The absolute values matter less than the ratios, which are what order
-    /// the optimizer's choices. Every distance is strictly more expensive than
-    /// the one inside it, including `Near`, so that a scheduler with a choice
-    /// between a node-local and a rack-local replica prefers the closer one.
+    /// Derived rather than invented, which the previous default was not. The
+    /// guesses it replaces, against rates published in January 2026:
+    ///
+    /// ```text
+    ///                   guessed    derived
+    /// hot_byte_usd       1e-11     4.0e-13     25x too high
+    /// cold_multiplier    1000      26          38x too high
+    /// near_multiplier    2.0       1.0         in-region transfer is free
+    /// far_multiplier     100       51          about right
+    /// byte_day_usd       7e-13     7.67e-13    about right
+    /// ```
+    ///
+    /// The `cold_multiplier` error was the one worth catching. At 1000x, any
+    /// decision priced in money would refuse to read cold data under
+    /// practically any circumstances; the real ratio is about 26, which is a
+    /// reason to prefer hot data rather than a reason to never touch cold.
     fn default() -> Self {
-        PriceTable {
-            hot_byte_usd: 1e-11,
-            cold_multiplier: 1_000.0,
-            near_multiplier: 2.0,
-            far_multiplier: 100.0,
-            cpu_second_usd: 1e-5,
-            byte_day_usd: 7e-13,
-        }
+        PriceTable::aws_s3_same_region()
     }
 }
 
@@ -157,40 +224,103 @@ mod tests {
     const GB: u64 = 1_000_000_000;
 
     #[test]
-    fn cold_and_far_bytes_cost_more_than_hot_local_ones() {
+    fn cold_bytes_cost_more_than_hot_ones() {
         let p = PriceTable::default();
-        let hot_local = p.byte_usd(Tier::Hot, Distance::Local);
-        let cold_local = p.byte_usd(Tier::Cold, Distance::Local);
-        let hot_far = p.byte_usd(Tier::Hot, Distance::Far);
-        let cold_far = p.byte_usd(Tier::Cold, Distance::Far);
+        assert!(
+            p.byte_usd(Tier::Cold, Distance::Local) > p.byte_usd(Tier::Hot, Distance::Local),
+            "a retrieval fee is a real charge"
+        );
+    }
 
-        assert!(cold_local > hot_local, "cold must cost more than hot");
-        assert!(hot_far > hot_local, "far must cost more than local");
-        assert!(cold_far > cold_local);
-        assert!(cold_far > hot_far);
+    /// Distance is free within a region, and the design assumed otherwise.
+    ///
+    /// This test used to assert that every distance costs strictly more than
+    /// the one inside it, on the reasoning that a scheduler needs a reason to
+    /// prefer a closer replica. Calibration against published rates showed the
+    /// premise is false for the dominant deployment: AWS bills nothing for
+    /// transfer from S3 to compute in the same region, whatever availability
+    /// zone either is in.
+    ///
+    /// So `Local`, `Near` and `Far` are all the same price by default, and the
+    /// reason to prefer local data there is **latency**, which `Cost` does not
+    /// model. That is a real gap, and pricing distance as though money were the
+    /// reason would have hidden it behind a number nobody could defend.
+    #[test]
+    fn distance_is_free_within_a_region() {
+        let p = PriceTable::default();
+        let at = |d| p.byte_usd(Tier::Hot, d);
+        assert_eq!(at(Distance::Local), at(Distance::Near));
+        assert_eq!(at(Distance::Near), at(Distance::Far));
     }
 
     #[test]
-    fn distance_prices_strictly_increase_by_default() {
-        // Strict, so that a scheduler choosing between a node-local and a
-        // rack-local replica has a reason to prefer the closer one.
-        let p = PriceTable::default();
-        let at = |d| p.byte_usd(Tier::Hot, d);
+    fn distance_costs_money_once_bytes_leave_the_region() {
+        for p in [
+            PriceTable::aws_s3_cross_region(),
+            PriceTable::aws_s3_internet(),
+        ] {
+            let at = |d| p.byte_usd(Tier::Hot, d);
+            assert!(
+                at(Distance::Far) > at(Distance::Local),
+                "egress is billed, so far must cost more"
+            );
+        }
+
+        // And the internet is far dearer than another region, which is what
+        // makes serving queries out of the wrong place expensive.
+        assert!(
+            PriceTable::aws_s3_internet().far_multiplier
+                > PriceTable::aws_s3_cross_region().far_multiplier
+        );
+    }
+
+    #[test]
+    fn a_deployment_can_price_distance_however_it_likes() {
+        // On-premises, cross-rack traffic contends for a shared uplink even
+        // though nobody sends an invoice for it. A deployment that wants
+        // locality to weigh on cost can say so, and nothing here prevents it.
+        let contended = PriceTable {
+            near_multiplier: 2.0,
+            far_multiplier: 10.0,
+            ..PriceTable::default()
+        };
+        let at = |d| contended.byte_usd(Tier::Hot, d);
         assert!(at(Distance::Local) < at(Distance::Near));
         assert!(at(Distance::Near) < at(Distance::Far));
     }
 
+    /// The rates are checkable against the sources they came from.
     #[test]
-    fn an_on_prem_table_may_price_every_distance_the_same() {
-        // Nothing requires the ordering to be strict; a deployment with no
-        // egress billing and a flat fabric can say so.
-        let flat = PriceTable {
-            near_multiplier: 1.0,
-            far_multiplier: 1.0,
-            ..PriceTable::default()
-        };
-        let at = |d| flat.byte_usd(Tier::Hot, d);
-        assert_eq!(at(Distance::Local), at(Distance::Far));
+    fn the_published_rates_are_what_was_derived_from() {
+        let p = PriceTable::aws_s3_same_region();
+
+        // $0.023 per GB-month over thirty days.
+        assert!((p.byte_day_usd - 0.023 / (1e9 * 30.0)).abs() < 1e-18);
+        // $0.0004 per 1,000 GETs, spread over a 1 MB read.
+        assert!((p.hot_byte_usd - 4e-13).abs() < 1e-16);
+        // $0.01 per GB retrieval on top of that.
+        assert!(
+            (p.cold_multiplier - 26.0).abs() < 0.5,
+            "cold_multiplier {}",
+            p.cold_multiplier
+        );
+
+        // Cross-region egress at $0.02 per GB.
+        assert!(
+            (PriceTable::aws_s3_cross_region().far_multiplier - 51.0).abs() < 1.0,
+            "far_multiplier {}",
+            PriceTable::aws_s3_cross_region().far_multiplier
+        );
+    }
+
+    #[test]
+    fn a_smaller_average_read_makes_every_byte_dearer() {
+        // A per-request fee spread over a 4 KB footer read costs far more per
+        // byte than the same fee over a 1 MB column chunk. Worth exposing,
+        // since it is the one input a caller is likely to get wrong.
+        let big = PriceTable::from_rates(0.023, 0.0004, 1e6, 0.0, 0.01);
+        let small = PriceTable::from_rates(0.023, 0.0004, 4e3, 0.0, 0.01);
+        assert!(small.hot_byte_usd > big.hot_byte_usd * 100.0);
     }
 
     #[test]

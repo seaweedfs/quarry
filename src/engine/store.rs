@@ -322,7 +322,12 @@ mod tests {
     async fn what_the_backend_reports_decides_how_much_a_budget_buys() {
         use crate::facts::{PlacedStorage, Placement};
 
-        let prices = PriceTable::default();
+        // Priced for bytes leaving the region, because that is the deployment
+        // where distance costs money. Under same-region rates — the default —
+        // transfer is not billed at all, so a colocated byte and a remote one
+        // cost exactly the same and this would have nothing to measure. See
+        // `PriceTable::aws_s3_same_region`.
+        let prices = PriceTable::aws_s3_internet();
         let budget = Budget::usd(prices.byte_usd(Tier::Hot, Distance::Far) * 150.0);
         let here = Place::parse("/onprem/dc1/rack2/node7");
 
