@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, Predicate, Query};
+use crate::layout::Spread;
 use crate::registry::Registry;
 use crate::snapshot::TableId;
 
@@ -141,12 +142,29 @@ pub struct Proposal {
     pub bytes_scanned: u64,
     /// The most this could possibly have saved.
     ///
-    /// A **ceiling**, not an estimate: it assumes the index prunes everything,
-    /// which it will not. Selectivity is unknowable before building, and this
-    /// design would rather report a bound it can defend than invent a
-    /// selectivity constant. It still orders proposals correctly, which is
-    /// what a ranking needs.
+    /// A **ceiling**, not an estimate: it assumes the index prunes everything.
+    /// Measured against real data it was 1775x optimistic, unboundedly
+    /// optimistic, and exactly right, across three regimes — so it does *not*
+    /// order proposals usefully, which an earlier version of this comment
+    /// claimed it did.
+    ///
+    /// Use [`Proposal::expected_usd`] to rank. This remains only as an upper
+    /// bound, which is occasionally worth knowing and never worth deciding on.
     pub ceiling_usd: f64,
+}
+
+impl Proposal {
+    /// What this is expected to save, given how the field is laid out.
+    ///
+    /// The ceiling scaled by the fraction of a scan an index actually removes
+    /// that the file format does not. Against measured data this lands within
+    /// a few points of what was realized, where the ceiling was out by three
+    /// orders of magnitude.
+    pub fn expected_usd(&self, spread: &Spread, prices: &PriceTable) -> f64 {
+        self.bytes_scanned as f64
+            * spread.index_advantage()
+            * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+    }
 }
 
 /// What the optimizer is allowed to do.
@@ -206,7 +224,7 @@ pub struct Policy {
     /// Without this the loop builds an index whenever a shape goes unaided,
     /// which measurement showed to be badly wrong: of three regimes, one saved
     /// 95% of a scan and two saved nothing, and nothing in the proposal could
-    /// tell them apart. See [`Spread`](crate::layout::Spread).
+    /// tell them apart. See [`Spread`].
     ///
     /// Zero would restore the old behaviour of building on hope alone.
     pub min_index_advantage_pct: f64,

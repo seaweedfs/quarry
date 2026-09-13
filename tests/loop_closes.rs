@@ -37,6 +37,7 @@ use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 use quarry::workload::{Policy, Workload};
 
 const TENANT_FIELD: u32 = 4;
+const MESSAGE_FIELD: u32 = 7;
 const POLICY: PolicyFingerprint = PolicyFingerprint(1);
 
 fn schema() -> SchemaRef {
@@ -1125,4 +1126,123 @@ async fn overlap_is_estimated_correctly_under_partial_clustering() {
     );
     // Three of eight files is still well worth an index.
     assert!(spread.index_advantage_pct() > 40.0);
+}
+
+/// Ranking: the biggest ceiling is not the best candidate.
+///
+/// Nothing measured whether proposals were *ordered* well, only whether
+/// individual decisions were right. They were not: `max_builds_per_round` was
+/// applied while walking proposals in `ceiling_usd` order, and the ceiling was
+/// measured 1775x wrong on one regime. With the default of one build per
+/// round, a round could build the worst candidate and decline the best.
+#[tokio::test]
+async fn the_best_candidate_is_built_not_the_one_with_the_biggest_ceiling() {
+    let fixture = fixture("loop_ranking");
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+
+    // Two fields. `tenant_id` is scanned twice as much, so it has the larger
+    // ceiling — but the format nearly prunes it already. `message` is scanned
+    // less and an index would genuinely help.
+    //
+    //     ceiling   tenant 1000 MB  >  message 500 MB
+    //     expected  tenant  120 MB  <  message 475 MB
+    let barely_helps = Spread {
+        files: 20,
+        files_by_bounds: 20.0,
+        files_by_index: 17.6, // 12% advantage, just over the threshold
+    };
+    let helps_a_lot = Spread {
+        files: 20,
+        files_by_bounds: 20.0,
+        files_by_index: 1.0, // 95% advantage
+    };
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30)
+            .with_min_queries(3)
+            .with_max_builds(1),
+    )
+    .for_reader(POLICY)
+    .with_spreads(BTreeMap::from([
+        (TENANT_FIELD, barely_helps),
+        (MESSAGE_FIELD, helps_a_lot),
+    ]));
+
+    // Ten queries on tenant_id, five on message, the same size each.
+    for _ in 0..10 {
+        optimizer.observe(observation_on(TENANT_FIELD, 100_000_000));
+    }
+    for _ in 0..5 {
+        optimizer.observe(observation_on(MESSAGE_FIELD, 100_000_000));
+    }
+
+    let proposals = optimizer.proposals();
+    assert_eq!(proposals.len(), 2);
+    assert_eq!(
+        proposals[0].field, TENANT_FIELD,
+        "by ceiling, tenant_id looks like the one to build"
+    );
+
+    // But by expected saving it is not: 1000 MB x 12% against 500 MB x 95%.
+    let prices = PriceTable::default();
+    let tenant = proposals
+        .iter()
+        .find(|p| p.field == TENANT_FIELD)
+        .expect("tenant proposal");
+    let message = proposals
+        .iter()
+        .find(|p| p.field == MESSAGE_FIELD)
+        .expect("message proposal");
+    assert!(tenant.ceiling_usd > message.ceiling_usd);
+    assert!(
+        message.expected_usd(&helps_a_lot, &prices) > tenant.expected_usd(&barely_helps, &prices),
+        "the cheaper query's index should be worth more"
+    );
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "one build allowed: {round:?}");
+    assert_eq!(
+        round.built[0],
+        index_id(&TableId("events".into()), MESSAGE_FIELD),
+        "the round must spend its one build on the better candidate: {round:?}"
+    );
+    assert_eq!(
+        round
+            .declined
+            .iter()
+            .find(|(id, _)| *id == index_id(&TableId("events".into()), TENANT_FIELD))
+            .map(|(_, why)| *why),
+        Some(Declined::RoundFull),
+        "and defer the other rather than skip it: {round:?}"
+    );
+}
+
+/// An observation of a query filtering `field`, having read `bytes`.
+fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
+    use quarry::derived::{Predicate, Query};
+    use quarry::workload::{Fingerprint, Observation};
+
+    let query = Query {
+        table: TableId("events".into()),
+        snapshot: SnapshotId(1),
+        policy: POLICY,
+        plan_hash: field as u64,
+        plan: None,
+        projected: std::collections::BTreeSet::from([field]),
+        predicates: vec![Predicate::Eq { field, value: 1 }],
+    };
+    Observation {
+        fingerprint: Fingerprint::of(&query),
+        bytes_read: bytes,
+        bytes_if_full_scan: bytes,
+        used: None,
+    }
 }

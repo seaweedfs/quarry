@@ -1196,13 +1196,11 @@ genuine Iceberg table, default policy, nothing supplied, and it reaches
 
 ### Still open
 
-- `Proposal::ceiling_usd` remains a ceiling. With an advantage available it
-  could become an expected saving, at which point proposals could be ranked
-  meaningfully rather than by an upper bound that measured 1775x off.
 - Bounds for non-Iceberg Parquet tables, from footer statistics. Without them
   the gate declines on a plain Parquet table.
-- Nothing measures whether the *ranking* of proposals is any good, only
-  whether individual decisions are.
+- Bounds for non-Iceberg Parquet tables, from footer statistics. Without them
+  the gate declines on a plain Parquet table.
+
 
 
 ---
@@ -1265,3 +1263,43 @@ indexes built. The conservative direction, and deliberate.
 `overlap_is_estimated_correctly_under_partial_clustering` pins the regime that
 broke it twice, comparing the sampled estimate against the index's own
 postings.
+
+
+---
+
+## Phase 16 — Ranking `[x]`
+
+`Proposal::expected_usd` scales the ceiling by the advantage, so a proposal
+reports what it is expected to save rather than the most it conceivably could.
+Against measured data the ceiling was 1775x out; the expected figure lands
+within three points.
+
+### A bug that fell out of writing the test
+
+Nothing had measured whether proposals were *ordered* well, only whether
+individual decisions were right. They were not:
+
+```text
+max_builds_per_round was applied while walking proposals in ceiling order
+```
+
+and the ceiling is the number measurement found to be 1775x wrong on one
+regime and unbounded on another. With the default of **one build per round**, a
+round could build the worst candidate and decline the best as `RoundFull`.
+
+The build phase is now: cheap refusals, then evidence, then rank by expected
+saving, then cap. The cap applies to the ranked order, which is the whole
+point of having one.
+
+`the_best_candidate_is_built_not_the_one_with_the_biggest_ceiling` pins it with
+two fields whose orders disagree — 1000 MB at 12% against 500 MB at 95%, so
+the ceiling prefers the first and the expected saving the second. The round
+must spend its single build on the second and defer the first rather than skip
+it.
+
+### On getting the test wrong first
+
+The first version used 1000 MB at 15% against 30 MB at 95%, which the ceiling
+and the expected saving *agree* on — 150 against 28.5. It would have passed
+whether or not the ranking worked. Caught only because the assertion comparing
+the two expected values failed before reaching the interesting part.

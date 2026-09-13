@@ -280,6 +280,13 @@ impl Optimizer {
             .into_iter()
             .collect();
 
+        // Cheap refusals first, then evidence, then rank, then build. The
+        // order matters: `max_builds_per_round` used to be applied while
+        // walking proposals in `ceiling_usd` order, which measurement showed
+        // to be 1775x wrong on one regime and unbounded on another — so with
+        // the default of one build per round, a round could build the worst
+        // candidate and decline the best as `RoundFull`.
+        let mut ranked: Vec<(Proposal, f64)> = Vec::new();
         for proposal in proposals {
             let id = index_id(&proposal.table, proposal.field);
 
@@ -290,17 +297,14 @@ impl Optimizer {
                 round.declined.push((id, Declined::AlreadyBuilt));
                 continue;
             }
-            if round.built.len() >= self.policy.max_builds_per_round {
-                round.declined.push((id, Declined::RoundFull));
-                continue;
-            }
 
-            // Would this beat what the file format prunes for free? Checked
+            // Would this beat what the file format prunes for free? Asked
             // before building, because the answer is usually no, and because
             // building first and measuring after means paying for the build
             // and the storage to learn it was pointless.
+            let spread = self.evidence(session, table, proposal.field).await;
             if self.policy.min_index_advantage_pct > 0.0 {
-                match self.evidence(session, table, proposal.field).await {
+                match spread {
                     None => {
                         round.declined.push((id, Declined::NoEvidence));
                         continue;
@@ -313,6 +317,28 @@ impl Optimizer {
                     }
                     Some(_) => {}
                 }
+            }
+
+            // Ranked by what it is expected to save, not by the ceiling.
+            // Without evidence there is nothing to scale the ceiling by, which
+            // only happens when the policy does not require evidence.
+            let expected = spread
+                .map(|spread| proposal.expected_usd(&spread, &self.prices))
+                .unwrap_or(proposal.ceiling_usd);
+            ranked.push((proposal, expected));
+        }
+
+        ranked.sort_by(|(left, one), (right, other)| {
+            other
+                .total_cmp(one)
+                .then_with(|| left.field.cmp(&right.field))
+        });
+
+        for (proposal, _) in ranked {
+            let id = index_id(&proposal.table, proposal.field);
+            if round.built.len() >= self.policy.max_builds_per_round {
+                round.declined.push((id, Declined::RoundFull));
+                continue;
             }
 
             let built =
