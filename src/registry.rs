@@ -50,6 +50,11 @@ impl Registry {
         self.entries.get(id)
     }
 
+    /// Every registered id, in order.
+    pub fn ids(&self) -> Vec<DerivedId> {
+        self.entries.keys().cloned().collect()
+    }
+
     /// How many pieces are registered.
     pub fn len(&self) -> usize {
         self.entries.len()

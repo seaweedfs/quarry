@@ -25,6 +25,7 @@ use crate::cost::PriceTable;
 use crate::derived::{Decision, DerivedId, FieldId, PolicyFingerprint, Predicate, Query, Rewrite};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
+use crate::workload::{Fingerprint, Observation};
 
 /// Hash a literal the way [`QuarryTable`] does when probing an index.
 ///
@@ -59,6 +60,38 @@ pub struct ScanReport {
     /// table will look it up under, so it is reported rather than left to be
     /// recomputed.
     pub plan_hash: u64,
+    /// What the query would have cost unaided.
+    ///
+    /// The sum of the live data files' sizes at the queried snapshot, known
+    /// exactly from metadata. This is what makes a saving measurable instead
+    /// of estimated — see [`crate::workload`].
+    pub bytes_if_full_scan: u64,
+    /// The shape of the query, with literals stripped.
+    pub fingerprint: Fingerprint,
+}
+
+impl ScanReport {
+    /// Bytes this scan expects to read.
+    ///
+    /// Derived-state bytes are not counted: what a query avoids is measured
+    /// against the table, and a piece of derived state small enough to be
+    /// worth using is negligible beside the files it replaced.
+    pub fn bytes_planned(&self, sizes: &BTreeMap<FileId, u64>) -> u64 {
+        self.files_read
+            .iter()
+            .filter_map(|file| sizes.get(file))
+            .sum()
+    }
+
+    /// What to record about this scan.
+    pub fn observation(&self, bytes_read: u64) -> Observation {
+        Observation {
+            fingerprint: self.fingerprint.clone(),
+            bytes_read,
+            bytes_if_full_scan: self.bytes_if_full_scan,
+            used: self.used.clone().map(DerivedId),
+        }
+    }
 }
 
 /// Where a table's data actually lives.
@@ -263,6 +296,16 @@ impl QuarryTable {
             projected: self.projected_fields(projection),
             predicates: self.predicates(filters),
         };
+        let fingerprint = Fingerprint::of(&query);
+
+        // The unaided baseline, known exactly rather than estimated: every
+        // live data file's size. Only available where sizes are known, which
+        // is the Parquet path; an in-memory table reports zero and its
+        // observations are correspondingly uninformative.
+        let bytes_if_full_scan = match &self.files {
+            Files::Parquet { sizes, .. } => live.iter().filter_map(|file| sizes.get(file)).sum(),
+            Files::Memory(_) => 0,
+        };
 
         // The cheapest candidate the engine can actually execute. A
         // substituting one is executable only if its rows were supplied to
@@ -286,6 +329,8 @@ impl QuarryTable {
                         also_scanned,
                         substituted: false,
                         plan_hash,
+                        bytes_if_full_scan,
+                        fingerprint: fingerprint.clone(),
                     }),
                     Rewrite::Substitute { .. }
                         if self.materialized.contains_key(&candidate.derived.id) =>
@@ -296,6 +341,8 @@ impl QuarryTable {
                             also_scanned,
                             substituted: true,
                             plan_hash,
+                            bytes_if_full_scan,
+                            fingerprint: fingerprint.clone(),
                         })
                     }
                     Rewrite::Substitute { .. } => None,
@@ -309,6 +356,8 @@ impl QuarryTable {
                 also_scanned: BTreeSet::new(),
                 substituted: false,
                 plan_hash,
+                bytes_if_full_scan,
+                fingerprint,
             },
             Some(mut report) => {
                 report

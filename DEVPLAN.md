@@ -541,14 +541,59 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] Two implementations: `OpaqueStorage` (all `None`) and `PlacedStorage`
 - [x] `resolve`: the one place defaults are applied
 - [x] Wired through `MeteredStore` and `Quarry`
+- [x] `Workload`: observation by query shape, with literals stripped
+- [x] `proposals`: which index to build, ranked by what is at stake
+- [x] `retirements`: what has not paid for keeping it
+- [x] `PriceTable::byte_day_usd`, so retention and reads compare
+- [x] The loop, tested end to end on real queries over real Parquet
 - [ ] `commit_notifications`, when there is something to consume it
-- [ ] Iceberg `ScanReport` ingestion; query telemetry
-- [ ] `auto_optimize`: build, measure realized benefit, retire
+- [ ] Building a proposed index by reading the data
+- [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
 
 **Done when** the optimizer contains no backend name, and an unused derived
-state is retired on its own. The first half holds: `MeteredStore` used to
-hardcode hot-and-far, and now asks the backend. Nothing outside `facts.rs`
-mentions a backend.
+state is retired on its own. **Both halves now hold.** `MeteredStore` used to
+hardcode hot-and-far and now asks the backend; nothing outside `facts.rs`
+mentions one. And `tests/loop_closes.rs` walks the whole cycle: ten unaided
+queries, a proposal, a build, ten aided queries, a measured saving, and the
+proposal stopping — plus a gigabyte of unprobed index being retired.
+
+**The counterfactual problem mostly dissolves for pruning.** Measuring an
+optimizer is usually circular: you cannot know what a candidate would have
+saved without building it, and once built the baseline is gone. The usual
+answers — holdout sampling, shadow execution — both cost something.
+
+For pruning it is not needed, because the baseline is *computable*:
+
+```text
+a full scan's cost = the sum of the live data files' sizes
+                     known exactly, at any snapshot, reading nothing
+```
+
+So the saving is `full_scan_bytes - bytes_read`: measured, per query, with no
+holdout. `ScanReport::bytes_if_full_scan` carries it, and the test asserts the
+credited saving equals exactly the three of four files the index ruled out.
+
+Where it genuinely does not dissolve, stated rather than papered over:
+
+```text
+latency            not modelled; bytes are a poor proxy for a cpu-bound query
+substituting kinds a cached aggregate's alternative is "read N bytes AND
+                   compute", and the compute is not priced
+never built        a proposal's saving can only be BOUNDED, which is why
+                   Proposal::ceiling_usd is named a ceiling and documented
+                   as assuming perfect selectivity. Inventing a selectivity
+                   constant would have looked more precise and been less
+                   honest; the ceiling still ranks proposals correctly.
+```
+
+Two deliberate choices in the proposer: it only proposes for shapes that went
+**unaided**, so a served shape is left alone; and it merges by `(table, field)`
+rather than by shape, so ten shapes filtering the same column ask for one index
+rather than ten.
+
+Retirement treats *never used* as a reason to retire. Something built and never
+touched is indistinguishable from a leak, and rebuilding is cheap because
+derived state is disposable.
 
 **Found while implementing — "assume the worst" is wrong for one dimension.**
 `core-design.md` says an unanswered capability should default to "unknown,

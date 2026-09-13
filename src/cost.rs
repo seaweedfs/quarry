@@ -90,6 +90,13 @@ pub struct PriceTable {
     pub far_multiplier: f64,
     /// Price of one cpu-second.
     pub cpu_second_usd: f64,
+    /// Price of *keeping* one byte for one day.
+    ///
+    /// Separate from the price of moving a byte, and in different units: a
+    /// rate rather than a one-off. Retirement compares what a piece of derived
+    /// state has saved against what keeping it costs over some horizon, and
+    /// those two cannot be compared without this.
+    pub byte_day_usd: f64,
 }
 
 impl PriceTable {
@@ -105,6 +112,11 @@ impl PriceTable {
             Distance::Far => self.far_multiplier,
         };
         self.hot_byte_usd * tier_multiplier * distance_multiplier
+    }
+
+    /// Price keeping `bytes` for `days`.
+    pub fn retention_usd(&self, bytes: u64, days: f64) -> f64 {
+        bytes as f64 * self.byte_day_usd * days
     }
 
     /// Price reading `bytes` from `tier` at `distance`, spending
@@ -133,6 +145,7 @@ impl Default for PriceTable {
             near_multiplier: 2.0,
             far_multiplier: 100.0,
             cpu_second_usd: 1e-5,
+            byte_day_usd: 7e-13,
         }
     }
 }

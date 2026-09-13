@@ -1,0 +1,550 @@
+//! What queries asked for, what would have helped, and what stopped helping.
+//!
+//! This is the part that makes the system *self*-optimizing rather than merely
+//! optimizable. Everything else uses derived state that someone decided to
+//! build; this decides.
+//!
+//! # The counterfactual problem, and where it does not apply
+//!
+//! Measuring an optimizer's benefit is usually circular: you cannot measure
+//! what a candidate would have saved without building it, and once you build
+//! it the un-optimized baseline is gone. The usual answers are holdout
+//! sampling or shadow execution, both of which cost something.
+//!
+//! For *pruning*, none of that is needed, because the baseline is **computable
+//! from metadata**:
+//!
+//! ```text
+//! a full scan's cost = the sum of the live data files' sizes
+//! ```
+//!
+//! That is known exactly, at every snapshot, without reading anything. So the
+//! saving from having pruned is `full_scan_bytes - bytes_read`, measured rather
+//! than estimated, for every query that ran.
+//!
+//! Where it genuinely does not apply, and this design says so rather than
+//! pretending:
+//!
+//! ```text
+//! latency          not modelled at all; bytes are a proxy, and a poor one
+//!                  for a query whose cost is cpu rather than I/O
+//!
+//! substituting     a cached aggregate's alternative is not "read N bytes"
+//! kinds            but "read N bytes and then compute", and the compute is
+//!                  not priced here
+//!
+//! what was never   a proposal's saving cannot be measured, only bounded.
+//! built            See `Proposal::ceiling_usd`, which is a ceiling and is
+//!                  documented as one.
+//! ```
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::cost::PriceTable;
+use crate::derived::{DerivedId, FieldId, Predicate, Query};
+use crate::registry::Registry;
+use crate::snapshot::TableId;
+
+/// The shape of a query, with literals stripped.
+///
+/// Two queries differing only in which tenant they ask about share a
+/// fingerprint, which is the whole point: one index serves both. Literals are
+/// dropped rather than hashed, so nothing here can leak a value.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Fingerprint {
+    /// The table read.
+    pub table: TableId,
+    /// Fields an index could probe, because they were compared for equality.
+    pub probeable: BTreeSet<FieldId>,
+    /// Fields restricted in a way nothing can currently probe.
+    pub opaque: BTreeSet<FieldId>,
+    /// Fields read.
+    pub projected: BTreeSet<FieldId>,
+}
+
+impl Fingerprint {
+    /// The shape of `query`.
+    pub fn of(query: &Query) -> Self {
+        let mut probeable = BTreeSet::new();
+        let mut opaque = BTreeSet::new();
+        for predicate in &query.predicates {
+            match predicate {
+                Predicate::Eq { field, .. } => probeable.insert(*field),
+                Predicate::Opaque { field } => opaque.insert(*field),
+            };
+        }
+        Fingerprint {
+            table: query.table.clone(),
+            probeable,
+            opaque,
+            projected: query.projected.clone(),
+        }
+    }
+}
+
+/// What one query actually cost, and what it would have cost unaided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observation {
+    /// The query's shape.
+    pub fingerprint: Fingerprint,
+    /// Bytes the query read.
+    pub bytes_read: u64,
+    /// Bytes a full scan of the queried snapshot would have read.
+    ///
+    /// Known exactly from the live file sizes, which is what makes the saving
+    /// below a measurement rather than a guess.
+    pub bytes_if_full_scan: u64,
+    /// Which piece of derived state served it, if any.
+    pub used: Option<DerivedId>,
+}
+
+impl Observation {
+    /// Bytes not read, thanks to whatever served this query.
+    ///
+    /// Saturating: a query that somehow read more than a full scan is recorded
+    /// as having saved nothing rather than as a negative saving.
+    pub fn bytes_saved(&self) -> u64 {
+        self.bytes_if_full_scan.saturating_sub(self.bytes_read)
+    }
+}
+
+/// What has been seen for one query shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// How many queries of this shape ran.
+    pub queries: u64,
+    /// Bytes they read in total.
+    pub bytes_read: u64,
+    /// Bytes full scans would have read.
+    pub bytes_if_full_scan: u64,
+    /// How many were served by derived state.
+    pub helped: u64,
+}
+
+impl Seen {
+    /// Bytes not read across every query of this shape.
+    pub fn bytes_saved(&self) -> u64 {
+        self.bytes_if_full_scan.saturating_sub(self.bytes_read)
+    }
+}
+
+/// Something worth building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    /// The table it would be built on.
+    pub table: TableId,
+    /// The field it would index.
+    pub field: FieldId,
+    /// How many queries of this shape went unaided.
+    pub queries: u64,
+    /// Bytes those queries read.
+    pub bytes_scanned: u64,
+    /// The most this could possibly have saved.
+    ///
+    /// A **ceiling**, not an estimate: it assumes the index prunes everything,
+    /// which it will not. Selectivity is unknowable before building, and this
+    /// design would rather report a bound it can defend than invent a
+    /// selectivity constant. It still orders proposals correctly, which is
+    /// what a ranking needs.
+    pub ceiling_usd: f64,
+}
+
+/// What queries have asked for, accumulated by shape.
+#[derive(Clone, Debug, Default)]
+pub struct Workload {
+    by_shape: BTreeMap<Fingerprint, Seen>,
+    by_derived: BTreeMap<DerivedId, Seen>,
+}
+
+impl Workload {
+    /// An empty workload.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record what a query cost.
+    pub fn observe(&mut self, observation: Observation) {
+        let shape = self.by_shape.entry(observation.fingerprint).or_default();
+        shape.queries += 1;
+        shape.bytes_read = shape.bytes_read.saturating_add(observation.bytes_read);
+        shape.bytes_if_full_scan = shape
+            .bytes_if_full_scan
+            .saturating_add(observation.bytes_if_full_scan);
+
+        if let Some(id) = observation.used {
+            shape.helped += 1;
+            let credited = self.by_derived.entry(id).or_default();
+            credited.queries += 1;
+            credited.helped += 1;
+            credited.bytes_read = credited.bytes_read.saturating_add(observation.bytes_read);
+            credited.bytes_if_full_scan = credited
+                .bytes_if_full_scan
+                .saturating_add(observation.bytes_if_full_scan);
+        }
+    }
+
+    /// How many query shapes have been seen.
+    pub fn shapes(&self) -> usize {
+        self.by_shape.len()
+    }
+
+    /// What was seen for one shape.
+    pub fn seen(&self, fingerprint: &Fingerprint) -> Option<Seen> {
+        self.by_shape.get(fingerprint).copied()
+    }
+
+    /// What one piece of derived state has actually saved.
+    pub fn credited(&self, id: &DerivedId) -> Option<Seen> {
+        self.by_derived.get(id).copied()
+    }
+
+    /// Indexes worth building, most promising first.
+    ///
+    /// Only proposes for queries that went **unaided**: a shape already served
+    /// by derived state does not need more. Requires at least `min_queries`
+    /// of a shape, so that one expensive one-off does not cause a build.
+    ///
+    /// One proposal per (table, field), with counts summed across every shape
+    /// that would benefit — otherwise ten shapes filtering the same field
+    /// would each propose the same index.
+    pub fn proposals(&self, prices: &PriceTable, min_queries: u64) -> Vec<Proposal> {
+        let mut merged: BTreeMap<(TableId, FieldId), Proposal> = BTreeMap::new();
+
+        for (shape, seen) in &self.by_shape {
+            let unaided = seen.queries.saturating_sub(seen.helped);
+            if unaided == 0 {
+                continue;
+            }
+            for field in &shape.probeable {
+                let key = (shape.table.clone(), *field);
+                let entry = merged.entry(key).or_insert_with(|| Proposal {
+                    table: shape.table.clone(),
+                    field: *field,
+                    queries: 0,
+                    bytes_scanned: 0,
+                    ceiling_usd: 0.0,
+                });
+                entry.queries += unaided;
+                entry.bytes_scanned = entry.bytes_scanned.saturating_add(seen.bytes_read);
+            }
+        }
+
+        let mut proposals: Vec<Proposal> = merged
+            .into_values()
+            .filter(|proposal| proposal.queries >= min_queries)
+            .map(|mut proposal| {
+                proposal.ceiling_usd = proposal.bytes_scanned as f64
+                    * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far);
+                proposal
+            })
+            .collect();
+
+        // Most promising first; ties broken by field so the order is total.
+        proposals.sort_by(|a, b| {
+            b.ceiling_usd
+                .total_cmp(&a.ceiling_usd)
+                .then_with(|| a.field.cmp(&b.field))
+        });
+        proposals
+    }
+
+    /// Derived state that has not paid for itself over `horizon_days`.
+    ///
+    /// Compares what a piece has *measurably* saved against what keeping it
+    /// costs. A piece nothing has used yet is proposed for retirement, which is
+    /// deliberate: something built and never touched is indistinguishable from
+    /// a leak, and rebuilding it later is cheap because derived state is
+    /// disposable.
+    ///
+    /// Returns ids only; the caller decides whether to act, so that an
+    /// advisory mode and an automatic one share this code.
+    pub fn retirements(
+        &self,
+        registry: &Registry,
+        prices: &PriceTable,
+        horizon_days: f64,
+    ) -> Vec<DerivedId> {
+        let mut retire = Vec::new();
+        for id in registry.ids() {
+            let Some(derived) = registry.get(&id) else {
+                continue;
+            };
+            let keeping = prices.retention_usd(derived.bytes, horizon_days);
+            let saved = self
+                .credited(&id)
+                .map(|seen| {
+                    seen.bytes_saved() as f64
+                        * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+                })
+                .unwrap_or(0.0);
+            if saved < keeping {
+                retire.push(id);
+            }
+        }
+        retire
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::Cost;
+    use crate::derived::{Derived, Kind, PolicyFingerprint, Refreshed, Rewrite, Source};
+    use crate::snapshot::{Diff, SnapshotId};
+
+    const GB: u64 = 1_000_000_000;
+
+    fn table() -> TableId {
+        TableId("events".into())
+    }
+
+    fn query_on(fields: &[FieldId]) -> Query {
+        Query {
+            table: table(),
+            snapshot: SnapshotId(1),
+            policy: PolicyFingerprint(1),
+            plan_hash: 1,
+            projected: BTreeSet::from([7]),
+            predicates: fields
+                .iter()
+                .map(|field| Predicate::Eq {
+                    field: *field,
+                    value: 42,
+                })
+                .collect(),
+        }
+    }
+
+    fn unaided(fields: &[FieldId], bytes: u64) -> Observation {
+        Observation {
+            fingerprint: Fingerprint::of(&query_on(fields)),
+            bytes_read: bytes,
+            bytes_if_full_scan: bytes,
+            used: None,
+        }
+    }
+
+    #[test]
+    fn a_fingerprint_drops_literals_but_keeps_shape() {
+        let mut one = query_on(&[4]);
+        one.predicates = vec![Predicate::Eq { field: 4, value: 1 }];
+        let mut two = query_on(&[4]);
+        two.predicates = vec![Predicate::Eq {
+            field: 4,
+            value: 999,
+        }];
+
+        assert_eq!(
+            Fingerprint::of(&one),
+            Fingerprint::of(&two),
+            "two tenants asking the same question share one index"
+        );
+    }
+
+    #[test]
+    fn probeable_and_opaque_predicates_are_distinguished() {
+        let mut query = query_on(&[]);
+        query.predicates = vec![
+            Predicate::Eq { field: 4, value: 1 },
+            Predicate::Opaque { field: 9 },
+        ];
+        let fingerprint = Fingerprint::of(&query);
+        assert_eq!(fingerprint.probeable, BTreeSet::from([4]));
+        assert_eq!(fingerprint.opaque, BTreeSet::from([9]));
+    }
+
+    #[test]
+    fn an_unaided_shape_produces_a_proposal() {
+        let mut workload = Workload::new();
+        for _ in 0..10 {
+            workload.observe(unaided(&[4], GB));
+        }
+
+        let proposals = workload.proposals(&PriceTable::default(), 5);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].field, 4);
+        assert_eq!(proposals[0].queries, 10);
+        assert_eq!(proposals[0].bytes_scanned, 10 * GB);
+        assert!(proposals[0].ceiling_usd > 0.0);
+    }
+
+    #[test]
+    fn a_rare_shape_does_not_justify_a_build() {
+        let mut workload = Workload::new();
+        workload.observe(unaided(&[4], 100 * GB));
+        assert!(
+            workload.proposals(&PriceTable::default(), 5).is_empty(),
+            "one expensive query is not a workload"
+        );
+    }
+
+    #[test]
+    fn an_already_helped_shape_produces_no_proposal() {
+        let mut workload = Workload::new();
+        for _ in 0..10 {
+            workload.observe(Observation {
+                fingerprint: Fingerprint::of(&query_on(&[4])),
+                bytes_read: GB / 10,
+                bytes_if_full_scan: GB,
+                used: Some(DerivedId("idx".into())),
+            });
+        }
+        assert!(workload.proposals(&PriceTable::default(), 1).is_empty());
+    }
+
+    #[test]
+    fn one_index_is_proposed_per_field_not_per_shape() {
+        // Two shapes filtering the same field differ only in projection.
+        let mut workload = Workload::new();
+        for _ in 0..5 {
+            workload.observe(unaided(&[4], GB));
+        }
+        let mut other = query_on(&[4]);
+        other.projected = BTreeSet::from([7, 11]);
+        for _ in 0..5 {
+            workload.observe(Observation {
+                fingerprint: Fingerprint::of(&other),
+                bytes_read: GB,
+                bytes_if_full_scan: GB,
+                used: None,
+            });
+        }
+        assert_eq!(workload.shapes(), 2);
+
+        let proposals = workload.proposals(&PriceTable::default(), 1);
+        assert_eq!(proposals.len(), 1, "one field, one index");
+        assert_eq!(proposals[0].queries, 10, "counts sum across shapes");
+    }
+
+    #[test]
+    fn proposals_are_ordered_by_what_is_at_stake() {
+        let mut workload = Workload::new();
+        for _ in 0..3 {
+            workload.observe(unaided(&[4], GB));
+            workload.observe(unaided(&[9], 100 * GB));
+        }
+        let proposals = workload.proposals(&PriceTable::default(), 1);
+        assert_eq!(proposals[0].field, 9, "the expensive one first");
+        assert_eq!(proposals[1].field, 4);
+    }
+
+    #[test]
+    fn saving_is_measured_not_estimated() {
+        let observation = Observation {
+            fingerprint: Fingerprint::of(&query_on(&[4])),
+            bytes_read: GB / 4,
+            bytes_if_full_scan: GB,
+            used: Some(DerivedId("idx".into())),
+        };
+        assert_eq!(observation.bytes_saved(), GB - GB / 4);
+    }
+
+    #[test]
+    fn reading_more_than_a_full_scan_saves_nothing_rather_than_less() {
+        let observation = Observation {
+            fingerprint: Fingerprint::of(&query_on(&[4])),
+            bytes_read: 2 * GB,
+            bytes_if_full_scan: GB,
+            used: Some(DerivedId("idx".into())),
+        };
+        assert_eq!(observation.bytes_saved(), 0);
+    }
+
+    // Retirement needs a registry, so a minimal kind to populate it with.
+
+    #[derive(Debug)]
+    struct Nothing;
+
+    impl Kind for Nothing {
+        fn name(&self) -> &'static str {
+            "nothing"
+        }
+        fn matches(&self, _query: &Query) -> Option<Rewrite> {
+            None
+        }
+        fn cost(&self, _prices: &PriceTable) -> Cost {
+            Cost::ZERO
+        }
+        fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+            Refreshed::UpToDate
+        }
+    }
+
+    fn registry_with(id: &str, bytes: u64) -> Registry {
+        let mut registry = Registry::new();
+        registry.register(Derived::new(
+            DerivedId(id.into()),
+            Source {
+                table: table(),
+                snapshot: SnapshotId(1),
+            },
+            PolicyFingerprint(1),
+            bytes,
+            Box::new(Nothing),
+        ));
+        registry
+    }
+
+    #[test]
+    fn derived_state_nothing_has_used_is_retired() {
+        let registry = registry_with("idle", 10 * GB);
+        let retire = Workload::new().retirements(&registry, &PriceTable::default(), 30.0);
+        assert_eq!(
+            retire,
+            vec![DerivedId("idle".into())],
+            "built and never touched is indistinguishable from a leak"
+        );
+    }
+
+    #[test]
+    fn derived_state_that_has_paid_for_itself_is_kept() {
+        let registry = registry_with("useful", 1_000_000);
+        let mut workload = Workload::new();
+        for _ in 0..1_000 {
+            workload.observe(Observation {
+                fingerprint: Fingerprint::of(&query_on(&[4])),
+                bytes_read: 0,
+                bytes_if_full_scan: GB,
+                used: Some(DerivedId("useful".into())),
+            });
+        }
+        assert!(
+            workload
+                .retirements(&registry, &PriceTable::default(), 30.0)
+                .is_empty(),
+            "a terabyte of avoided reads pays for a megabyte of storage"
+        );
+    }
+
+    #[test]
+    fn a_huge_piece_saving_little_is_retired() {
+        let registry = registry_with("bloated", 500 * GB);
+        let mut workload = Workload::new();
+        workload.observe(Observation {
+            fingerprint: Fingerprint::of(&query_on(&[4])),
+            bytes_read: 0,
+            bytes_if_full_scan: 1_000,
+            used: Some(DerivedId("bloated".into())),
+        });
+        assert_eq!(
+            workload.retirements(&registry, &PriceTable::default(), 30.0),
+            vec![DerivedId("bloated".into())]
+        );
+    }
+
+    #[test]
+    fn credit_goes_to_the_piece_that_served_the_query() {
+        let mut workload = Workload::new();
+        workload.observe(Observation {
+            fingerprint: Fingerprint::of(&query_on(&[4])),
+            bytes_read: 1,
+            bytes_if_full_scan: GB,
+            used: Some(DerivedId("a".into())),
+        });
+
+        let credited = workload.credited(&DerivedId("a".into())).expect("credited");
+        assert_eq!(credited.queries, 1);
+        assert_eq!(credited.bytes_saved(), GB - 1);
+        assert!(workload.credited(&DerivedId("b".into())).is_none());
+    }
+}
