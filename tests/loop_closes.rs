@@ -27,12 +27,13 @@ use url::Url;
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
 use quarry::engine::{
-    Quarry, QuarryTable, build_index, build_proposed_index, hash_scalar, index_id,
+    Optimizer, Quarry, QuarryTable, build_index, build_proposed_index, hash_scalar, index_id,
+    shared,
 };
 use quarry::kinds::Index;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
-use quarry::workload::Workload;
+use quarry::workload::{Policy, Workload};
 
 const TENANT_FIELD: u32 = 4;
 const POLICY: PolicyFingerprint = PolicyFingerprint(1);
@@ -277,6 +278,168 @@ async fn the_loop_builds_its_own_index_from_the_data() {
 
     // STOP PROPOSING.
     assert!(after.proposals(&prices, 1).is_empty());
+}
+
+/// The optimizer driving itself: no caller sequences the steps.
+#[tokio::test]
+async fn the_optimizer_runs_the_loop_on_its_own() {
+    let fixture = fixture("loop_driven");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let table_bytes: u64 = fixture.sizes.values().sum();
+
+    // A shared registry, so what the optimizer builds reaches the table
+    // without the table being rebuilt.
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic_pct(table_bytes, 5.0).with_min_queries(3),
+    )
+    .for_reader(POLICY);
+
+    let quarry = quarry();
+
+    // Round 0: nothing observed, so nothing to do.
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+    let first = optimizer.round(&session, &served).await;
+    assert_eq!(first, quarry::engine::Round::default(), "nothing to go on");
+
+    // Queries run; the optimizer is told what they cost.
+    for _ in 0..5 {
+        let rows: usize = session
+            .sql(sql)
+            .await
+            .expect("query")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 500);
+
+        let report = served.last_scan().expect("a scan happened");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+        assert_eq!(report.used, None, "nothing is built yet");
+    }
+
+    // Round 1: it proposes, builds, and registers, by itself.
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "one index built: {round:?}");
+    assert!(round.retired.is_empty());
+    assert_eq!(registry.read().expect("lock").len(), 1);
+
+    // The same table now uses it — no rebuild, because the registry is shared.
+    let rows: usize = session
+        .sql(sql)
+        .await
+        .expect("query")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 500, "the answer must not change");
+
+    let report = served.last_scan().expect("a scan happened");
+    assert_eq!(
+        report.used.as_deref(),
+        Some(round.built[0].0.as_str()),
+        "the index the optimizer built should now be serving queries"
+    );
+    optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+
+    // Round 2: nothing left to do, and it does not rebuild what it made.
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty(), "must not rebuild: {round:?}");
+    assert!(round.retired.is_empty(), "it is earning its keep");
+}
+
+#[tokio::test]
+async fn an_advisory_optimizer_proposes_but_changes_nothing() {
+    let fixture = fixture("loop_advisory");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(Arc::clone(&registry), Policy::ADVISORY.with_min_queries(3));
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    assert_eq!(optimizer.proposals().len(), 1, "it has an opinion");
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty(), "advisory must not act");
+    assert_eq!(
+        round.declined,
+        vec![(
+            round.declined[0].0.clone(),
+            quarry::engine::Declined::Advisory
+        )],
+    );
+    assert_eq!(registry.read().expect("lock").len(), 0);
+}
+
+#[tokio::test]
+async fn a_budget_of_nothing_declines_the_build() {
+    let fixture = fixture("loop_budget");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    // Automatic, but with no room to keep anything.
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(0).with_min_queries(3),
+    );
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty());
+    assert_eq!(
+        round.declined.first().map(|(_, why)| *why),
+        Some(quarry::engine::Declined::OverBudget),
+        "the ceiling is checked on what was built, not on a guess"
+    );
+    assert_eq!(registry.read().expect("lock").len(), 0);
+}
+
+/// A table sharing `registry`, so the optimizer's builds reach it.
+fn shared_table(fixture: &Fixture, registry: quarry::engine::SharedRegistry) -> QuarryTable {
+    let mut table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(1),
+        fixture.graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .with_shared_registry(registry)
+    .on_object_store(ObjectStoreUrl::local_filesystem());
+    for (file, size) in &fixture.sizes {
+        table = table.with_parquet_file(file.clone(), *size);
+    }
+    table
 }
 
 #[tokio::test]

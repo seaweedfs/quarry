@@ -149,6 +149,74 @@ pub struct Proposal {
     pub ceiling_usd: f64,
 }
 
+/// What the optimizer is allowed to do.
+///
+/// The design's user surface is one table property and one number:
+///
+/// ```sql
+/// ALTER TABLE events SET (auto_optimize = true, optimize_budget_pct = 5);
+/// ```
+///
+/// so this is deliberately small. Everything here is a ceiling or a threshold;
+/// none of it is a hint the optimizer may ignore.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Policy {
+    /// Whether the optimizer may act at all.
+    ///
+    /// When false a round still *reports* what it would do, so advisory and
+    /// automatic modes share one code path and one set of decisions.
+    pub auto_optimize: bool,
+    /// Most bytes of derived state to keep for this table.
+    pub budget_bytes: u64,
+    /// Queries of a shape before it justifies building anything.
+    pub min_queries: u64,
+    /// Days over which retention is priced when deciding what has paid off.
+    pub horizon_days: f64,
+    /// Most builds in one round, so a cold start cannot build everything at
+    /// once.
+    pub max_builds_per_round: usize,
+}
+
+impl Policy {
+    /// Observe and report, but change nothing.
+    pub const ADVISORY: Policy = Policy {
+        auto_optimize: false,
+        budget_bytes: 0,
+        min_queries: 10,
+        horizon_days: 30.0,
+        max_builds_per_round: 1,
+    };
+
+    /// Act, keeping derived state under `budget_bytes`.
+    pub fn automatic(budget_bytes: u64) -> Self {
+        Policy {
+            auto_optimize: true,
+            budget_bytes,
+            ..Policy::ADVISORY
+        }
+    }
+
+    /// Act, keeping derived state under `percent` of the table's own size.
+    ///
+    /// The design's unit. A percentage is the one a user can set without
+    /// knowing how big an index turns out to be.
+    pub fn automatic_pct(table_bytes: u64, percent: f64) -> Self {
+        Policy::automatic((table_bytes as f64 * percent / 100.0) as u64)
+    }
+
+    /// Require `min_queries` of a shape before building for it.
+    pub fn with_min_queries(mut self, min_queries: u64) -> Self {
+        self.min_queries = min_queries;
+        self
+    }
+
+    /// Build at most `max` pieces per round.
+    pub fn with_max_builds(mut self, max: usize) -> Self {
+        self.max_builds_per_round = max;
+        self
+    }
+}
+
 /// What queries have asked for, accumulated by shape.
 #[derive(Clone, Debug, Default)]
 pub struct Workload {
@@ -323,6 +391,18 @@ mod tests {
             used: None,
         }
     }
+
+    #[test]
+    fn a_budget_percentage_is_of_the_table() {
+        let policy = Policy::automatic_pct(100 * GB, 5.0);
+        assert!(policy.auto_optimize);
+        assert_eq!(policy.budget_bytes, 5 * GB);
+    }
+
+    // `Policy::ADVISORY` is a const, so asserting on its fields asserts on
+    // compile-time constants and proves nothing. What matters is that an
+    // advisory optimizer declines to act, which tests/loop_closes.rs checks
+    // against a real table.
 
     #[test]
     fn a_fingerprint_drops_literals_but_keeps_shape() {

@@ -547,9 +547,10 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] `PriceTable::byte_day_usd`, so retention and reads compare
 - [x] The loop, tested end to end on real queries over real Parquet
 - [x] `build_index`: building a proposed index by reading the data
+- [x] `Policy` and `Optimizer`: a driver that runs the loop on its own
 - [ ] `commit_notifications`, when there is something to consume it
 - [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
-- [ ] A driver that runs the loop on its own, rather than a caller doing it
+- [ ] Rebuilding derived state when the table's snapshot moves
 
 **Done when** the optimizer contains no backend name, and an unused derived
 state is retired on its own. **Both halves now hold.** `MeteredStore` used to
@@ -617,10 +618,44 @@ a *hand-written* one, so it would have passed whether or not the builder
 worked. It now queries through the index it built and asserts by id that the
 built one served the query.
 
-What remains before this is genuinely automatic: nothing yet *drives* the loop.
-A caller still observes, asks for proposals, builds, and registers. Every step
-works and is tested; the scheduler that runs them without being asked is the
-next piece.
+**The driver, and the order within a round.** `Optimizer` owns the workload and
+a shared registry, and `round()` does the whole sequence itself:
+
+```text
+1. retire first    frees budget, so a useful index is not refused because
+                   a useless one is occupying the space
+2. then build      most-at-stake first, which is the order proposals
+                   already arrive in
+3. budget after    an index's size is not knowable until it is built, so
+                   the ceiling is enforced on what was produced
+```
+
+Step 3 is the same estimation-versus-enforcement line drawn everywhere else in
+this crate. A build that turns out too large for the remaining budget is
+discarded, not kept and apologised for.
+
+**Sharing the registry was the blocker.** `QuarryTable` owned its `Registry` by
+value, which is why every test rebuilt the table per query and why an optimizer
+could not have added anything. It now holds `Arc<RwLock<Registry>>` — a plain
+lock, not an async one, because planning takes a read guard and never awaits
+while holding it. The test asserts the built index serves the *same* table
+instance that was registered before it existed.
+
+**Advisory and automatic share one code path.** `Policy::ADVISORY` runs the
+same decisions and reports them as `Declined::Advisory` rather than acting. A
+separate advisory path could disagree with what automatic mode would do, which
+would make the advice worthless.
+
+Rebuilding after a freshly-built index would otherwise happen every round: the
+index has not served a query yet, so the workload still sees the shape as
+unaided. The round checks by id, which is why `index_id` is derived from
+`(table, field)` rather than being random.
+
+**A unit test was deleted for asserting on constants.** `Policy::ADVISORY` is a
+`const`, so `assert!(!Policy::ADVISORY.auto_optimize)` is constant-folded and
+proves nothing — clippy caught it. The behaviour that matters is tested against
+a real table instead. Silencing the lint with a `const` block would have kept a
+test that tests nothing.
 
 **Found while implementing — "assume the worst" is wrong for one dimension.**
 `core-design.md` says an unanswered capability should default to "unknown,
