@@ -76,6 +76,15 @@ impl Index {
     pub fn bytes_estimate(&self) -> u64 {
         self.bytes
     }
+
+    /// Every hashed value and the files holding it, in a fixed order.
+    ///
+    /// Ordered because it is written to storage: a `BTreeMap` makes the bytes
+    /// a function of the contents alone, so the same index encodes
+    /// identically every time and two writers cannot disagree.
+    pub fn postings(&self) -> impl Iterator<Item = (u64, &BTreeSet<FileId>)> {
+        self.postings.iter().map(|(value, files)| (*value, files))
+    }
 }
 
 impl Kind for Index {

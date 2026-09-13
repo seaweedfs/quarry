@@ -23,6 +23,8 @@ mod cache;
 mod iceberg_table;
 mod materialized;
 mod optimizer;
+#[cfg(feature = "iceberg")]
+mod persist;
 mod quarry;
 mod store;
 mod table;
@@ -33,6 +35,10 @@ pub use cache::{CacheStats, RangeCache};
 pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};
 pub use materialized::{MaterializedResult, hash_plan};
 pub use optimizer::{Declined, Optimizer, Round};
+#[cfg(feature = "iceberg")]
+pub use persist::{
+    Layout, QUARRY_EQ_INDEX_V1, Recovered, Store, discard, read_index, recover, write_index,
+};
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
 pub use table::{QuarryTable, ScanReport, SharedRegistry, hash_scalar, shared};

@@ -549,6 +549,11 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] `build_index`: building a proposed index by reading the data
 - [x] `Policy` and `Optimizer`: a driver that runs the loop on its own
 - [x] Refresh: rebuilding derived state the table has grown past
+- [x] `StableHasher` and `HASH_VERSION`, gating anything written down
+- [x] Index bytes persisted as Puffin blobs at self-describing paths
+- [x] Registry rebuilt by listing after a restart
+- [ ] Publishing to Iceberg `TableMetadata.statistics`
+- [ ] Credits and the shape aggregate persisted
 - [ ] `commit_notifications`, so a round knows the table moved without asking
 - [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
 
@@ -738,3 +743,122 @@ cross-principal sharing      after a policy-fingerprint audit
 writes (INSERT/MERGE/DELETE) read-only; iceberg-rust lacks row-level writes
 natural-language queries     belongs in the client, not the engine
 ```
+
+
+---
+
+## Phase 11 — Persistence `[~]`
+
+Everything the optimizer learned and built lived in memory. A restart lost it,
+and then — with credits gone — retirement would have deleted the indexes whose
+bytes were still in storage. Disposable state is fine; destroying it on every
+restart is not.
+
+**It is three problems, not one**, and only one of them is large:
+
+```text
+index bytes         MB–GB   read every query      slower queries
+registry metadata   ~200 B  startup + planning    orphaned bytes, rebuild
+per-derived credits  ~40 B  per round             DESTRUCTIVE, see below
+per-shape workload   ~40 B  per round             re-learns in min_queries
+raw observations    GB/day  never read            nothing
+```
+
+Losing **credits** is the one that does harm rather than costing time:
+`retirements` treats never-used as a reason to retire, so a restart with an
+intact registry and empty credits deletes every index it has. Forty bytes per
+piece.
+
+The only large thing, the raw observation stream, is never read — the aggregate
+is kilobytes.
+
+### The hash had to be fixed first
+
+`DefaultHasher`'s algorithm is not stable across Rust releases. An index keyed
+on it survives a compiler upgrade as an index matching **nothing**: a miss, not
+an error, so the system quietly slows and the loop rebuilds everything with no
+signal. `StableHasher` is FNV-1a plus a SplitMix64 finalizer, both published
+constants, with the pinned test vectors derived from an independent
+implementation rather than from this code's output.
+
+Writing that test found a portability bug that would have shipped:
+`Hasher::write_u64` defaults to `to_ne_bytes` and `write_usize` to the
+platform's pointer width, so hashes would have differed across endianness and
+across 32- versus 64-bit builds.
+
+`HASH_VERSION` exists because a fixed algorithm is not the whole story: the
+bytes fed to it come from `std`'s and `arrow`'s `Hash` implementations, which
+are theirs to change. Persisted state carries the version and is refused
+loudly rather than matching silently.
+
+### The format is Iceberg's
+
+Puffin, and the shapes line up closely enough to be worth writing down:
+
+```text
+Puffin BlobMetadata          Quarry
+  snapshot_id            ≡     Derived.source.snapshot   ← the lineage anchor
+  fields: Vec<i32>       ≡     Index.field               ← a Vec, so composite is free
+  type: String           ≡     Kind::name()
+  properties: Map              policy fingerprint, hash version
+```
+
+An unfamiliar engine skips an unknown blob type safely. It cannot *use* the
+index: this is a standard location, not a standard index format, and claiming
+otherwise would oversell it.
+
+### The path is the metadata
+
+```text
+<table location>/_quarry/idx/<table-uuid>/<field>/<source-snapshot>.puffin
+```
+
+so the registry is recoverable by listing, with nothing read and no side store
+to keep in step. Write order follows: **blob first, register second** — an
+orphan costs storage, whereas a registry entry with no blob behind it costs
+confidence in every decision.
+
+`Layout::parse` reads identity from the **tail** of a path rather than by
+stripping a prefix, because `FileIO` and `ObjectStore` name the same object
+differently and recovery has to recognise both.
+
+### Two IO stacks, because FileIO cannot list
+
+`iceberg::io::FileIO` has no listing operation at all — read, write, delete,
+exists. So recovery uses `FileIO` for Puffin blobs and `ObjectStore` for
+listing. Named in the docs rather than hidden, because it is a real seam.
+
+A correction to something claimed earlier: the `RangeCache` does *not* serve
+index reads, since Puffin goes through FileIO's own IO stack. It does not
+matter — an index is read once into the registry and then held, so the registry
+is the cache. Indexes are not re-read per query.
+
+### Two bugs, one of them upstream
+
+**`iceberg-rust` 0.6 panics on a truncated Puffin file.** Its footer reader
+computes `input_file_length - footer_length` where `footer_length` comes from
+four bytes read out of the file; on a truncated object those bytes are garbage,
+the subtraction underflows, and the process aborts. In release builds it wraps
+and requests an absurd range instead. A half-written object taking down an
+engine is not an acceptable failure mode for state that is meant to be
+disposable, so the footer is validated first — magic at both ends, and a
+declared length that fits inside the file.
+
+**`discard` reported deletes that deleted nothing.** `recover` put
+object-store paths in `discarded` while `FileIO::delete` wanted its own form,
+and deleting an absent key succeeds on every object store — so the count was
+confident and wrong. It now records the readable form, and counts only objects
+that existed and are now gone.
+
+### Refusing is the only safe response to bad bytes
+
+A truncated index is not a smaller index: it would prune away files holding
+matching rows, which is the one direction that returns wrong answers. So
+`decode` refuses on any inconsistency, including trailing bytes, and the test
+truncates at **every** byte offset rather than at one convenient point.
+
+### Still in memory
+
+Credits and the shape aggregate. Until they are written down, a restart
+recovers the indexes and then retires them for having saved nothing — which is
+worse than not recovering them at all, and is the next thing to fix.

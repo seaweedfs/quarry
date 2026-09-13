@@ -15,7 +15,7 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
-decision core is 120 tests with **no dependencies**. Optional features add 87
+decision core is 120 tests with **no dependencies**. Optional features add 105
 more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
 table metadata, and `rest-catalog` queries a table loaded from a live Iceberg
 REST catalog over HTTP.
@@ -23,7 +23,7 @@ REST catalog over HTTP.
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features rest-catalog     # 207 tests, incl. a live REST catalog
+cargo test --features rest-catalog     # 225 tests, incl. a live REST catalog
 cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 
@@ -74,6 +74,7 @@ src/
     iceberg_table.rs  a QuarryTable over a real Iceberg table
     build.rs          builds the index the loop proposed, by reading the data
     optimizer.rs      runs the loop: retire, refresh, build, enforce the budget
+    persist.rs        indexes as Puffin blobs; registry rebuilt by listing
     materialized.rs   a Kind holding Arrow batches, defined outside the core
     store.rs          an object store that counts bytes and enforces budgets
     cache.rs          a read-through cache for ranges of immutable objects
@@ -87,6 +88,7 @@ tests/
   iceberg_sql.rs    SQL over that table, with the rule choosing objects
   iceberg_rest.rs   the same, loaded from a REST catalog over a real socket
   loop_closes.rs    the optimizer driving itself against a live table
+  persistence.rs    derived state surviving a restart, and refusing bad bytes
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place

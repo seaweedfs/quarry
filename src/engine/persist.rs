@@ -1,0 +1,657 @@
+//! Writing derived state down, and finding it again.
+//!
+//! The registry, the workload and the optimizer's record of its own builds all
+//! lived in memory, so a restart lost everything learned and everything built
+//! — and then, with credits gone, retirement would have deleted the indexes
+//! whose bytes were still sitting in storage. Disposable state is fine;
+//! destroying it on every restart is not.
+//!
+//! # The format is Iceberg's, not ours
+//!
+//! Puffin is the format Iceberg already defines for derived blobs — sketches,
+//! deletion vectors, statistics. Its metadata carries almost exactly what
+//! [`Derived`] needs:
+//!
+//! ```text
+//! Puffin BlobMetadata          Quarry
+//!   snapshot_id            ≡     Derived.source.snapshot   ← the lineage anchor
+//!   fields: Vec<i32>       ≡     Index.field               ← a Vec, so composite is free
+//!   type: String           ≡     Kind::name()
+//!   properties: Map              policy fingerprint, hash version, postings
+//! ```
+//!
+//! Using it means an unfamiliar engine encountering these files skips them
+//! safely as an unknown blob type, rather than tripping over a private format.
+//! It does not mean another engine can *use* them: this is a standard
+//! location, not a standard index format.
+//!
+//! # The path is the metadata
+//!
+//! ```text
+//! <prefix>/<table-uuid>/<field>/<source-snapshot>.puffin
+//! ```
+//!
+//! so the registry is recoverable by listing. Nothing has to be read to know
+//! what a file is or which snapshot it belongs to, there is no second store to
+//! keep in step, and a crash between writing a blob and registering it leaves
+//! an orphan that listing finds — an orphan costs storage, whereas a registry
+//! entry with no blob behind it costs confidence in every decision.
+//!
+//! Write order follows from that: **blob first, register second.**
+//!
+//! # Two IO stacks, named rather than hidden
+//!
+//! `iceberg::io::FileIO` has no listing operation — it can read, write, delete
+//! and test existence, and that is all. So recovery needs both:
+//!
+//! ```text
+//! FileIO        reading and writing Puffin blobs, because that is what
+//!               PuffinReader and PuffinWriter take
+//!
+//! ObjectStore   listing, because FileIO cannot, and because this is the
+//!               stack that is already metered and cached
+//! ```
+//!
+//! The two name paths differently — FileIO takes the location Iceberg records,
+//! an object store addresses a path within a store — so [`Layout::parse`]
+//! reads identity from the *tail* of a path rather than by stripping a prefix.
+//! Three segments is all it needs, and that works in either path space.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use iceberg::io::{FileIO, FileRead};
+use iceberg::puffin::{Blob, CompressionCodec, PuffinReader, PuffinWriter};
+use object_store::ObjectStore;
+use object_store::path::Path as ObjectPath;
+
+use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
+use crate::kinds::Index;
+use crate::registry::Registry;
+use crate::snapshot::{FileId, SnapshotId, TableId};
+use crate::stable_hash::HASH_VERSION;
+
+/// The blob type for an equality index.
+///
+/// Versioned in the name: a change to the layout below becomes a different
+/// type, which an older reader skips rather than misreads.
+pub const QUARRY_EQ_INDEX_V1: &str = "quarry-eq-index-v1";
+
+/// Property carrying the hash version the postings were built with.
+const HASH_VERSION_PROPERTY: &str = "quarry.hash-version";
+/// Property carrying the policy the index was built for.
+const POLICY_PROPERTY: &str = "quarry.policy";
+
+/// Where derived state for a table lives.
+///
+/// One directory per table, one per field beneath it, named by the snapshot
+/// the index was built from.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    prefix: String,
+}
+
+impl Layout {
+    /// Keep derived state under `prefix`.
+    ///
+    /// Typically the table's own location plus a reserved directory, so
+    /// derived state travels with the table and is removed with it.
+    pub fn new(prefix: impl Into<String>) -> Self {
+        Layout {
+            prefix: prefix.into().trim_end_matches('/').to_owned(),
+        }
+    }
+
+    /// Derived state beside the table it came from.
+    pub fn beside(table_location: &str) -> Self {
+        Layout::new(format!(
+            "{}/_quarry/idx",
+            table_location.trim_end_matches('/')
+        ))
+    }
+
+    /// Where one index belongs, in the path space `FileIO` uses.
+    pub fn index_path(&self, table: &TableId, field: FieldId, at: SnapshotId) -> String {
+        format!("{}/{}/{}/{}.puffin", self.prefix, table.0, field, at.0)
+    }
+
+    /// Everything for one table, in the path space `FileIO` uses.
+    pub fn table_prefix(&self, table: &TableId) -> String {
+        format!("{}/{}/", self.prefix, table.0)
+    }
+
+    /// The same prefix as an object store addresses it.
+    ///
+    /// Listing happens through `ObjectStore`, which names paths within a store
+    /// rather than by full location, so the scheme and authority come off —
+    /// the same reconciliation
+    /// [`object_path`](crate::from_iceberg::object_path) performs for data
+    /// files.
+    pub fn object_prefix(&self, table: &TableId) -> String {
+        crate::from_iceberg::object_path(&self.table_prefix(table))
+            .trim_start_matches('/')
+            .to_owned()
+    }
+
+    /// Recover `(table, field, snapshot)` from a path this layout produced.
+    ///
+    /// Read from the **tail**, not by stripping the prefix, because the same
+    /// object is named one way by `FileIO` and another by an object store and
+    /// this has to recognise both. The last three segments carry everything:
+    /// identity does not depend on how the path was reached.
+    ///
+    /// Anything that does not parse is not ours, and is ignored rather than
+    /// treated as corrupt — other things may share the prefix.
+    pub fn parse(&self, path: &str) -> Option<(TableId, FieldId, SnapshotId)> {
+        let mut segments = path.rsplit('/');
+        let snapshot = segments.next()?.strip_suffix(".puffin")?.parse().ok()?;
+        let field = segments.next()?.parse().ok()?;
+        let table = segments.next()?;
+        if table.is_empty() {
+            return None;
+        }
+        // The remaining prefix must be ours, in one naming or the other.
+        let tail = format!("/{table}/{field}/{snapshot}.puffin");
+        let head = path.strip_suffix(&tail)?;
+        if !self.prefix.ends_with(head) && !head.ends_with(&self.prefix) {
+            return None;
+        }
+        Some((TableId(table.to_owned()), field, SnapshotId(snapshot)))
+    }
+}
+
+/// Serialise an index's postings.
+///
+/// Deliberately plain: a count, then each hashed value followed by its file
+/// paths. Compression is Puffin's job, not this function's.
+fn encode(index: &Index) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(index.values() as u64).to_le_bytes());
+    for (value, files) in index.postings() {
+        out.extend_from_slice(&value.to_le_bytes());
+        out.extend_from_slice(&(files.len() as u64).to_le_bytes());
+        for file in files {
+            let bytes = file.0.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+    out
+}
+
+/// Read postings back, or `None` if the bytes are not a well-formed index.
+///
+/// Returns `None` rather than a partial index on any inconsistency. A
+/// truncated index is not a smaller index: it would prune away files that
+/// hold matching rows, which is the one direction that returns wrong answers.
+fn decode(field: FieldId, bytes: &[u8]) -> Option<Index> {
+    let mut cursor = Cursor { bytes, at: 0 };
+    let values = cursor.u64()?;
+    let mut index = Index::new(field);
+
+    for _ in 0..values {
+        let value = cursor.u64()?;
+        let files = cursor.u64()?;
+        for _ in 0..files {
+            let len = cursor.u64()? as usize;
+            let path = cursor.take(len)?;
+            index.insert(value, FileId(String::from_utf8(path.to_vec()).ok()?));
+        }
+    }
+    if cursor.at != bytes.len() {
+        return None; // Trailing bytes mean this is not what we think it is.
+    }
+    Some(index)
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(len)?;
+        let slice = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(slice)
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+}
+
+/// Write an index to storage as a Puffin blob.
+///
+/// Returns the path written. Registering it is the caller's next step, and
+/// deliberately not this function's: a blob with no registry entry is an
+/// orphan, while a registry entry with no blob is a lie.
+pub async fn write_index(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    policy: PolicyFingerprint,
+    index: &Index,
+) -> iceberg::Result<String> {
+    let path = layout.index_path(table, index.field(), at);
+    let output = file_io.new_output(&path)?;
+
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_EQ_INDEX_V1.to_owned())
+                .fields(vec![index.field() as i32])
+                .snapshot_id(at.0)
+                .sequence_number(0)
+                .data(encode(index))
+                .properties(HashMap::from([
+                    (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
+                    (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                ]))
+                .build(),
+            // Uncompressed, because `iceberg-rust` 0.6 declares `Lz4` and
+            // `Zstd` but returns FeatureUnsupported for both. Postings are
+            // hashes and repeated path strings, so they would compress well;
+            // this costs bytes on disk and nothing in correctness, and the
+            // codec is recorded per blob so a later writer can change it
+            // without invalidating anything already written.
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(path)
+}
+
+/// Read one index back, if it is one we can still use.
+///
+/// Refuses, rather than returns something wrong, when:
+///
+/// - the blob type is not ours, or is a version we do not know
+/// - the hash version differs, so the postings were built by a different
+///   hashing of values and would match nothing
+/// - the bytes do not decode exactly
+///
+/// The hash-version check is the reason
+/// [`HASH_VERSION`](crate::stable_hash::HASH_VERSION) exists: without it a
+/// changed hash produces an index that silently matches nothing, which reads
+/// as "mysteriously slower" rather than as a fault.
+pub async fn read_index(
+    file_io: &FileIO,
+    path: &str,
+    field: FieldId,
+) -> iceberg::Result<Option<(Index, PolicyFingerprint)>> {
+    if !is_plausible_puffin(file_io, path).await? {
+        return Ok(None);
+    }
+    let reader = PuffinReader::new(file_io.new_input(path)?);
+    let metadata = reader.file_metadata().await?;
+
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_EQ_INDEX_V1 {
+            continue;
+        }
+        let properties = blob_metadata.properties();
+        if properties.get(HASH_VERSION_PROPERTY).map(String::as_str)
+            != Some(&HASH_VERSION.to_string())
+        {
+            continue;
+        }
+        let policy = properties
+            .get(POLICY_PROPERTY)
+            .and_then(|raw| raw.parse().ok())
+            .map(PolicyFingerprint);
+        let Some(policy) = policy else {
+            continue;
+        };
+
+        let blob = reader.blob(blob_metadata).await?;
+        if let Some(index) = decode(field, blob.data()) {
+            let bytes = blob.data().len() as u64;
+            return Ok(Some((index.with_bytes(bytes), policy)));
+        }
+    }
+    Ok(None)
+}
+
+/// Puffin's file magic, `PFA1`.
+const PUFFIN_MAGIC: [u8; 4] = [0x50, 0x46, 0x41, 0x31];
+/// Leading magic, plus the footer's payload-length, flags and trailing magic.
+const PUFFIN_MINIMUM_LENGTH: u64 = 4 + 4 + 4 + 4;
+
+/// Whether a file is structurally a Puffin file, checked before parsing it.
+///
+/// This exists because of a real defect in `iceberg-rust` 0.6, not out of
+/// caution. Its footer reader computes
+///
+/// ```text
+/// start = input_file_length - footer_length
+/// ```
+///
+/// where `footer_length` comes from four bytes read out of the file. On a
+/// truncated object those bytes are whatever happened to land there, the
+/// subtraction underflows, and the process **panics** — in release builds it
+/// wraps instead and asks for an absurd range. Either way a half-written
+/// object takes down an engine rather than being skipped, which is not an
+/// acceptable failure mode for state that is meant to be disposable.
+///
+/// So the footer is validated first, with two small ranged reads: the magic at
+/// both ends, and a declared footer length that actually fits inside the file.
+/// That covers truncation and gross corruption. It is not a checksum and does
+/// not claim to be — the decoder's exact-length check is the second line.
+async fn is_plausible_puffin(file_io: &FileIO, path: &str) -> iceberg::Result<bool> {
+    let input = file_io.new_input(path)?;
+    let length = input.metadata().await?.size;
+    if length < PUFFIN_MINIMUM_LENGTH {
+        return Ok(false);
+    }
+
+    let reader = input.reader().await?;
+    if reader.read(0..4).await?.as_ref() != PUFFIN_MAGIC {
+        return Ok(false);
+    }
+    if reader.read(length - 4..length).await?.as_ref() != PUFFIN_MAGIC {
+        return Ok(false);
+    }
+
+    // The footer struct is the last twelve bytes: payload length, flags,
+    // magic. The payload precedes it.
+    let declared = reader.read(length - 12..length - 8).await?;
+    let payload: u32 = u32::from_le_bytes(declared.as_ref().try_into().map_err(|_| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            "puffin footer payload length is not four bytes",
+        )
+    })?);
+
+    // 4 leading magic + payload + 12 footer struct must fit.
+    Ok(4 + payload as u64 + 12 <= length)
+}
+
+/// What was recovered, and what was found but could not be used.
+#[derive(Debug, Default)]
+pub struct Recovered {
+    /// Derived state loaded and ready to register.
+    pub registry: Registry,
+    /// What each recovered piece indexes, so the optimizer can refresh it.
+    pub fields: std::collections::BTreeMap<DerivedId, FieldId>,
+    /// Objects that are ours but unusable, and should be deleted.
+    ///
+    /// A stale hash version, a superseded snapshot, or corrupt bytes. Not an
+    /// error: derived state is disposable, and the right response is to drop
+    /// it and let the loop rebuild.
+    pub discarded: Vec<String>,
+}
+
+/// Rebuild the registry for one table by listing what is in storage.
+///
+/// No side store and no catalog read: the paths carry the identities. Only
+/// indexes built from a snapshot the graph still knows are kept, since the
+/// rule would refuse the rest anyway.
+pub async fn recover(
+    file_io: &FileIO,
+    store: &dyn ObjectStore,
+    layout: &Layout,
+    table: &TableId,
+    known_snapshots: &[SnapshotId],
+) -> iceberg::Result<Recovered> {
+    let mut recovered = Recovered::default();
+
+    for path in list_paths(store, &layout.object_prefix(table)).await {
+        let Some((found_table, field, at)) = layout.parse(&path) else {
+            continue;
+        };
+        if &found_table != table {
+            continue;
+        }
+        // Listing gave an object-store path; reading and deleting both need
+        // the FileIO one. Recording the wrong form here made `discard` report
+        // success for deletes that hit nothing, because object stores treat
+        // deleting an absent key as a no-op.
+        let readable = layout.index_path(table, field, at);
+
+        if !known_snapshots.contains(&at) {
+            // Built from a snapshot the table no longer retains, so the rule
+            // could not admit it. Disposable; drop it.
+            recovered.discarded.push(readable);
+            continue;
+        }
+        match read_index(file_io, &readable, field).await? {
+            Some((index, policy)) => {
+                let id = super::index_id(table, field);
+                let bytes = index.bytes_estimate();
+                recovered.fields.insert(id.clone(), field);
+                recovered.registry.register(Derived::new(
+                    id,
+                    Source {
+                        table: table.clone(),
+                        snapshot: at,
+                    },
+                    policy,
+                    bytes,
+                    Box::new(index),
+                ));
+            }
+            None => recovered.discarded.push(readable),
+        }
+    }
+    Ok(recovered)
+}
+
+/// Object paths under a prefix.
+///
+/// A listing failure yields nothing rather than an error: a missing prefix is
+/// the normal state of a table that has never been optimized, and the caller's
+/// response to either is the same — start from scratch.
+async fn list_paths(store: &dyn ObjectStore, prefix: &str) -> Vec<String> {
+    use futures::StreamExt;
+
+    let mut paths = Vec::new();
+    let mut listing = store.list(Some(&ObjectPath::from(prefix)));
+    while let Some(entry) = listing.next().await {
+        if let Ok(meta) = entry {
+            paths.push(meta.location.to_string());
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// Delete objects that are ours but unusable.
+///
+/// Separate from [`recover`] so that recovery is read-only and a caller can
+/// inspect what would be removed before removing it.
+///
+/// The count is of objects that existed and are now gone, not of calls that
+/// returned `Ok`. Deleting an absent key succeeds on every object store, so
+/// counting successes would report confident progress while deleting nothing
+/// — which is exactly how the wrong path form went unnoticed.
+pub async fn discard(file_io: &FileIO, paths: &[String]) -> iceberg::Result<usize> {
+    let mut removed = 0;
+    for path in paths {
+        if !file_io.exists(path).await.unwrap_or(false) {
+            continue;
+        }
+        if file_io.delete(path).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Shared handle to a table's on-disk derived state.
+#[derive(Clone, Debug)]
+pub struct Store {
+    file_io: Arc<FileIO>,
+    store: Arc<dyn ObjectStore>,
+    layout: Layout,
+}
+
+impl Store {
+    /// Keep derived state under `layout`.
+    ///
+    /// Both stacks are required and for different reasons: `file_io` reads and
+    /// writes Puffin blobs, `store` lists them, because `FileIO` cannot.
+    pub fn new(file_io: Arc<FileIO>, store: Arc<dyn ObjectStore>, layout: Layout) -> Self {
+        Store {
+            file_io,
+            store,
+            layout,
+        }
+    }
+
+    /// The layout in use.
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Write an index and report where it went.
+    pub async fn write(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        policy: PolicyFingerprint,
+        index: &Index,
+    ) -> iceberg::Result<String> {
+        write_index(&self.file_io, &self.layout, table, at, policy, index).await
+    }
+
+    /// Rebuild a table's registry from storage.
+    pub async fn recover(
+        &self,
+        table: &TableId,
+        known_snapshots: &[SnapshotId],
+    ) -> iceberg::Result<Recovered> {
+        recover(
+            &self.file_io,
+            self.store.as_ref(),
+            &self.layout,
+            table,
+            known_snapshots,
+        )
+        .await
+    }
+
+    /// Delete unusable objects.
+    pub async fn discard(&self, paths: &[String]) -> iceberg::Result<usize> {
+        discard(&self.file_io, paths).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> TableId {
+        TableId("9c12d441".into())
+    }
+
+    fn layout() -> Layout {
+        Layout::new("_quarry/idx")
+    }
+
+    fn index_of(pairs: &[(u64, &str)]) -> Index {
+        let mut index = Index::new(4);
+        for (value, file) in pairs {
+            index.insert(*value, FileId((*file).to_owned()));
+        }
+        index
+    }
+
+    #[test]
+    fn a_path_carries_the_identity() {
+        let path = layout().index_path(&table(), 4, SnapshotId(810));
+        assert_eq!(path, "_quarry/idx/9c12d441/4/810.puffin");
+        assert_eq!(
+            layout().parse(&path),
+            Some((table(), 4, SnapshotId(810))),
+            "listing alone must be enough to rebuild the registry"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_in_the_prefix_does_not_double_up() {
+        assert_eq!(
+            Layout::new("_quarry/idx/").index_path(&table(), 4, SnapshotId(1)),
+            "_quarry/idx/9c12d441/4/1.puffin"
+        );
+    }
+
+    #[test]
+    fn paths_that_are_not_ours_are_ignored() {
+        let layout = layout();
+        for path in [
+            "somewhere/else/4/1.puffin",
+            "_quarry/idx/9c12d441/4/1.parquet",
+            "_quarry/idx/9c12d441/notafield/1.puffin",
+            "_quarry/idx/9c12d441/4/notasnapshot.puffin",
+            "_quarry/idx/9c12d441/4/1/extra.puffin",
+            "_quarry/idx/9c12d441",
+        ] {
+            assert_eq!(layout.parse(path), None, "should not parse: {path}");
+        }
+    }
+
+    #[test]
+    fn an_index_survives_a_round_trip() {
+        let index = index_of(&[(1, "a.parquet"), (1, "c.parquet"), (2, "b.parquet")]);
+        let decoded = decode(4, &encode(&index)).expect("decodes");
+
+        assert_eq!(decoded.field(), 4);
+        assert_eq!(decoded.values(), 2);
+        assert_eq!(decoded.files_for(1), index.files_for(1));
+        assert_eq!(decoded.files_for(2), index.files_for(2));
+    }
+
+    #[test]
+    fn an_empty_index_survives_a_round_trip() {
+        let decoded = decode(4, &encode(&Index::new(4))).expect("decodes");
+        assert_eq!(decoded.values(), 0);
+    }
+
+    #[test]
+    fn truncated_bytes_decode_to_nothing_rather_than_less() {
+        // A short index is not a smaller index: it would prune away files
+        // holding matching rows, which is the direction that returns wrong
+        // answers. Refusing is the only safe response.
+        let encoded = encode(&index_of(&[(1, "a.parquet"), (2, "b.parquet")]));
+        for cut in 1..encoded.len() {
+            assert!(
+                decode(4, &encoded[..cut]).is_none(),
+                "truncating to {cut} bytes must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut encoded = encode(&index_of(&[(1, "a.parquet")]));
+        encoded.push(0);
+        assert!(decode(4, &encoded).is_none());
+    }
+
+    #[test]
+    fn an_absurd_length_does_not_panic() {
+        // A corrupt length prefix must not be trusted into an allocation or
+        // an out-of-bounds read.
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u64.to_le_bytes()); // one value
+        encoded.extend_from_slice(&7u64.to_le_bytes()); // the value
+        encoded.extend_from_slice(&1u64.to_le_bytes()); // one file
+        encoded.extend_from_slice(&u64::MAX.to_le_bytes()); // impossible length
+        assert!(decode(4, &encoded).is_none());
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_path_is_refused() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u64.to_le_bytes());
+        encoded.extend_from_slice(&7u64.to_le_bytes());
+        encoded.extend_from_slice(&1u64.to_le_bytes());
+        encoded.extend_from_slice(&2u64.to_le_bytes());
+        encoded.extend_from_slice(&[0xff, 0xfe]);
+        assert!(decode(4, &encoded).is_none());
+    }
+}
