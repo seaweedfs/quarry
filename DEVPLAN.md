@@ -305,6 +305,7 @@ behind `--features engine`.
 - [x] Parquet objects read through `object_store`, selected by the rule
 - [x] `MeteredStore`: counts bytes fetched, enforces a budget against real I/O
 - [x] `RangeCache`: read-through cache for object ranges
+- [x] `Quarry` / `Session`: one place that assembles the stack
 - [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
 
 **Design constraint.** Use DataFusion's own extension points —
@@ -427,6 +428,35 @@ should cost. Conditional and versioned requests bypass entirely, since their
 purpose is to ask the store something the cache cannot answer. Eviction is
 insertion-ordered rather than frequency-based; the design wants the latter, and
 eviction is unconditionally safe either way.
+
+**One entry point, and it needed two meters.** Assembling a working engine took
+about thirty lines of setup, which is fine in a test and wrong as an interface
+for a design whose user-facing claim is that ordinary SQL gets faster.
+`Quarry` owns the stack and hands out a `Session` per query:
+
+```text
+MeteredStore   per session: enforces this query's budget
+     └─ RangeCache   shared: immutable object ranges
+           └─ MeteredStore   shared: lifetime origin I/O
+                 └─ origin
+```
+
+Writing this down forced a distinction that had been left implicit. Both
+meters are wanted, because they answer different questions:
+
+```text
+outer   sees every read INCLUDING cache hits
+        → the right basis for a budget: a query reading 10 GB out of
+          cache still consumed 10 GB of work
+
+inner   sees only what MISSED
+        → real origin I/O: what the cache saved, and what a remote
+          store would have billed
+```
+
+The cache has to sit between them, because it must outlive any one session
+while a budget must not. The caching test now asserts all three numbers at
+once: origin bytes unchanged, cache hits above zero, session bytes above zero.
 
 ---
 

@@ -87,6 +87,20 @@ impl MeteredStore {
         self.state.lock().expect("store state").stats
     }
 
+    /// What has been read, priced.
+    ///
+    /// Zero unless a budget is set, since pricing is the meter's job and a
+    /// store without one only counts.
+    pub fn spent(&self) -> crate::cost::Cost {
+        self.state
+            .lock()
+            .expect("store state")
+            .meter
+            .as_ref()
+            .map(Meter::spent)
+            .unwrap_or(crate::cost::Cost::ZERO)
+    }
+
     /// Whether a budget stopped the reads.
     pub fn outcome(&self) -> Outcome {
         self.state

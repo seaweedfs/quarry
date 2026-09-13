@@ -19,10 +19,12 @@
 
 mod cache;
 mod materialized;
+mod quarry;
 mod store;
 mod table;
 
 pub use cache::{CacheStats, RangeCache};
 pub use materialized::{MaterializedResult, hash_plan};
+pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
 pub use table::{QuarryTable, ScanReport, hash_scalar};

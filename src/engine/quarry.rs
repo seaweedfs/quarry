@@ -1,0 +1,280 @@
+//! One place that assembles the pieces.
+//!
+//! Until now a working engine had to be wired by hand: an origin store, a
+//! meter, a cache, a session, a registered table. That is fine in a test and
+//! wrong as an interface, since the design's whole user-facing claim is that
+//! ordinary SQL gets faster without anything new to learn.
+//!
+//! # The store stack, and why it has two meters
+//!
+//! ```text
+//! MeteredStore   per session: enforces this query's budget
+//!      └─ RangeCache   shared: immutable object ranges (optional)
+//!            └─ MeteredStore   shared: lifetime origin I/O
+//!                  └─ origin
+//! ```
+//!
+//! Both meters are wanted, and they measure different things:
+//!
+//! - The **outer** one sees every read including cache hits. That is the right
+//!   basis for a budget: a query that reads 10 GB out of cache still consumed
+//!   10 GB of work, and a caller who asked for a ceiling meant it.
+//! - The **inner** one sees only what missed, so its counter is real origin
+//!   I/O — what the cache saved, and what a remote store would have billed.
+//!
+//! The cache sits between them because it must outlive any one session, while
+//! a budget must not.
+
+use std::sync::Arc;
+
+use datafusion::arrow::array::RecordBatch;
+use datafusion::error::Result as DfResult;
+use datafusion::prelude::SessionContext;
+use object_store::ObjectStore;
+use url::Url;
+
+use crate::budget::{Budget, Outcome};
+use crate::cost::{Cost, PriceTable};
+
+use super::{CacheStats, MeteredStore, QuarryTable, RangeCache, StoreStats};
+
+/// A configured engine: an object store, prices, and an optional cache.
+///
+/// Long-lived. Hand out a [`Session`] per query, or per group of queries that
+/// should share a budget.
+#[derive(Debug)]
+pub struct Quarry {
+    url: Url,
+    /// The stack below any per-session metering: cache over origin meter.
+    shared: Arc<dyn ObjectStore>,
+    origin_meter: Arc<MeteredStore>,
+    cache: Option<Arc<RangeCache>>,
+    prices: PriceTable,
+}
+
+impl Quarry {
+    /// Read from `origin`, with no cache.
+    pub fn new(url: Url, origin: Arc<dyn ObjectStore>) -> Self {
+        let origin_meter = Arc::new(MeteredStore::new(origin));
+        Quarry {
+            url,
+            shared: Arc::clone(&origin_meter) as _,
+            origin_meter,
+            cache: None,
+            prices: PriceTable::default(),
+        }
+    }
+
+    /// Read from `origin` through a cache of at most `cache_bytes`.
+    ///
+    /// Only sound for stores whose objects are never modified in place; see
+    /// [`RangeCache`].
+    pub fn with_cache(url: Url, origin: Arc<dyn ObjectStore>, cache_bytes: u64) -> Self {
+        let origin_meter = Arc::new(MeteredStore::new(origin));
+        let cache = Arc::new(RangeCache::for_immutable_objects(
+            Arc::clone(&origin_meter) as _,
+            cache_bytes,
+        ));
+        Quarry {
+            url,
+            shared: Arc::clone(&cache) as _,
+            origin_meter,
+            cache: Some(cache),
+            prices: PriceTable::default(),
+        }
+    }
+
+    /// Price reads differently — a colocated store, or one with no egress bill.
+    pub fn with_prices(mut self, prices: PriceTable) -> Self {
+        self.prices = prices;
+        self
+    }
+
+    /// Bytes actually fetched from the origin, for the life of this `Quarry`.
+    ///
+    /// What the cache did *not* save. Compare with a session's
+    /// [`Session::spent`] to see the cache's effect.
+    pub fn origin_stats(&self) -> StoreStats {
+        self.origin_meter.stats()
+    }
+
+    /// How the cache has been used, if there is one.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        self.cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// Drop the cache's contents. Always safe.
+    pub fn clear_cache(&self) {
+        if let Some(cache) = &self.cache {
+            cache.clear();
+        }
+    }
+
+    /// A session with no spending limit.
+    pub fn session(&self) -> Session {
+        self.session_with_budget(Budget::UNLIMITED)
+    }
+
+    /// A session that stops once `budget` is spent.
+    ///
+    /// The ceiling is enforced against bytes as they are read, so an
+    /// over-budget query fails part-way rather than after the fact — and it
+    /// fails rather than returning fewer rows, because a truncated answer
+    /// looks complete.
+    pub fn session_with_budget(&self, budget: Budget) -> Session {
+        let meter =
+            Arc::new(MeteredStore::new(Arc::clone(&self.shared)).with_budget(budget, self.prices));
+        let ctx = SessionContext::new();
+        ctx.register_object_store(&self.url, Arc::clone(&meter) as _);
+        Session { ctx, meter }
+    }
+}
+
+/// One session's worth of querying, with its own budget.
+pub struct Session {
+    ctx: SessionContext,
+    meter: Arc<MeteredStore>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SessionContext is not Debug, and its contents would not be useful
+        // here anyway; what a caller wants to see is the spend.
+        f.debug_struct("Session")
+            .field("stats", &self.stats())
+            .field("outcome", &self.outcome())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    /// The underlying DataFusion context, for anything not wrapped here.
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    /// Make a table queryable under `name`.
+    pub fn register(&self, name: &str, table: Arc<QuarryTable>) -> DfResult<()> {
+        self.ctx.register_table(name, table)?;
+        Ok(())
+    }
+
+    /// Run a query to completion.
+    pub async fn sql(&self, sql: &str) -> DfResult<Vec<RecordBatch>> {
+        self.ctx.sql(sql).await?.collect().await
+    }
+
+    /// What this session has read, priced.
+    ///
+    /// Includes reads served from cache: this is what the query consumed, not
+    /// what it cost the origin. For the latter see [`Quarry::origin_stats`].
+    pub fn spent(&self) -> Cost {
+        self.meter.spent()
+    }
+
+    /// Bytes and requests this session issued.
+    pub fn stats(&self) -> StoreStats {
+        self.meter.stats()
+    }
+
+    /// Whether a budget stopped this session.
+    pub fn outcome(&self) -> Outcome {
+        self.meter.outcome()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::TableId;
+    use crate::snapshot::{Snapshot, SnapshotGraph, SnapshotId};
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use object_store::memory::InMemory;
+    use std::collections::BTreeMap;
+
+    fn url() -> Url {
+        Url::parse("memory://").expect("url")
+    }
+
+    fn table() -> Arc<QuarryTable> {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+        )
+        .expect("batch");
+
+        let file = crate::snapshot::FileId("only".into());
+        let graph =
+            SnapshotGraph::new().with(Snapshot::root(SnapshotId(1)).with_clean_file(file.clone()));
+
+        Arc::new(
+            QuarryTable::new(
+                schema,
+                TableId("t".into()),
+                SnapshotId(1),
+                graph,
+                BTreeMap::from([("n".to_owned(), 1u32)]),
+            )
+            .with_file(file, vec![batch]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_session_answers_sql() {
+        let quarry = Quarry::new(url(), Arc::new(InMemory::new()));
+        let session = quarry.session();
+        session.register("t", table()).expect("register");
+
+        let rows = session.sql("SELECT sum(n) AS s FROM t").await.expect("sql");
+        let sum = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64")
+            .value(0);
+        assert_eq!(sum, 6);
+    }
+
+    #[test]
+    fn a_quarry_without_a_cache_reports_no_cache_stats() {
+        let quarry = Quarry::new(url(), Arc::new(InMemory::new()));
+        assert!(quarry.cache_stats().is_none());
+        quarry.clear_cache(); // harmless
+    }
+
+    #[test]
+    fn a_quarry_with_a_cache_reports_cache_stats() {
+        let quarry = Quarry::with_cache(url(), Arc::new(InMemory::new()), 1 << 20);
+        assert_eq!(quarry.cache_stats(), Some(CacheStats::default()));
+    }
+
+    #[tokio::test]
+    async fn sessions_have_separate_budgets_but_share_the_cache() {
+        let quarry = Quarry::with_cache(url(), Arc::new(InMemory::new()), 1 << 20);
+
+        let first = quarry.session_with_budget(Budget::bytes(10));
+        let second = quarry.session();
+
+        assert_eq!(first.stats(), StoreStats::default());
+        assert_eq!(second.stats(), StoreStats::default());
+        assert!(first.outcome().is_complete());
+
+        // Both draw on the same cache, so the shared one is what persists.
+        assert!(quarry.cache_stats().is_some());
+    }
+
+    #[tokio::test]
+    async fn in_memory_tables_never_touch_the_store() {
+        // Worth pinning: the table above holds its data in memory, so the
+        // store stack should see nothing at all.
+        let quarry = Quarry::new(url(), Arc::new(InMemory::new()));
+        let session = quarry.session();
+        session.register("t", table()).expect("register");
+        session.sql("SELECT * FROM t").await.expect("sql");
+
+        assert_eq!(quarry.origin_stats(), StoreStats::default());
+        assert_eq!(session.stats(), StoreStats::default());
+    }
+}

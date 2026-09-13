@@ -16,12 +16,12 @@ Everything else is derived, priced, and disposable.
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done, and phase 9 is under way. The
 decision core is 90 tests with **no dependencies**; DataFusion sits behind
-`--features engine` and adds 39 more, including SQL over real Parquet.
+`--features engine` and adds 44 more, including SQL over real Parquet.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine        # 129 tests, incl. SQL over real Parquet
+cargo test --features engine        # 134 tests, incl. SQL over real Parquet
 cargo run --example explain         # no dependencies; walks a table over 4 commits
 ```
 
@@ -56,6 +56,7 @@ src/
     materialized.rs   a Kind holding Arrow batches, defined outside the core
     store.rs          an object store that counts bytes and enforces budgets
     cache.rs          a read-through cache for ranges of immutable objects
+    quarry.rs         Quarry and Session: the assembled stack
 examples/
   explain.rs    end-to-end walkthrough
 tests/

@@ -26,10 +26,11 @@ use object_store::local::LocalFileSystem;
 use quarry::budget::Budget;
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{MeteredStore, QuarryTable, RangeCache, hash_scalar};
+use quarry::engine::{MeteredStore, Quarry, QuarryTable, hash_scalar};
 use quarry::kinds::Index;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
+use url::Url;
 
 const TENANT_FIELD: u32 = 4;
 const POLICY: PolicyFingerprint = PolicyFingerprint(1);
@@ -91,27 +92,18 @@ async fn run(table: Arc<QuarryTable>, sql: &str) -> Vec<RecordBatch> {
         .expect("execute")
 }
 
-/// Run against a store that counts what it fetches, returning the query's
-/// result alongside it so the I/O can be asserted on.
+/// Run against a store that counts what it fetches, so the I/O can be
+/// asserted on.
+///
+/// A fresh `SessionContext` each time, so DataFusion's own metadata caching
+/// cannot be mistaken for the cache under test.
 async fn run_metered(
     table: Arc<QuarryTable>,
     sql: &str,
     store: Arc<MeteredStore>,
 ) -> datafusion::error::Result<Vec<RecordBatch>> {
-    run_on_store(table, sql, store).await
-}
-
-/// Run against an arbitrary object store.
-///
-/// A fresh `SessionContext` each time, so DataFusion's own metadata caching
-/// cannot be mistaken for ours.
-async fn run_on_store(
-    table: Arc<QuarryTable>,
-    sql: &str,
-    store: Arc<dyn object_store::ObjectStore>,
-) -> datafusion::error::Result<Vec<RecordBatch>> {
     let ctx = SessionContext::new();
-    ctx.register_object_store(&url::Url::parse("file://").expect("url"), store);
+    ctx.register_object_store(&Url::parse("file://").expect("url"), store);
     ctx.register_table("events", table).expect("register");
     ctx.sql(sql).await?.collect().await
 }
@@ -391,38 +383,49 @@ async fn a_byte_budget_aborts_a_real_parquet_scan() {
 #[tokio::test]
 async fn a_repeated_query_stops_touching_the_store() {
     let dir = scratch("parquet_cached");
-
-    // RangeCache outside the meter, so the meter counts only what missed.
-    let origin = Arc::new(MeteredStore::new(Arc::new(LocalFileSystem::new())));
-    let cached: Arc<dyn object_store::ObjectStore> = Arc::new(RangeCache::for_immutable_objects(
-        Arc::clone(&origin) as _,
-        16 << 20,
-    ));
-
     let sql = "SELECT * FROM events WHERE tenant_id = 1";
 
-    let (first_table, _) = parquet_table(&dir, 810);
-    let rows = run_on_store(Arc::new(first_table), sql, Arc::clone(&cached))
-        .await
-        .expect("first run");
-    assert_eq!(total_rows(&rows), 3);
+    // The whole stack, assembled once. A session per query, so the budget is
+    // per-query while the cache outlives both.
+    let quarry = Quarry::with_cache(
+        Url::parse("file://").expect("url"),
+        Arc::new(LocalFileSystem::new()),
+        16 << 20,
+    );
 
-    let after_first = origin.stats().bytes_fetched;
+    let first = quarry.session();
+    let (table, _) = parquet_table(&dir, 810);
+    first.register("events", Arc::new(table)).expect("register");
+    assert_eq!(total_rows(&first.sql(sql).await.expect("first run")), 3);
+
+    let after_first = quarry.origin_stats().bytes_fetched;
     assert!(after_first > 0, "the first run must read the objects");
 
-    // Same query, same immutable files, a brand new session.
-    let (second_table, _) = parquet_table(&dir, 810);
-    let rows = run_on_store(Arc::new(second_table), sql, Arc::clone(&cached))
-        .await
-        .expect("second run");
-    assert_eq!(total_rows(&rows), 3, "identical answer");
+    let second = quarry.session();
+    let (table, _) = parquet_table(&dir, 810);
+    second
+        .register("events", Arc::new(table))
+        .expect("register");
+    assert_eq!(
+        total_rows(&second.sql(sql).await.expect("second run")),
+        3,
+        "identical answer"
+    );
 
     assert_eq!(
-        origin.stats().bytes_fetched,
+        quarry.origin_stats().bytes_fetched,
         after_first,
         "the second run fetched {} extra bytes; it should have been served \
          entirely from cache",
-        origin.stats().bytes_fetched - after_first
+        quarry.origin_stats().bytes_fetched - after_first
+    );
+    assert!(
+        quarry.cache_stats().expect("a cache").hits > 0,
+        "and the cache should say so"
+    );
+    assert!(
+        second.stats().bytes_fetched > 0,
+        "the session still read bytes; they just did not come from the origin"
     );
 }
 
