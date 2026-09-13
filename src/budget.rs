@@ -125,7 +125,11 @@ impl Outcome {
 pub struct Meter {
     budget: Budget,
     prices: PriceTable,
-    spent: Cost,
+    /// Accumulated as though every read waited its turn; the overlap is
+    /// applied in [`Meter::spent`], because it depends on how many reads there
+    /// turned out to be.
+    serial: Cost,
+    reads: u64,
     stopped: Option<Exceeded>,
 }
 
@@ -135,7 +139,8 @@ impl Meter {
         Meter {
             budget,
             prices,
-            spent: Cost::ZERO,
+            serial: Cost::ZERO,
+            reads: 0,
             stopped: None,
         }
     }
@@ -151,8 +156,10 @@ impl Meter {
         if let Some(exceeded) = self.stopped {
             return Permit::Stop(exceeded);
         }
-        self.spent = self.spent + self.prices.price(bytes, tier, distance, 0.0);
-        match self.budget.breach(&self.spent) {
+        self.serial = self.serial + self.prices.price(bytes, tier, distance, 0.0);
+        self.reads += 1;
+        let spent = self.spent();
+        match self.budget.breach(&spent) {
             None => Permit::Continue,
             Some(exceeded) => {
                 self.stopped = Some(exceeded);
@@ -166,8 +173,9 @@ impl Meter {
         if let Some(exceeded) = self.stopped {
             return Permit::Stop(exceeded);
         }
-        self.spent = self.spent + self.prices.price(0, Tier::Hot, Distance::Local, seconds);
-        match self.budget.breach(&self.spent) {
+        self.serial = self.serial + self.prices.price(0, Tier::Hot, Distance::Local, seconds);
+        let spent = self.spent();
+        match self.budget.breach(&spent) {
             None => Permit::Continue,
             Some(exceeded) => {
                 self.stopped = Some(exceeded);
@@ -177,8 +185,24 @@ impl Meter {
     }
 
     /// What has been spent so far.
+    ///
+    /// Waiting is discounted by however many reads overlapped, which is why
+    /// this is computed rather than accumulated: `n` reads over `f` parallel
+    /// streams wait `n/f` times, and `n` is not known until the scan ends.
+    /// Dividing by `min(f, n)` keeps a single read paying its full round trip
+    /// while a wide scan pays once per wave.
     pub fn spent(&self) -> Cost {
-        self.spent
+        let overlap = self
+            .prices
+            .concurrent_reads
+            .min(self.reads.max(1) as f64)
+            .max(1.0);
+        let waited = self.serial.wait_seconds / overlap;
+        Cost {
+            wait_seconds: waited,
+            usd: self.serial.usd - (self.serial.wait_seconds - waited) * self.prices.cpu_second_usd,
+            ..self.serial
+        }
     }
 
     /// How the query ended, as things stand.
@@ -334,5 +358,106 @@ mod tests {
     fn a_zero_byte_read_never_breaches() {
         let mut m = meter(Budget::bytes(0));
         assert!(m.charge(0, Tier::Hot, Distance::Local).is_continue());
+    }
+
+    /// The overlap model, against arithmetic done here rather than by it.
+    ///
+    /// Sixteen reads over four streams wait four times. This is the term that
+    /// was wrong by the engine's parallelism before `concurrent_reads`
+    /// existed, and on a sixteen-core machine that is not a rounding error.
+    #[test]
+    fn reads_that_overlap_wait_once_per_wave() {
+        let prices = PriceTable::default().with_concurrent_reads(4.0);
+        let one_read = prices.wait_seconds(1_000, Tier::Hot, Distance::Near);
+
+        let mut meter = Meter::new(Budget::UNLIMITED, prices);
+        for _ in 0..16 {
+            assert_eq!(
+                meter.charge(1_000, Tier::Hot, Distance::Near),
+                Permit::Continue
+            );
+        }
+
+        let waited = meter.spent().wait_seconds;
+        assert!(
+            (waited - 4.0 * one_read).abs() < 1e-12,
+            "16 reads over 4 streams should wait 4 times: {waited} vs {}",
+            4.0 * one_read
+        );
+    }
+
+    #[test]
+    fn a_single_read_still_waits_in_full() {
+        // The case that rules out simply dividing every read by the
+        // parallelism: one read overlaps with nothing.
+        let prices = PriceTable::default().with_concurrent_reads(16.0);
+        let mut meter = Meter::new(Budget::UNLIMITED, prices);
+        meter.charge(1_000, Tier::Hot, Distance::Far);
+
+        let expected = prices.wait_seconds(1_000, Tier::Hot, Distance::Far);
+        assert!((meter.spent().wait_seconds - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overlap_is_reflected_in_the_money_too() {
+        // Not just the reported seconds: the discount has to reach the total,
+        // or a budget would still be spent at the serial rate.
+        let serial = Meter::new(Budget::UNLIMITED, PriceTable::default());
+        let parallel = Meter::new(
+            Budget::UNLIMITED,
+            PriceTable::default().with_concurrent_reads(8.0),
+        );
+        let spend = |mut m: Meter| {
+            for _ in 0..8 {
+                m.charge(1_000, Tier::Hot, Distance::Near);
+            }
+            m.spent()
+        };
+        let (serial, parallel) = (spend(serial), spend(parallel));
+
+        assert_eq!(serial.bytes, parallel.bytes, "bytes are unaffected");
+        assert!(parallel.usd < serial.usd);
+    }
+
+    #[test]
+    fn overlapping_reads_let_a_budget_go_further() {
+        // The consequence that matters. Waiting is charged, so overstating it
+        // aborts queries that were in fact affordable.
+        let serial_prices = PriceTable::default();
+        let eight_reads = |prices: PriceTable, n: usize| {
+            let mut m = Meter::new(Budget::UNLIMITED, prices);
+            for _ in 0..n {
+                m.charge(1_000, Tier::Hot, Distance::Near);
+            }
+            m.spent().usd
+        };
+
+        // A budget priced for exactly eight serial reads.
+        let budget = Budget::usd(eight_reads(serial_prices, 8));
+
+        let mut serial = Meter::new(budget, serial_prices);
+        for _ in 0..8 {
+            assert_eq!(
+                serial.charge(1_000, Tier::Hot, Distance::Near),
+                Permit::Continue
+            );
+        }
+        assert!(
+            matches!(
+                serial.charge(1_000, Tier::Hot, Distance::Near),
+                Permit::Stop(_)
+            ),
+            "the ninth serial read should not fit"
+        );
+
+        // Overlapped sixteen ways, the same money buys more than eight.
+        let mut parallel = Meter::new(budget, serial_prices.with_concurrent_reads(16.0));
+        for i in 0..16 {
+            assert_eq!(
+                parallel.charge(1_000, Tier::Hot, Distance::Near),
+                Permit::Continue,
+                "read {i} should fit when reads overlap"
+            );
+        }
     }
 }

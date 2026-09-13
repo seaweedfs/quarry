@@ -142,12 +142,19 @@ impl Quarry {
     /// fails rather than returning fewer rows, because a truncated answer
     /// looks complete.
     pub fn session_with_budget(&self, budget: Budget) -> Session {
+        let ctx = SessionContext::new();
+        // Take the parallelism from DataFusion rather than assuming it. Reads
+        // that overlap wait once, not once each, and on a sixteen-core machine
+        // the difference is sixteenfold on what is often the largest part of a
+        // small-file scan's cost.
+        let prices = self
+            .prices
+            .with_concurrent_reads(ctx.state().config().target_partitions() as f64);
         let meter = Arc::new(
             MeteredStore::new(Arc::clone(&self.shared))
                 .with_facts(Arc::clone(&self.facts), self.here.clone())
-                .with_budget(budget, self.prices),
+                .with_budget(budget, prices),
         );
-        let ctx = SessionContext::new();
         ctx.register_object_store(&self.url, Arc::clone(&meter) as _);
         Session { ctx, meter }
     }

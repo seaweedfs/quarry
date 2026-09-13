@@ -138,6 +138,23 @@ pub struct PriceTable {
     pub near_link: Link,
     /// How fast bytes arrive from another region, or over the internet.
     pub far_link: Link,
+    /// How many reads this deployment has in flight at once.
+    ///
+    /// Waiting is the one part of a cost that does *not* add up over reads: a
+    /// scan issuing sixteen requests in parallel waits once, not sixteen
+    /// times. [`crate::budget::Meter`] divides accumulated waiting by this.
+    ///
+    /// # Why the default is one
+    ///
+    /// There is no conservative default, because the two consumers want
+    /// opposite errors. A budget is safest assuming *no* overlap, since
+    /// understating a cost lets a query overspend; a build decision is safest
+    /// assuming *full* overlap, since overstating a saving is what builds
+    /// indexes that do not pay. Guessing therefore cannot be safe in both, so
+    /// the default is the literal truth for a caller with no engine — one read
+    /// at a time — and [`crate::engine::Quarry`] replaces it with DataFusion's
+    /// own `target_partitions` rather than a guess.
+    pub concurrent_reads: f64,
 }
 
 impl PriceTable {
@@ -185,6 +202,7 @@ impl PriceTable {
                 first_byte_seconds: 80e-3,
                 bytes_per_second: 40e6,
             },
+            concurrent_reads: 1.0,
         }
     }
 
@@ -225,6 +243,12 @@ impl PriceTable {
     /// pruning pays for itself fastest.
     pub fn aws_s3_internet() -> Self {
         PriceTable::from_rates(0.023, 0.0004, 1e6, 0.09, 0.01)
+    }
+
+    /// The same table with a different number of reads in flight.
+    pub fn with_concurrent_reads(mut self, reads: f64) -> Self {
+        self.concurrent_reads = reads.max(1.0);
+        self
     }
 
     /// How bytes arrive from `distance`.

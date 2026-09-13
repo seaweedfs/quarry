@@ -1499,9 +1499,56 @@ All four measured regimes still get the same verdict. `EXPLAIN` now prints
 waiting separately, since it is the part a caller can act on — by moving work
 closer, or reading in fewer, larger pieces.
 
+### Concurrency `[x]`
+
+The note here previously said fixing this "needs a parallelism figure the
+planner does not currently carry". That was wrong, and checking it took one
+probe: `SessionContext::new().state().config().target_partitions()` is **16** on
+this machine. So the dominant term of a small-file scan's cost was overstated by
+the core count, and the excuse for leaving it was an assumption never tested.
+
+`PriceTable::concurrent_reads` is now applied in two places:
+
+```text
+Meter::spent          serial waiting / min(reads, concurrent_reads)
+Proposal::expected_usd  round trips avoided / concurrent_reads
+```
+
+`Meter` accumulates waiting *serially* and discounts in `spent()`, because the
+divisor depends on how many reads there turned out to be and that is not known
+until the scan ends. Dividing by `min(f, n)` rather than `f` is what keeps a
+single read paying its full round trip — an isolated read overlaps with nothing,
+and simply dividing every read by the parallelism would have understated it
+sixteenfold.
+
+`Quarry::session_with_budget` takes the figure from DataFusion rather than
+assuming it.
+
+#### There is no conservative default, so the truth is the default
+
+The two consumers want opposite errors:
+
+```text
+a budget       safest assuming NO overlap   understating cost lets it overspend
+a build        safest assuming FULL overlap  overstating saving builds junk
+```
+
+No single guess is safe in both, which is the argument for fetching the real
+number instead of picking one. The default is 1.0 — the literal truth for a
+caller with no engine, reading one thing at a time.
+
+#### Tested against arithmetic, not against itself
+
+`a_session_charges_for_overlapping_reads_not_serial_ones` goes through `Quarry`,
+because a unit test of the division passes with the wiring absent entirely. Its
+ground truth comes from the store's own counters: an opaque backend resolves
+every read to `Far`, so serial waiting is exactly
+`requests x first_byte + bytes_fetched / bytes_per_second`, and the charge must
+be that over `min(requests, target_partitions)`.
+
 ### Still not modelled
 
-Concurrency. A scan issuing twenty parallel reads waits once, not twenty times,
-so `wait_seconds` summed over files is an upper bound. Fixing that needs a
-parallelism figure the planner does not currently carry, and overstating waiting
-biases toward fewer, larger reads — the conservative direction.
+Whether `target_partitions` is the true read fan-out. It is DataFusion's
+*execution* parallelism, and a single partition may have several reads in flight
+inside one Parquet reader — so this is a lower bound on overlap, and therefore
+still errs toward overstating waiting.

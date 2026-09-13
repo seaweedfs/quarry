@@ -429,6 +429,62 @@ async fn a_repeated_query_stops_touching_the_store() {
     );
 }
 
+/// The wiring, not the model: a real session must take its parallelism from
+/// DataFusion rather than assume reads happen one at a time.
+///
+/// Tested through `Quarry`, because that is where the figure is fetched — a
+/// unit test of the arithmetic would pass with the wiring absent entirely.
+///
+/// The ground truth is `requests`: the store counts them, so the serial cost
+/// of waiting is at least `requests` round trips. If the session charged
+/// serially, waiting could not come to less than that.
+#[tokio::test]
+async fn a_session_charges_for_overlapping_reads_not_serial_ones() {
+    let dir = scratch("parquet_overlap");
+    let (table, _) = parquet_table(&dir, 810);
+
+    let partitions = SessionContext::new().state().config().target_partitions();
+    assert!(
+        partitions > 1,
+        "this test needs a machine that would parallelise; got {partitions}"
+    );
+
+    let quarry = Quarry::new(
+        Url::parse("file://").expect("url"),
+        Arc::new(LocalFileSystem::new()),
+    );
+    let session = quarry.session();
+    session
+        .register("events", Arc::new(table))
+        .expect("register");
+    session.sql("SELECT * FROM events").await.expect("query");
+
+    let spent = session.spent();
+    let stats = session.stats();
+    let requests = stats.requests;
+    assert!(requests > 1, "the scan made several reads: {requests}");
+    assert!(spent.wait_seconds > 0.0, "and waited for them");
+
+    // This store reports no placement, so every read resolves to `Far` — see
+    // `MeteredStore`. That makes the serial cost of waiting computable from
+    // the counters alone, which is the ground truth this test needs.
+    let link = PriceTable::default().far_link;
+    let serial = requests as f64 * link.first_byte_seconds
+        + stats.bytes_fetched as f64 / link.bytes_per_second;
+    let waves = (requests as f64).min(partitions as f64);
+
+    assert!(
+        (spent.wait_seconds - serial / waves).abs() < 1e-9,
+        "{requests} reads over {waves} streams should wait {}s, charged {}s",
+        serial / waves,
+        spent.wait_seconds
+    );
+    assert!(
+        spent.wait_seconds < serial,
+        "and that must be less than waiting for each in turn"
+    );
+}
+
 #[tokio::test]
 async fn a_generous_budget_lets_the_query_finish() {
     let dir = scratch("parquet_budget_ok");

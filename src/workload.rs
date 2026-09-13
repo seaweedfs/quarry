@@ -246,8 +246,14 @@ impl Proposal {
         let opens_avoided =
             self.queries as f64 * (spread.files_by_bounds - spread.files_by_index).max(0.0);
 
+        // Divided by the reads in flight, because a scan that skips sixteen
+        // files in parallel saves one wave of waiting, not sixteen. Left
+        // undivided this term would overstate the benefit of an index over
+        // many small files by exactly the engine's parallelism.
+        let waves_avoided = opens_avoided / prices.concurrent_reads.max(1.0);
+
         bytes * prices.byte_usd(Tier::Hot, Distance::Far)
-            + opens_avoided * prices.link(Distance::Far).first_byte_seconds * prices.cpu_second_usd
+            + waves_avoided * prices.link(Distance::Far).first_byte_seconds * prices.cpu_second_usd
     }
 }
 
@@ -883,7 +889,8 @@ mod tests {
     /// and the reason `expected_usd` has a second term.
     #[test]
     fn skipping_many_small_files_is_worth_more_than_skipping_a_few_large_ones() {
-        let prices = PriceTable::default();
+        // A non-unit parallelism, so that the division is actually exercised.
+        let prices = PriceTable::default().with_concurrent_reads(8.0);
         let queries = 10;
         let bytes_scanned = 10 * GB;
 
@@ -916,9 +923,13 @@ mod tests {
             "many small files should rank higher: {small} vs {large}"
         );
 
-        // And by exactly the round trips avoided, computed independently here.
+        // And by exactly the round trips avoided, computed independently
+        // here — including the parallelism, since skipping eight files at once
+        // saves one wave of waiting rather than eight.
         let extra_opens = queries as f64 * ((1_000.0 - 100.0) - (10.0 - 1.0));
-        let expected_gap = extra_opens * prices.far_link.first_byte_seconds * prices.cpu_second_usd;
+        let expected_gap = (extra_opens / prices.concurrent_reads)
+            * prices.far_link.first_byte_seconds
+            * prices.cpu_second_usd;
         assert!(
             (small - large - expected_gap).abs() < 1e-12,
             "gap {} should be {}",
