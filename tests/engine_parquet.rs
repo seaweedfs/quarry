@@ -26,7 +26,7 @@ use object_store::local::LocalFileSystem;
 use quarry::budget::Budget;
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{MeteredStore, QuarryTable, hash_scalar};
+use quarry::engine::{MeteredStore, QuarryTable, RangeCache, hash_scalar};
 use quarry::kinds::Index;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -97,6 +97,18 @@ async fn run_metered(
     table: Arc<QuarryTable>,
     sql: &str,
     store: Arc<MeteredStore>,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    run_on_store(table, sql, store).await
+}
+
+/// Run against an arbitrary object store.
+///
+/// A fresh `SessionContext` each time, so DataFusion's own metadata caching
+/// cannot be mistaken for ours.
+async fn run_on_store(
+    table: Arc<QuarryTable>,
+    sql: &str,
+    store: Arc<dyn object_store::ObjectStore>,
 ) -> datafusion::error::Result<Vec<RecordBatch>> {
     let ctx = SessionContext::new();
     ctx.register_object_store(&url::Url::parse("file://").expect("url"), store);
@@ -374,6 +386,44 @@ async fn a_byte_budget_aborts_a_real_parquet_scan() {
         "unhelpful error: {error}"
     );
     assert!(!store.outcome().is_complete());
+}
+
+#[tokio::test]
+async fn a_repeated_query_stops_touching_the_store() {
+    let dir = scratch("parquet_cached");
+
+    // RangeCache outside the meter, so the meter counts only what missed.
+    let origin = Arc::new(MeteredStore::new(Arc::new(LocalFileSystem::new())));
+    let cached: Arc<dyn object_store::ObjectStore> = Arc::new(RangeCache::for_immutable_objects(
+        Arc::clone(&origin) as _,
+        16 << 20,
+    ));
+
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    let (first_table, _) = parquet_table(&dir, 810);
+    let rows = run_on_store(Arc::new(first_table), sql, Arc::clone(&cached))
+        .await
+        .expect("first run");
+    assert_eq!(total_rows(&rows), 3);
+
+    let after_first = origin.stats().bytes_fetched;
+    assert!(after_first > 0, "the first run must read the objects");
+
+    // Same query, same immutable files, a brand new session.
+    let (second_table, _) = parquet_table(&dir, 810);
+    let rows = run_on_store(Arc::new(second_table), sql, Arc::clone(&cached))
+        .await
+        .expect("second run");
+    assert_eq!(total_rows(&rows), 3, "identical answer");
+
+    assert_eq!(
+        origin.stats().bytes_fetched,
+        after_first,
+        "the second run fetched {} extra bytes; it should have been served \
+         entirely from cache",
+        origin.stats().bytes_fetched - after_first
+    );
 }
 
 #[tokio::test]

@@ -17,10 +17,12 @@
 //! nothing in `derived`, `registry`, or `explain` knows it exists, and none of
 //! them changed to accommodate it.
 
+mod cache;
 mod materialized;
 mod store;
 mod table;
 
+pub use cache::{CacheStats, RangeCache};
 pub use materialized::{MaterializedResult, hash_plan};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
 pub use table::{QuarryTable, ScanReport, hash_scalar};

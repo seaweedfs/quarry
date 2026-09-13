@@ -304,7 +304,7 @@ behind `--features engine`.
 - [x] `MaterializedResult`: a substituting kind holding real Arrow batches
 - [x] Parquet objects read through `object_store`, selected by the rule
 - [x] `MeteredStore`: counts bytes fetched, enforces a budget against real I/O
-- [ ] Metadata and block caches
+- [x] `RangeCache`: read-through cache for object ranges
 - [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
 
 **Design constraint.** Use DataFusion's own extension points —
@@ -389,6 +389,44 @@ Reads are priced hot and `Far` by default, which is what remote object storage
 is. A colocated store says otherwise via `with_locality`, and then the same
 money budget buys far more bytes — tested, and the first place `Distance` pays
 for itself outside a unit test.
+
+**The cache, and why it is allowed to exist.** `RangeCache` caches bounded byte
+ranges keyed on `(path, range)`. That would be *unsound* in general: an object
+overwritten in place under the same path would serve stale bytes, and the
+answer would look entirely normal.
+
+What makes it sound is a property of the table format, not of the code:
+
+```text
+Iceberg data files are immutable.
+New data means new files; a committed data file is never rewritten.
+```
+
+So the constructor is `RangeCache::for_immutable_objects`, not `new` — a caller
+pointing it at mutable objects has to type out the assumption being broken.
+Writes and deletes still invalidate, as defence in depth rather than the
+argument.
+
+Composition order is the useful kind of ordering:
+
+```text
+RangeCache(MeteredStore(store))   the meter counts only what MISSED, so
+                                  its stats measure real origin I/O
+
+MeteredStore(RangeCache(store))   the meter counts every read including
+                                  hits, which measures demand, not cost
+```
+
+The first arrangement gives the headline test: the same query, run twice in
+*separate sessions* so DataFusion's own metadata caching cannot be mistaken for
+ours, fetches **zero** extra bytes from the origin the second time.
+
+Deliberate limits: only bounded ranges are cached, because resolving an offset
+or suffix needs the object size and that is one round trip more than a cache
+should cost. Conditional and versioned requests bypass entirely, since their
+purpose is to ask the store something the cache cannot answer. Eviction is
+insertion-ordered rather than frequency-based; the design wants the latter, and
+eviction is unconditionally safe either way.
 
 ---
 
