@@ -328,7 +328,10 @@ mod tests {
         // cost exactly the same and this would have nothing to measure. See
         // `PriceTable::aws_s3_same_region`.
         let prices = PriceTable::aws_s3_internet();
-        let budget = Budget::usd(prices.byte_usd(Tier::Hot, Distance::Far) * 150.0);
+        // A ceiling that affords one far read and not two. Priced with
+        // `price` rather than `byte_usd * bytes`, because most of what a small
+        // remote read costs is the round trip waited for, not the bytes moved.
+        let budget = Budget::usd(prices.price(150, Tier::Hot, Distance::Far, 0.0).usd);
         let here = Place::parse("/onprem/dc1/rack2/node7");
 
         // A backend that says nothing: everything is far.

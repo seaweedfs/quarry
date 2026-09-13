@@ -1441,3 +1441,67 @@ dominated by request charges. Under the guessed table it was $1.20. The
 *decisions* are unchanged — all four measured regimes still get the same
 verdict — because those turn on ratios between candidates, which is why the
 constants mattered less than the structural errors found earlier.
+
+
+---
+
+## Phase 20 — Latency `[x]`
+
+Calibration left the cost model unable to say why local data is preferable,
+because in the same region it is not cheaper. `Cost` gains `wait_seconds`, and
+distance is priced through the worker that sits idle waiting rather than through
+a transfer fee nobody is billed for.
+
+```text
+Link { first_byte_seconds, bytes_per_second }   per distance
+
+same node       ~100 us, ~2 GB/s     a cache hit, or local NVMe
+same region      ~20 ms, ~90 MB/s    S3, one stream
+another region   ~80 ms, ~40 MB/s
+```
+
+Two numbers per link rather than one, because the parts scale differently: a
+round trip that a large read amortises away and a rate that it does not. A
+megabyte from S3 spends most of its time waiting; a gigabyte barely notices.
+Measured figures, from reproduced benchmarks — latency is not on a price list.
+
+`wait_seconds` is kept apart from `cpu_seconds` because waiting is not work: a
+blocked worker is idle, and the two have different remedies. Both are charged at
+`cpu_second_usd`, which is what puts distance back into one currency.
+
+### One property had to be given up, and should have been
+
+`Add`'s doc claimed pricing a whole read equals summing the prices of its parts.
+Once waiting is priced that is false: three reads pay three round trips where one
+pays one. The test asserting it now asserts the opposite, and checks the gap is
+*exactly* two round trips.
+
+That difference is the whole reason large reads beat small ones, so a model in
+which it cancelled out could not express the most basic advice about object
+storage. Bytes and seconds still compose exactly; money does not.
+
+### The benefit calculation was half-fixed without this
+
+`Proposal::expected_usd` priced a saving in bytes alone, which understates an
+index over many small files — the state compaction exists to fix. It now has a
+second term for files not opened:
+
+```text
+bytes not moved     dominates when files are large
+files not opened    dominates when files are small and many
+```
+
+Two tables pruning 90% of a scan are ranked apart when one skips nine files and
+the other nine hundred. `skipping_many_small_files_is_worth_more_than_skipping_a_few_large_ones`
+asserts the gap equals the avoided round trips, computed independently.
+
+All four measured regimes still get the same verdict. `EXPLAIN` now prints
+waiting separately, since it is the part a caller can act on — by moving work
+closer, or reading in fewer, larger pieces.
+
+### Still not modelled
+
+Concurrency. A scan issuing twenty parallel reads waits once, not twenty times,
+so `wait_seconds` summed over files is an upper bound. Fixing that needs a
+parallelism figure the planner does not currently carry, and overstating waiting
+biases toward fewer, larger reads — the conservative direction.

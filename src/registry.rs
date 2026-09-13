@@ -225,9 +225,8 @@ mod tests {
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {
             Cost {
-                bytes: 0,
-                cpu_seconds: 0.0,
                 usd: self.usd,
+                ..Cost::ZERO
             }
         }
         fn refresh(&mut self, _diff: &Diff) -> Refreshed {

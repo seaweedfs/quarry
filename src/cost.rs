@@ -24,14 +24,21 @@ pub enum Tier {
 
 /// What some work costs.
 ///
-/// `usd` is the total the [`PriceTable`] arrived at; `bytes` and `cpu_seconds`
-/// are kept so that a caller can see what drove it.
+/// `usd` is the total the [`PriceTable`] arrived at; the rest are kept so that
+/// a caller can see what drove it, and because they carry different confidence.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cost {
     /// Bytes moved.
     pub bytes: u64,
-    /// Cpu-seconds spent.
+    /// Cpu-seconds spent computing.
     pub cpu_seconds: f64,
+    /// Seconds spent waiting for bytes to arrive.
+    ///
+    /// Separate from `cpu_seconds` because it is not work: a worker blocked on
+    /// a round trip is idle, and the two have very different remedies. It is
+    /// priced at the same rate all the same, which is the point — see
+    /// [`PriceTable::wait_seconds`].
+    pub wait_seconds: f64,
     /// Total price in US dollars.
     pub usd: f64,
 }
@@ -41,12 +48,17 @@ impl Cost {
     pub const ZERO: Cost = Cost {
         bytes: 0,
         cpu_seconds: 0.0,
+        wait_seconds: 0.0,
         usd: 0.0,
     };
 }
 
-/// Combining costs is what makes plans composable: pricing a whole plan and
-/// summing the prices of its parts give the same answer.
+/// Combining costs is what makes plans composable.
+///
+/// Bytes and seconds add exactly. Money does *not* reproduce the price of the
+/// whole from the prices of its parts, and should not: three reads pay three
+/// round trips where one read pays one. See
+/// `splitting_a_read_costs_extra_round_trips`.
 impl std::ops::Add for Cost {
     type Output = Cost;
 
@@ -54,6 +66,7 @@ impl std::ops::Add for Cost {
         Cost {
             bytes: self.bytes.saturating_add(other.bytes),
             cpu_seconds: self.cpu_seconds + other.cpu_seconds,
+            wait_seconds: self.wait_seconds + other.wait_seconds,
             usd: self.usd + other.usd,
         }
     }
@@ -62,6 +75,27 @@ impl std::ops::Add for Cost {
 impl std::iter::Sum for Cost {
     fn sum<I: Iterator<Item = Cost>>(iter: I) -> Cost {
         iter.fold(Cost::ZERO, |a, b| a + b)
+    }
+}
+
+/// How quickly bytes arrive from a given distance.
+///
+/// Two numbers because a transfer has two parts that scale differently: a
+/// round trip that a large read amortises away, and a rate that it does not.
+/// Reading one megabyte from S3 spends more than half its time waiting; the
+/// same round trip against a hundred megabytes is noise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Link {
+    /// Seconds before the first byte arrives.
+    pub first_byte_seconds: f64,
+    /// Bytes per second once they are flowing.
+    pub bytes_per_second: f64,
+}
+
+impl Link {
+    /// How long `bytes` take to arrive.
+    pub fn seconds(&self, bytes: u64) -> f64 {
+        self.first_byte_seconds + bytes as f64 / self.bytes_per_second.max(f64::MIN_POSITIVE)
     }
 }
 
@@ -97,6 +131,13 @@ pub struct PriceTable {
     /// state has saved against what keeping it costs over some horizon, and
     /// those two cannot be compared without this.
     pub byte_day_usd: f64,
+    /// How fast bytes arrive from the same node — a cache hit, or colocated
+    /// storage.
+    pub local_link: Link,
+    /// How fast bytes arrive from the same region.
+    pub near_link: Link,
+    /// How fast bytes arrive from another region, or over the internet.
+    pub far_link: Link,
 }
 
 impl PriceTable {
@@ -130,6 +171,20 @@ impl PriceTable {
             far_multiplier: (egress_usd_per_gb / GB + hot_local) / hot_local,
             cpu_second_usd: 1.1e-5,
             byte_day_usd: storage_usd_per_gb_month / (GB * 30.0),
+            // Measured figures rather than derived ones, since latency is not
+            // on a price list. See `aws_s3_same_region`.
+            local_link: Link {
+                first_byte_seconds: 100e-6,
+                bytes_per_second: 2e9,
+            },
+            near_link: Link {
+                first_byte_seconds: 20e-3,
+                bytes_per_second: 90e6,
+            },
+            far_link: Link {
+                first_byte_seconds: 80e-3,
+                bytes_per_second: 40e6,
+            },
         }
     }
 
@@ -142,6 +197,15 @@ impl PriceTable {
     /// GET requests       $0.0004 per 1,000
     /// transfer to EC2    free, same region, any availability zone
     /// cold retrieval     $0.01 per GB  (Standard-IA / One Zone-IA)
+    /// ```
+    ///
+    /// Latency and throughput are measured, not published, and come from
+    /// widely reproduced benchmarks:
+    ///
+    /// ```text
+    /// same region     ~20 ms to first byte, ~90 MB/s on one stream
+    /// same node       ~100 us, ~2 GB/s   (a cache hit, or local NVMe)
+    /// another region  ~80 ms, ~40 MB/s   (inter-region round trip)
     /// ```
     ///
     /// Rates move; this is a starting point, not a promise. `from_rates` is
@@ -161,6 +225,41 @@ impl PriceTable {
     /// pruning pays for itself fastest.
     pub fn aws_s3_internet() -> Self {
         PriceTable::from_rates(0.023, 0.0004, 1e6, 0.09, 0.01)
+    }
+
+    /// How bytes arrive from `distance`.
+    pub fn link(&self, distance: Distance) -> Link {
+        match distance {
+            Distance::Local => self.local_link,
+            Distance::Near => self.near_link,
+            Distance::Far => self.far_link,
+        }
+    }
+
+    /// How long a worker waits for `bytes` to arrive from `distance`.
+    ///
+    /// # Why waiting is priced at all
+    ///
+    /// Calibration turned up an awkward fact: AWS bills nothing for transfer
+    /// from S3 to compute in the same region, so a byte from the next rack and
+    /// a byte from this node cost the same money. Distance was therefore
+    /// invisible to a cost model made only of money, and the locality
+    /// machinery had nothing to weigh.
+    ///
+    /// Waiting is not free, though — it is paid for in the worker that sits
+    /// idle. Charging that time at [`PriceTable::cpu_second_usd`] puts
+    /// distance back into the one currency without inventing a transfer fee
+    /// nobody would be billed for.
+    ///
+    /// Cold storage adds its own delay, which is where the difference is
+    /// stark: a retrieval measured in hours is not a slower read, it is a
+    /// different kind of operation.
+    pub fn wait_seconds(&self, bytes: u64, tier: Tier, distance: Distance) -> f64 {
+        let waiting = self.link(distance).seconds(bytes);
+        match tier {
+            Tier::Hot => waiting,
+            Tier::Cold => waiting * self.cold_multiplier,
+        }
     }
 
     /// Price of a single byte at a given tier and distance.
@@ -185,10 +284,17 @@ impl PriceTable {
     /// Price reading `bytes` from `tier` at `distance`, spending
     /// `cpu_seconds` doing it.
     pub fn price(&self, bytes: u64, tier: Tier, distance: Distance, cpu_seconds: f64) -> Cost {
+        let wait_seconds = if bytes == 0 {
+            0.0
+        } else {
+            self.wait_seconds(bytes, tier, distance)
+        };
         Cost {
             bytes,
             cpu_seconds,
-            usd: bytes as f64 * self.byte_usd(tier, distance) + cpu_seconds * self.cpu_second_usd,
+            wait_seconds,
+            usd: bytes as f64 * self.byte_usd(tier, distance)
+                + (cpu_seconds + wait_seconds) * self.cpu_second_usd,
         }
     }
 }
@@ -323,22 +429,96 @@ mod tests {
         assert!(small.hot_byte_usd > big.hot_byte_usd * 100.0);
     }
 
+    /// Bytes and cpu-seconds compose exactly; money does not, and should not.
+    ///
+    /// This used to assert that pricing a whole read equals summing its parts.
+    /// Once waiting is priced that is false, and falsely: three reads pay three
+    /// round trips where one pays one. The difference is the reason large reads
+    /// are preferred to small ones, so a model in which it vanished would be
+    /// unable to express the most basic advice about object storage.
     #[test]
-    fn summing_parts_equals_costing_the_whole() {
+    fn splitting_a_read_costs_extra_round_trips() {
         let p = PriceTable::default();
-        let whole = p.price(3 * GB, Tier::Hot, Distance::Local, 3.0);
+        let whole = p.price(3 * GB, Tier::Hot, Distance::Near, 3.0);
         let parts: Cost = (0..3)
-            .map(|_| p.price(GB, Tier::Hot, Distance::Local, 1.0))
+            .map(|_| p.price(GB, Tier::Hot, Distance::Near, 1.0))
             .sum();
 
+        // The countable parts still add up.
         assert_eq!(parts.bytes, whole.bytes);
         assert!((parts.cpu_seconds - whole.cpu_seconds).abs() < f64::EPSILON);
+
+        // The waiting does not: two extra first-byte latencies.
+        let extra = parts.wait_seconds - whole.wait_seconds;
+        let round_trip = p.near_link.first_byte_seconds;
         assert!(
-            (parts.usd - whole.usd).abs() < 1e-12,
-            "parts {} != whole {}",
-            parts.usd,
-            whole.usd
+            (extra - 2.0 * round_trip).abs() < 1e-9,
+            "expected two extra round trips, got {extra}s"
         );
+        assert!(parts.usd > whole.usd, "and they are paid for");
+    }
+
+    #[test]
+    fn a_round_trip_dominates_a_small_read_and_vanishes_in_a_large_one() {
+        // The lesson the two-part Link exists to express.
+        let p = PriceTable::default();
+        let small = p.price(1_000_000, Tier::Hot, Distance::Near, 0.0);
+        let large = p.price(1_000_000_000, Tier::Hot, Distance::Near, 0.0);
+
+        let round_trip = p.near_link.first_byte_seconds;
+        assert!(
+            round_trip / small.wait_seconds > 0.5,
+            "a megabyte should spend most of its time waiting"
+        );
+        assert!(
+            round_trip / large.wait_seconds < 0.01,
+            "a gigabyte should barely notice"
+        );
+    }
+
+    /// The gap calibration exposed, now closed.
+    ///
+    /// Transfer within a region is not billed, so `byte_usd` cannot tell
+    /// `Local` from `Near`. Waiting can, and does.
+    #[test]
+    fn distance_costs_time_even_where_it_costs_no_money() {
+        let p = PriceTable::default();
+        assert_eq!(
+            p.byte_usd(Tier::Hot, Distance::Local),
+            p.byte_usd(Tier::Hot, Distance::Near),
+            "money still cannot tell them apart"
+        );
+
+        let local = p.price(GB, Tier::Hot, Distance::Local, 0.0);
+        let near = p.price(GB, Tier::Hot, Distance::Near, 0.0);
+        let far = p.price(GB, Tier::Hot, Distance::Far, 0.0);
+
+        assert!(local.wait_seconds < near.wait_seconds);
+        assert!(near.wait_seconds < far.wait_seconds);
+        assert!(
+            local.usd < near.usd && near.usd < far.usd,
+            "and the total now orders them: {} {} {}",
+            local.usd,
+            near.usd,
+            far.usd
+        );
+    }
+
+    #[test]
+    fn cold_storage_is_slow_as_well_as_dear() {
+        let p = PriceTable::default();
+        let hot = p.price(GB, Tier::Hot, Distance::Near, 0.0);
+        let cold = p.price(GB, Tier::Cold, Distance::Near, 0.0);
+        assert!(cold.wait_seconds > hot.wait_seconds * 10.0);
+    }
+
+    #[test]
+    fn nothing_read_means_nothing_waited_for() {
+        // A cpu-only cost must not be charged a round trip it never made.
+        let p = PriceTable::default();
+        let compute = p.price(0, Tier::Hot, Distance::Far, 1.0);
+        assert_eq!(compute.wait_seconds, 0.0);
+        assert!((compute.usd - p.cpu_second_usd).abs() < 1e-18);
     }
 
     #[test]

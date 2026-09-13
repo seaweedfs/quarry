@@ -224,10 +224,30 @@ impl Proposal {
     /// that the file format does not. Against measured data this lands within
     /// a few points of what was realized, where the ceiling was out by three
     /// orders of magnitude.
+    ///
+    /// Two terms, because skipping a file saves two different things:
+    ///
+    /// ```text
+    /// bytes not moved     dominates when files are large
+    /// files not opened    dominates when files are small and many
+    /// ```
+    ///
+    /// The second term is why this is not simply a byte count. A thousand
+    /// hundred-kilobyte files — the state Iceberg compaction exists to fix —
+    /// cost mostly round trips, so an index over them is worth considerably
+    /// more than the bytes it saves. Counting only bytes would rank such a
+    /// table below a fatter one that actually benefits less.
     pub fn expected_usd(&self, spread: &Spread, prices: &PriceTable) -> f64 {
-        self.bytes_scanned as f64
-            * spread.index_advantage()
-            * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+        use crate::cost::Tier;
+        use crate::place::Distance;
+
+        let bytes = self.bytes_scanned as f64 * spread.index_advantage();
+        // Files the index skips that the format's own ranges would not.
+        let opens_avoided =
+            self.queries as f64 * (spread.files_by_bounds - spread.files_by_index).max(0.0);
+
+        bytes * prices.byte_usd(Tier::Hot, Distance::Far)
+            + opens_avoided * prices.link(Distance::Far).first_byte_seconds * prices.cpu_second_usd
     }
 }
 
@@ -515,6 +535,7 @@ mod tests {
     use super::*;
     use crate::cost::Cost;
     use crate::derived::{Derived, Kind, PolicyFingerprint, Refreshed, Rewrite, Source};
+    use crate::layout::Spread;
     use crate::snapshot::{Diff, SnapshotId};
 
     const GB: u64 = 1_000_000_000;
@@ -849,5 +870,60 @@ mod tests {
         assert_eq!(credited.queries, 1);
         assert_eq!(credited.bytes_saved(), GB - 1);
         assert!(workload.credited(&DerivedId("b".into())).is_none());
+    }
+
+    /// Two tables saving the same bytes, ranked apart by how many files they
+    /// stop opening.
+    ///
+    /// Both prune 90% of a scan, so a benefit made only of bytes would call
+    /// them equal. They are not: one skips nine files, the other nine hundred,
+    /// and every skipped file is a round trip not waited for.
+    ///
+    /// This is the small-files case that Iceberg compaction exists to address,
+    /// and the reason `expected_usd` has a second term.
+    #[test]
+    fn skipping_many_small_files_is_worth_more_than_skipping_a_few_large_ones() {
+        let prices = PriceTable::default();
+        let queries = 10;
+        let bytes_scanned = 10 * GB;
+
+        let few_large = Spread {
+            files: 10,
+            files_by_bounds: 10.0,
+            files_by_index: 1.0,
+        };
+        let many_small = Spread {
+            files: 1_000,
+            files_by_bounds: 1_000.0,
+            files_by_index: 100.0,
+        };
+
+        // Ground truth for "a benefit made only of bytes cannot tell these
+        // apart": the fraction of the scan removed is identical.
+        assert_eq!(few_large.index_advantage(), many_small.index_advantage());
+
+        let proposal = Proposal {
+            table: table(),
+            field: 1,
+            queries,
+            bytes_scanned,
+            ceiling_usd: 0.0,
+        };
+        let large = proposal.expected_usd(&few_large, &prices);
+        let small = proposal.expected_usd(&many_small, &prices);
+        assert!(
+            small > large,
+            "many small files should rank higher: {small} vs {large}"
+        );
+
+        // And by exactly the round trips avoided, computed independently here.
+        let extra_opens = queries as f64 * ((1_000.0 - 100.0) - (10.0 - 1.0));
+        let expected_gap = extra_opens * prices.far_link.first_byte_seconds * prices.cpu_second_usd;
+        assert!(
+            (small - large - expected_gap).abs() < 1e-12,
+            "gap {} should be {}",
+            small - large,
+            expected_gap
+        );
     }
 }

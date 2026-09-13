@@ -188,6 +188,10 @@ impl fmt::Display for Explain {
             writeln!(f, "also scan: {} file(s) added since", self.also_scan.len())?;
         }
         writeln!(f, "bytes:     {} (known)", self.cost.bytes)?;
+        // Waiting is shown separately because it is the part a caller can act
+        // on by moving work closer or reading in fewer, larger pieces, and
+        // because in the same region it is the *only* thing distance changes.
+        writeln!(f, "waiting:   {:.4}s", self.cost.wait_seconds)?;
         writeln!(f, "cost:      ${:.8}", self.cost.usd)?;
         match self.coverage {
             Coverage::Exact => writeln!(f, "coverage:  exact")?,
