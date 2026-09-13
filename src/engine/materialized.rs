@@ -10,7 +10,7 @@
 //! records that a result exists and how big it is, which is enough to plan
 //! with but not to answer from. This one can answer.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 use datafusion::arrow::array::RecordBatch;
 
@@ -71,8 +71,21 @@ impl MaterializedResult {
 ///
 /// Exposed so a caller storing a result can key it the same way the table
 /// will look it up.
+///
+/// # A collision here is not safe
+///
+/// Unlike an index probe, where a collision costs extra I/O, two *different*
+/// plans hashing alike means one query is served the other's stored answer —
+/// a wrong result, silently. Being 64-bit and non-cryptographic, this is
+/// vanishingly unlikely by accident and trivial to arrange on purpose.
+///
+/// Substituting derived state therefore must not be persisted or shared
+/// between principals until a match is *verified* rather than assumed, by
+/// keeping the plan description beside the hash and comparing it. Pruning
+/// kinds have no such restriction, which is why they are the ones being
+/// written to storage first.
 pub fn hash_plan<H: Hash>(parts: &H) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = crate::stable_hash::StableHasher::new();
     parts.hash(&mut hasher);
     hasher.finish()
 }

@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use crate::cost::PriceTable;
 use crate::derived::{Decision, DerivedId, FieldId, PolicyFingerprint, Predicate, Query, Rewrite};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
+use crate::stable_hash::StableHasher;
 use crate::workload::{Fingerprint, Observation};
 
 /// A registry several things can hold at once.
@@ -42,13 +43,15 @@ pub fn shared(registry: Registry) -> SharedRegistry {
 /// Hash a literal the way [`QuarryTable`] does when probing an index.
 ///
 /// Anything building an index must agree with this, or a probe will miss.
-/// Not stable across Rust releases, so derived state that outlives a process
-/// will eventually need a fixed hash rather than [`DefaultHasher`]; in-memory
-/// state does not care yet.
+/// Uses [`StableHasher`], so an index written to storage still matches after a
+/// compiler upgrade — see [`HASH_VERSION`](crate::stable_hash::HASH_VERSION)
+/// for what remains versioned, and why.
+///
+/// A collision here is safe: two values hashing alike means the index reports
+/// files holding the other value too, so the scan over-selects and the
+/// predicate is re-applied to rows anyway.
 pub fn hash_scalar(value: &ScalarValue) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+    StableHasher::of(value)
 }
 
 /// What the rule decided for the most recent scan.
@@ -484,7 +487,7 @@ impl QuarryTable {
     /// asks for: a query that a rewrite could reduce to this one will hash
     /// differently, so the result cache under-hits rather than mis-hits.
     fn plan_hash(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = StableHasher::new();
         self.table.0.hash(&mut hasher);
         self.projected_fields(projection).hash(&mut hasher);
         let mut predicates = self.predicates(filters);

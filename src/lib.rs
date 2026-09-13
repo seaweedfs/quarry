@@ -32,4 +32,5 @@ pub mod kinds;
 pub mod place;
 pub mod registry;
 pub mod snapshot;
+pub mod stable_hash;
 pub mod workload;

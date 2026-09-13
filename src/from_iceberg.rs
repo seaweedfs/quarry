@@ -33,7 +33,7 @@
 //! direction of slow rather than the direction of wrong.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 use iceberg::io::FileIO;
 use iceberg::spec::{DataContentType, ManifestStatus, TableMetadata};
@@ -182,7 +182,7 @@ fn fingerprint(delete_files: &BTreeSet<String>) -> DeleteState {
     if delete_files.is_empty() {
         return DeleteState::NONE;
     }
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = crate::stable_hash::StableHasher::new();
     for path in delete_files {
         path.hash(&mut hasher);
     }
