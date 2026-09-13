@@ -306,7 +306,9 @@ behind `--features engine`.
 - [x] `MeteredStore`: counts bytes fetched, enforces a budget against real I/O
 - [x] `RangeCache`: read-through cache for object ranges
 - [x] `Quarry` / `Session`: one place that assembles the stack
-- [ ] `iceberg-rust` for real tables; Iceberg REST catalog client
+- [x] `from_iceberg`: a `SnapshotGraph` derived from real Iceberg metadata
+- [ ] Wire a real Iceberg table end to end through `QuarryTable`
+- [ ] Iceberg REST catalog client
 
 **Design constraint.** Use DataFusion's own extension points —
 `ObjectStore`, `TableProvider`, `Catalog` — not parallel ones. Held: the only
@@ -457,6 +459,41 @@ inner   sees only what MISSED
 The cache has to sit between them, because it must outlive any one session
 while a budget must not. The caching test now asserts all three numbers at
 once: origin bytes unchanged, cache hits above zero, session bytes above zero.
+
+**Real Iceberg metadata, behind its own feature.** `from_iceberg` walks a
+table's snapshots, manifest lists and manifests and produces a `SnapshotGraph`.
+It is gated on `iceberg` rather than `engine`, because the bridge is pure
+metadata: it needs no query engine, and the engine needs no Iceberg.
+
+The test table is genuine — real metadata JSON, real Avro manifest lists and
+manifests, written with `iceberg-rust`'s own writers and read back through its
+own readers. Only the Parquet data files are absent, because the bridge never
+opens them. That is the point: everything the rule needs is metadata.
+
+Delete attribution is deliberately coarse:
+
+```text
+no delete files in a snapshot
+    → every data file is DeleteState::NONE
+
+any delete files
+    → every data file gets the SAME fingerprint, from the whole
+      delete-file set
+```
+
+Position deletes can name a `referenced_data_file`, so partial attribution is
+possible; equality deletes apply by value across a partition, so exact
+attribution is not generally available. Over-invalidation is the safe
+direction: a delete anywhere makes every substituting piece look stale, while
+pruning keeps working because pruning tolerates any change.
+
+**One API trap worth recording.** `ManifestWriter::add_delete_file` reads as
+though it adds a delete file. It does not — it sets the entry's status to
+`Deleted`, which per the spec means *this file was removed from the table*. A
+delete file that is live in a snapshot is an `Added` entry in a
+deletes-content manifest, written with `add_file`. Getting this backwards makes
+deletes vanish rather than fail, and it was the bridge's
+`ManifestStatus::Deleted` skip — correct per spec — that surfaced it.
 
 ---
 

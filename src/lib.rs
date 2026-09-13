@@ -26,6 +26,8 @@ pub mod derived;
 pub mod engine;
 pub mod explain;
 pub mod facts;
+#[cfg(feature = "iceberg")]
+pub mod from_iceberg;
 pub mod kinds;
 pub mod place;
 pub mod registry;

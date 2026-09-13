@@ -21,6 +21,10 @@ engine = [
     "dep:bytes",
 ]
 
+# Reading real Iceberg tables. Separate from `engine` because the bridge is
+# only metadata: it needs no query engine, and the engine needs no Iceberg.
+iceberg = ["dep:iceberg", "dep:futures", "dep:serde_json", "dep:tokio"]
+
 [dependencies]
 async-trait = { version = "0.1.92", optional = true }
 # Arrow is reached through `datafusion::arrow` rather than depended on
@@ -39,6 +43,10 @@ url = { version = "2", optional = true }
 # object_store puts bytes::Bytes in its public API, so serving a cached
 # range means naming the type.
 bytes = { version = "1", optional = true }
+# Only the metadata side is used: table metadata, snapshots, manifests.
+iceberg = { version = "0.6.0", optional = true }
+# Only the Iceberg tests need this, to write table metadata JSON.
+serde_json = { version = "1.0.151", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

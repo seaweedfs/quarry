@@ -15,14 +15,15 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
-decision core is 98 tests with **no dependencies**; DataFusion sits behind
-`--features engine` and adds 46 more, including SQL over real Parquet.
+decision core is 98 tests with **no dependencies**. Two optional features add
+58 more: `engine` brings DataFusion and SQL over real Parquet, `iceberg` brings
+real table metadata.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine        # 144 tests, incl. SQL over real Parquet
-cargo run --example explain         # no dependencies; walks a table over 4 commits
+cargo test --features engine,iceberg   # 156 tests
+cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 
 `SELECT * FROM events WHERE tenant_id = 1` reads only the Parquet objects an
@@ -49,6 +50,7 @@ src/
   budget.rs     ceilings that stop execution, not estimates
   explain.rs    what a query will cost and why
   facts.rs      what a backend can say about tiers and placement
+  from_iceberg.rs   a SnapshotGraph from real Iceberg metadata (--features iceberg)
   kinds/
     result_cache.rs   a stored answer to one exact query (substituting)
     index.rs          equality on one field, prunes files (pruning)
@@ -63,6 +65,7 @@ examples/
 tests/
   engine_sql.rs     SQL through DataFusion, asserting which files were read
   engine_parquet.rs real Parquet on an object store, selected by the rule
+  iceberg_bridge.rs a genuine Iceberg table: metadata, manifest lists, manifests
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place
