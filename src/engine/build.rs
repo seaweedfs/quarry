@@ -100,6 +100,64 @@ pub async fn build_proposed_index(
     ))
 }
 
+/// How much of one file's values another file also holds, for `field`.
+///
+/// The input [`Spread::from_overlap`](crate::layout::Spread::from_overlap)
+/// needs, and the reason the gate is affordable: two column reads rather than
+/// the whole table. Building the index to find out whether the index is worth
+/// building would defeat the point.
+///
+/// Returns `None` when there are fewer than two files, or when a sampled file
+/// holds no values of the field — in neither case is there an overlap to
+/// measure, and inventing one would be worse than admitting ignorance.
+///
+/// Two files is a small sample and this is an estimate. The direction of its
+/// error matters more than its size: over-reporting overlap makes the gate
+/// refuse, which costs a slow query, while under-reporting makes it build,
+/// which costs storage forever. Adjacent files are deliberately *not* chosen —
+/// the first and last are, since neighbouring files in an ingestion-ordered
+/// table are the most likely to resemble each other and would make almost any
+/// column look clustered.
+pub async fn estimate_overlap(
+    session: &Session,
+    table: &QuarryTable,
+    field: FieldId,
+) -> DfResult<Option<f64>> {
+    let Some(column) = table.column_of(field) else {
+        return exec_err!("field {field} is not a column of this table");
+    };
+    let Some((url, files)) = table.parquet_files() else {
+        return Ok(None);
+    };
+    if files.len() < 2 {
+        return Ok(None);
+    }
+
+    let schema = datafusion::catalog::TableProvider::schema(table);
+    let Some((position, _)) = schema.column_with_name(column) else {
+        return exec_err!("column {column} is not in the table's schema");
+    };
+
+    let mut ends = files.iter();
+    let first = ends.next().expect("at least two files");
+    let last = ends.next_back().expect("at least two files");
+
+    let one: HashSet<u64> = read_column(session, url, &schema, position, first.0, *first.1)
+        .await?
+        .into_iter()
+        .collect();
+    if one.is_empty() {
+        return Ok(None);
+    }
+    let other: HashSet<u64> = read_column(session, url, &schema, position, last.0, *last.1)
+        .await?
+        .into_iter()
+        .collect();
+
+    let shared = one.iter().filter(|value| other.contains(value)).count();
+    Ok(Some(shared as f64 / one.len() as f64))
+}
+
 /// Every non-null value of one column of one object, hashed.
 async fn read_column(
     session: &Session,

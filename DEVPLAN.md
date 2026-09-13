@@ -1115,11 +1115,51 @@ That those tests were demonstrating the loop building a worthless index, and
 had been read as evidence it worked, is the clearest illustration of why the
 measurement was worth doing before more features.
 
+### The input the gate wanted could not be obtained
+
+`Spread::from_bounds` asks for rows per value, which needs a count of distinct
+values. Iceberg does not record one, so it has to be estimated — and every
+cheap estimator fails on exactly the cases the gate must separate. Sampling one
+file of twenty and counting distinct values `d`:
+
+```text
+                d      NDV as d    NDV as d x files
+SCATTERED    5,000      5,000       100,000  (true 5,000)
+SELECTIVE   49,900     49,900       998,000  (true 906,341)
+```
+
+`NDV = d` makes SELECTIVE look worthless; `NDV = d x files` makes SCATTERED
+look valuable. Wrong in opposite directions, and no constant factor fixes both.
+
+So `Spread::from_overlap` asks a question that *is* measurable: do two files
+hold the same values? Scattered files share nearly all of them, selective files
+almost none.
+
+```text
+files_by_index = 1 + (files - 1) x shared
+```
+
+`estimate_overlap` measures `shared` from **two** files rather than the table,
+which is what keeps the gate cheaper than the build it is gating — building an
+index to find out whether the index is worth building would defeat the point.
+It picks the first and last file rather than adjacent ones, since neighbours in
+an ingestion-ordered table resemble each other and would make almost any column
+look clustered.
+
+`from_iceberg::field_bounds` supplies the ranges, free, from manifest
+`lower_bounds`/`upper_bounds`. Only numeric and temporal types are mapped:
+strings have bounds but projecting them onto a number to compare range *widths*
+would invent a distance that does not exist.
+
+Tests now measure both regimes off real data — one tenant per file gives an
+overlap of exactly 0.0, four tenants in every file exactly 1.0 — and a
+single-file table reports `None` rather than a guess.
+
 ### Still open
 
-- Deriving `Spread` from Iceberg manifest `lower_bounds`/`upper_bounds`, so the
-  gate has evidence without a caller supplying it.
-- Estimating distinct values — a sample of one file, or a Puffin sketch.
-- `Proposal::ceiling_usd` remains a ceiling. It should become an expected
-  saving computed from the advantage, at which point proposals could be ranked
+- Wiring `field_bounds` + `estimate_overlap` into `Optimizer::round`, so the
+  gate gathers its own evidence instead of being handed a `Spread`. Both halves
+  exist and are tested; nothing calls them together yet.
+- `Proposal::ceiling_usd` remains a ceiling. With an advantage available it
+  could become an expected saving, at which point proposals could be ranked
   meaningfully rather than by an upper bound.

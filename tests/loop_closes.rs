@@ -27,8 +27,8 @@ use url::Url;
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
 use quarry::engine::{
-    Declined, Optimizer, Quarry, QuarryTable, build_index, build_proposed_index, hash_scalar,
-    index_id, shared,
+    Declined, Optimizer, Quarry, QuarryTable, build_index, build_proposed_index, estimate_overlap,
+    hash_scalar, index_id, shared,
 };
 use quarry::kinds::Index;
 use quarry::layout::Spread;
@@ -932,5 +932,114 @@ async fn the_gate_refuses_when_it_knows_nothing() {
     assert_eq!(
         round.declined.first().map(|(_, why)| *why),
         Some(Declined::NoEvidence)
+    );
+}
+
+/// The gate deciding from evidence it gathered itself.
+///
+/// Everything above hands the optimizer a `Spread`. Here the overlap is
+/// *measured* off the data, which is the input that removes the need for a
+/// distinct-value count Iceberg does not record.
+#[tokio::test]
+async fn overlap_is_measured_from_two_files_not_the_whole_table() {
+    // The fixture puts one tenant per file, so no two files share a value.
+    let clustered = fixture("spread_clustered");
+    let session = quarry().session();
+    let table = table(&clustered, Registry::new());
+
+    let overlap = estimate_overlap(&session, &table, TENANT_FIELD)
+        .await
+        .expect("estimate")
+        .expect("four files, so there is an overlap to measure");
+    assert_eq!(
+        overlap, 0.0,
+        "one tenant per file means no shared values at all"
+    );
+
+    // Combined with the fixture's disjoint ranges, that is the regime where
+    // the file format already prunes and an index adds nothing.
+    let disjoint: Vec<(f64, f64)> = (1..=4).map(|t| (t as f64, t as f64)).collect();
+    let spread = Spread::from_overlap(4, &disjoint, overlap);
+    assert!(
+        spread.index_advantage_pct() < 10.0,
+        "claimed {}%",
+        spread.index_advantage_pct()
+    );
+}
+
+#[tokio::test]
+async fn a_column_every_file_shares_measures_as_fully_overlapping() {
+    // Every file holds the same handful of values, which is the regime where
+    // an index prunes nothing however selective it looks.
+    let dir = scratch("spread_shared");
+    let mut sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    for index in 0..4 {
+        // The same four tenants in every file.
+        let path = dir.join(format!("{index}.parquet"));
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(file, schema(), None).expect("writer");
+        let tenants: Int64Array = (0..200).map(|row| (row % 4) as i64).collect();
+        let messages: StringArray = (0..200).map(|row| Some(format!("m{row}"))).collect();
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(tenants), Arc::new(messages)])
+            .expect("batch");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let id = FileId(path.to_string_lossy().into_owned());
+        sizes.insert(id.clone(), std::fs::metadata(&path).expect("stat").len());
+        files.push(id);
+    }
+
+    let mut snapshot = Snapshot::root(SnapshotId(1));
+    for file in &files {
+        snapshot = snapshot.with_clean_file(file.clone());
+    }
+    let shared_fixture = Fixture {
+        dir,
+        sizes,
+        graph: SnapshotGraph::new().with(snapshot),
+        files,
+        at: SnapshotId(1),
+    };
+
+    let session = quarry().session();
+    let table = table(&shared_fixture, Registry::new());
+    let overlap = estimate_overlap(&session, &table, TENANT_FIELD)
+        .await
+        .expect("estimate")
+        .expect("four files");
+
+    assert_eq!(overlap, 1.0, "every file holds every value");
+
+    // Ranges overlap too, so this is the SCATTERED regime: an index would be
+    // built, cost storage, and prune nothing.
+    let everywhere: Vec<(f64, f64)> = (0..4).map(|_| (0.0, 3.0)).collect();
+    let spread = Spread::from_overlap(4, &everywhere, overlap);
+    assert_eq!(spread.index_advantage_pct(), 0.0);
+}
+
+#[tokio::test]
+async fn a_single_file_table_has_no_overlap_to_measure() {
+    let dir = scratch("spread_one_file");
+    let (file, size) = write_parquet(&dir, "only.parquet", 1, 100);
+    let fixture = Fixture {
+        dir,
+        sizes: BTreeMap::from([(file.clone(), size)]),
+        graph: SnapshotGraph::new()
+            .with(Snapshot::root(SnapshotId(1)).with_clean_file(file.clone())),
+        files: vec![file],
+        at: SnapshotId(1),
+    };
+
+    let session = quarry().session();
+    let table = table(&fixture, Registry::new());
+    assert!(
+        estimate_overlap(&session, &table, TENANT_FIELD)
+            .await
+            .expect("estimate")
+            .is_none(),
+        "one file cannot overlap with anything, and guessing would be worse"
     );
 }

@@ -110,6 +110,48 @@ impl Spread {
         }
     }
 
+    /// Estimate from per-file ranges and how much two files' value sets share.
+    ///
+    /// # Why this exists alongside [`Spread::from_bounds`]
+    ///
+    /// `from_bounds` wants rows per value, which needs a count of distinct
+    /// values, which Iceberg does not record. Every cheap way of estimating it
+    /// fails on precisely the cases the gate has to separate. Sampling one
+    /// file out of twenty and counting distinct values `d`:
+    ///
+    /// ```text
+    ///                    d      NDV as d    NDV as d x files
+    /// SCATTERED       5,000      5,000       100,000  (true 5,000)
+    /// SELECTIVE      49,900     49,900       998,000  (true 906,341)
+    /// ```
+    ///
+    /// Taking `NDV = d` makes SELECTIVE look worthless; taking `NDV = d x
+    /// files` makes SCATTERED look valuable. Both are wrong, in opposite
+    /// directions, and no constant factor fixes both.
+    ///
+    /// What actually distinguishes them is measurable directly: whether two
+    /// files hold *the same values*. Scattered files share nearly all of them,
+    /// selective files almost none. So
+    ///
+    /// ```text
+    /// files_by_index = 1 + (files - 1) x shared
+    /// ```
+    ///
+    /// where `shared` is the fraction of one file's distinct values also
+    /// present in another — two column reads, no distinct-value count, and it
+    /// estimates the quantity that is actually wanted rather than a proxy for
+    /// it.
+    pub fn from_overlap(files: u64, ranges: &[(f64, f64)], shared: f64) -> Self {
+        let bounds = Spread::from_bounds(files, ranges, f64::MAX);
+        let shared = shared.clamp(0.0, 1.0);
+        let by_index = 1.0 + (files.saturating_sub(1) as f64) * shared;
+        Spread {
+            files,
+            files_by_bounds: bounds.files_by_bounds,
+            files_by_index: by_index.clamp(0.0, bounds.files_by_bounds),
+        }
+    }
+
     /// The fraction of a scan an index removes that the ranges do not.
     ///
     /// Zero when the format already prunes as well as an index could, which is
@@ -274,6 +316,96 @@ mod tests {
             .collect();
         let spread = Spread::from_bounds(10, &ranges, 1_000.0);
         assert!(spread.files_by_index <= spread.files_by_bounds);
+        assert_eq!(spread.index_advantage(), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    fn disjoint(files: u64, span: f64) -> Vec<(f64, f64)> {
+        let width = span / files as f64;
+        (0..files)
+            .map(|file| {
+                let low = file as f64 * width;
+                (low, low + width - 1.0)
+            })
+            .collect()
+    }
+
+    fn everywhere(files: u64, span: f64) -> Vec<(f64, f64)> {
+        (0..files).map(|_| (0.0, span)).collect()
+    }
+
+    /// The three measured regimes, using the input that can actually be
+    /// obtained: how much two files' value sets share.
+    #[test]
+    fn overlap_separates_all_three_regimes() {
+        // CLUSTERED: files partition the domain, so they share no values —
+        // but the ranges alone already reach one file, so an index adds
+        // nothing.
+        let clustered = Spread::from_overlap(20, &disjoint(20, 5_000.0), 0.0);
+        assert!(
+            clustered.index_advantage_pct() < 10.0,
+            "clustered claimed {}%",
+            clustered.index_advantage_pct()
+        );
+
+        // SCATTERED: every file holds every value, so two files share all of
+        // them and an index cannot narrow anything.
+        let scattered = Spread::from_overlap(20, &everywhere(20, 5_000.0), 1.0);
+        assert_eq!(scattered.index_advantage_pct(), 0.0);
+
+        // SELECTIVE: ranges overlap totally, yet two files share almost no
+        // values, so an index pins one file where ranges pin twenty.
+        let selective = Spread::from_overlap(20, &everywhere(20, 5_000_000.0), 0.01);
+        assert!(
+            selective.index_advantage_pct() > 90.0,
+            "selective claimed {}%",
+            selective.index_advantage_pct()
+        );
+    }
+
+    #[test]
+    fn it_agrees_with_the_measured_savings() {
+        // Realized: 1.1%, 0.0%, 95.0%.
+        let selective = Spread::from_overlap(20, &everywhere(20, 5_000_000.0), 0.01);
+        assert!((selective.index_advantage_pct() - 95.0).abs() < 6.0);
+    }
+
+    #[test]
+    fn partial_overlap_lands_in_between() {
+        let half = Spread::from_overlap(20, &everywhere(20, 1_000.0), 0.5);
+        let advantage = half.index_advantage_pct();
+        assert!(
+            (30.0..70.0).contains(&advantage),
+            "half-shared values should give a middling advantage, got {advantage}%"
+        );
+    }
+
+    #[test]
+    fn an_index_never_beats_what_it_is_capped_at() {
+        // Disjoint ranges already reach one file; no overlap figure should let
+        // an index claim to do better than that.
+        let spread = Spread::from_overlap(20, &disjoint(20, 5_000.0), 0.0);
+        assert!(spread.files_by_index <= spread.files_by_bounds);
+        assert_eq!(spread.index_advantage(), 0.0);
+    }
+
+    #[test]
+    fn nonsense_overlap_is_clamped() {
+        for shared in [-1.0, 2.0, f64::NAN.max(0.0)] {
+            let spread = Spread::from_overlap(20, &everywhere(20, 100.0), shared);
+            assert!(spread.files_by_index >= 0.0);
+            assert!(spread.index_advantage() >= 0.0);
+            assert!(spread.index_advantage() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn a_single_file_table_gains_nothing_from_an_index() {
+        let spread = Spread::from_overlap(1, &everywhere(1, 100.0), 0.0);
         assert_eq!(spread.index_advantage(), 0.0);
     }
 }

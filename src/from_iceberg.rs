@@ -38,6 +38,7 @@ use std::hash::{Hash, Hasher};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataContentType, ManifestStatus, TableMetadata};
 
+use crate::derived::FieldId;
 use crate::snapshot::{DeleteState, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 
 /// The table's identity, independent of its name.
@@ -124,6 +125,67 @@ pub async fn live_data_files(
     };
     let contents = read_snapshot(snapshot, metadata, file_io).await?;
     Ok(contents.sizes)
+}
+
+/// Per-file value ranges for one field, as the manifests record them.
+///
+/// The input the index gate needs, and it costs nothing to obtain: Iceberg
+/// already stores a lower and upper bound per field per data file, so whether
+/// an index could beat the format's own pruning is answerable from metadata
+/// alone. See [`Spread`](crate::layout::Spread).
+///
+/// Files that record no bound for the field are omitted, which the estimate
+/// treats as files that must always be read — so a table with no statistics
+/// degrades to "assume the worst" rather than to a wrong answer.
+///
+/// Only orderable numeric and temporal types are mapped. Strings and binary
+/// are left out: they have bounds, but projecting them onto a number to
+/// compare range *widths* would invent a distance that does not exist.
+pub async fn field_bounds(
+    metadata: &TableMetadata,
+    file_io: &FileIO,
+    at: SnapshotId,
+    field: FieldId,
+) -> iceberg::Result<Vec<(f64, f64)>> {
+    let Some(snapshot) = metadata.snapshot_by_id(at.0) else {
+        return Ok(Vec::new());
+    };
+
+    let mut ranges = Vec::new();
+    let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file.load_manifest(file_io).await?;
+        for entry in manifest.entries() {
+            if entry.status() == ManifestStatus::Deleted {
+                continue;
+            }
+            let data_file = entry.data_file();
+            if data_file.content_type() != DataContentType::Data {
+                continue;
+            }
+            let key = field as i32;
+            let low = data_file.lower_bounds().get(&key).and_then(as_number);
+            let high = data_file.upper_bounds().get(&key).and_then(as_number);
+            if let (Some(low), Some(high)) = (low, high) {
+                ranges.push((low, high));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// One bound as a number, if the type has a meaningful distance.
+fn as_number(bound: &iceberg::spec::Datum) -> Option<f64> {
+    use iceberg::spec::PrimitiveLiteral;
+    match bound.literal() {
+        PrimitiveLiteral::Int(value) => Some(*value as f64),
+        PrimitiveLiteral::Long(value) => Some(*value as f64),
+        PrimitiveLiteral::Float(value) => Some(value.into_inner() as f64),
+        PrimitiveLiteral::Double(value) => Some(value.into_inner()),
+        // Booleans, strings, binary, decimals and UUIDs are ordered but have
+        // no distance that range widths could be compared across.
+        _ => None,
+    }
 }
 
 struct Contents {
