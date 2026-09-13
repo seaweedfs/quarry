@@ -21,8 +21,12 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+use datafusion::parquet::file::statistics::Statistics;
 use datafusion::physical_plan::collect;
 use datafusion::scalar::ScalarValue;
+use object_store::path::Path as ObjectPath;
 
 use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
 use crate::kinds::Index;
@@ -214,6 +218,82 @@ pub async fn estimate_overlap(
         }
     }
     Ok(Some(total / pairs as f64))
+}
+
+/// Per-file value ranges for `field`, read from the Parquet footers.
+///
+/// The other half of what the index gate needs, for tables that do not come
+/// from a catalog. Iceberg records these bounds in its manifests and they cost
+/// nothing to read; a plain Parquet table has them too, in each file's footer,
+/// and without them the gate has to decline every proposal.
+///
+/// Only footers are read — a few kilobytes per file, no column data — so this
+/// stays far cheaper than the build it informs.
+///
+/// A file whose footer records no statistics for the column is **omitted**
+/// rather than guessed at, and [`Spread`](crate::layout::Spread) treats a
+/// missing range as a file that must always be read. Assuming a range would
+/// claim the format prunes something it does not.
+pub async fn parquet_bounds(
+    session: &Session,
+    table: &QuarryTable,
+    field: FieldId,
+) -> DfResult<Vec<(f64, f64)>> {
+    let Some(column) = table.column_of(field) else {
+        return exec_err!("field {field} is not a column of this table");
+    };
+    let Some((url, files)) = table.parquet_files() else {
+        return Ok(Vec::new());
+    };
+    let store = session.context().runtime_env().object_store(url)?;
+
+    let schema = datafusion::catalog::TableProvider::schema(table);
+    let Some((position, _)) = schema.column_with_name(column) else {
+        return exec_err!("column {column} is not in the table's schema");
+    };
+
+    let mut ranges = Vec::new();
+    for (file, size) in files {
+        let mut reader =
+            ParquetObjectReader::new(Arc::clone(&store), ObjectPath::from(file.0.as_str()))
+                .with_file_size(*size);
+        let Ok(metadata) = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await
+        else {
+            continue; // Not readable as Parquet; the caller will treat it as unknown.
+        };
+
+        // A file's range is the union of its row groups' ranges.
+        let mut low = f64::MAX;
+        let mut high = f64::MIN;
+        for group in metadata.metadata().row_groups() {
+            let Some(statistics) = group.columns().get(position).and_then(|c| c.statistics())
+            else {
+                continue;
+            };
+            if let Some((group_low, group_high)) = numeric_range(statistics) {
+                low = low.min(group_low);
+                high = high.max(group_high);
+            }
+        }
+        if low <= high {
+            ranges.push((low, high));
+        }
+    }
+    Ok(ranges)
+}
+
+/// One column chunk's range, if the type has a meaningful distance.
+///
+/// Booleans, strings and byte arrays are ordered but have no distance that
+/// range *widths* could be compared across, which is what the estimate needs.
+fn numeric_range(statistics: &Statistics) -> Option<(f64, f64)> {
+    match statistics {
+        Statistics::Int32(values) => Some((*values.min_opt()? as f64, *values.max_opt()? as f64)),
+        Statistics::Int64(values) => Some((*values.min_opt()? as f64, *values.max_opt()? as f64)),
+        Statistics::Float(values) => Some((*values.min_opt()? as f64, *values.max_opt()? as f64)),
+        Statistics::Double(values) => Some((*values.min_opt()?, *values.max_opt()?)),
+        _ => None,
+    }
 }
 
 /// Every non-null value of one column of one object, hashed.

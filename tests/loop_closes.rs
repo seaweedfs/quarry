@@ -28,7 +28,7 @@ use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
 use quarry::engine::{
     Declined, Optimizer, Quarry, QuarryTable, build_index, build_proposed_index, estimate_overlap,
-    hash_scalar, index_id, shared,
+    hash_scalar, index_id, parquet_bounds, shared,
 };
 use quarry::kinds::Index;
 use quarry::layout::Spread;
@@ -901,15 +901,24 @@ async fn the_gate_allows_an_index_the_format_cannot_replace() {
     assert_eq!(round.built.len(), 1, "should build: {round:?}");
 }
 
+/// A plain Parquet table, with no catalog, still gets judged.
+///
+/// This used to assert `NoEvidence`: the table carries no manifest bounds, so
+/// the gate had nothing to go on and declined to judge. Parquet keeps the same
+/// statistics in each file's footer, so there was never really nothing to go
+/// on — only nothing already in hand.
 #[tokio::test]
-async fn the_gate_refuses_when_it_knows_nothing() {
-    // Building on no evidence is what measurement showed to be wrong, so the
-    // default is to decline and say so rather than to hope.
-    let fixture = fixture("loop_gate_blind");
+async fn the_gate_reads_bounds_from_parquet_footers_without_a_catalog() {
+    let fixture = fixture("loop_gate_footers");
     let sql = "SELECT * FROM events WHERE tenant_id = 1";
 
     let registry = shared(Registry::new());
     let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    assert!(
+        served.bounds_of(TENANT_FIELD).is_none(),
+        "a hand-built table carries no catalog bounds"
+    );
+
     let mut optimizer = Optimizer::new(
         Arc::clone(&registry),
         Policy::automatic(1 << 30).with_min_queries(3),
@@ -927,6 +936,52 @@ async fn the_gate_refuses_when_it_knows_nothing() {
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
+
+    // The footers say each file holds one tenant, so the format already
+    // prunes and an index adds nothing. A judgement, not a shrug.
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty());
+    assert_eq!(
+        round.declined.first().map(|(_, why)| *why),
+        Some(Declined::NoAdvantage),
+        "footers should have supplied the evidence: {round:?}"
+    );
+}
+
+/// Footers alone are not always enough, and then it still declines.
+#[tokio::test]
+async fn a_field_whose_bounds_have_no_distance_yields_no_evidence() {
+    // `message` is a string. Parquet records bounds for it, but comparing the
+    // *width* of two string ranges would invent a distance that does not
+    // exist, so the estimate refuses them — and without ranges there is no
+    // way to tell what the format already prunes.
+    let fixture = fixture("loop_gate_strings");
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30).with_min_queries(3),
+    )
+    .for_reader(POLICY);
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        optimizer.observe(observation_on(MESSAGE_FIELD, 1_000_000));
+    }
+
+    assert!(
+        parquet_bounds(&session, &served, MESSAGE_FIELD)
+            .await
+            .expect("read footers")
+            .is_empty(),
+        "string bounds have no comparable width"
+    );
 
     let round = optimizer.round(&session, &served).await;
     assert!(round.built.is_empty());

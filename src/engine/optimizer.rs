@@ -30,6 +30,7 @@ use crate::workload::{Observation, Policy, Proposal, Workload};
 
 use super::{
     QuarryTable, Session, SharedRegistry, build_proposed_index, estimate_overlap, index_id,
+    parquet_bounds,
 };
 
 /// What one round did, or would have done.
@@ -379,11 +380,11 @@ impl Optimizer {
     /// value overlap     measured from two files, not the whole table
     /// ```
     ///
-    /// `None` when the ranges are missing, which is the honest answer rather
-    /// than the convenient one. Absent bounds would make the format look as
-    /// though it prunes nothing, and an index maximally valuable — optimistic
-    /// in exactly the direction that produced the useless indexes to begin
-    /// with. A caller who knows better can still say so with
+    /// `None` when the ranges cannot be had at all, which is the honest answer
+    /// rather than the convenient one. Absent bounds would make the format
+    /// look as though it prunes nothing, and an index maximally valuable —
+    /// optimistic in exactly the direction that produced the useless indexes
+    /// to begin with. A caller who knows better can still say so with
     /// [`Optimizer::with_spreads`].
     async fn evidence(
         &self,
@@ -394,7 +395,18 @@ impl Optimizer {
         if let Some(supplied) = self.spread(field) {
             return Some(supplied);
         }
-        let ranges = table.bounds_of(field)?.to_vec();
+
+        // From the catalog if the table came with them, otherwise from the
+        // Parquet footers. Both describe the same thing; the catalog's copy is
+        // simply already in hand, while footers cost a small read per file.
+        let ranges = match table.bounds_of(field) {
+            Some(ranges) => ranges.to_vec(),
+            None => parquet_bounds(session, table, field).await.ok()?,
+        };
+        if ranges.is_empty() {
+            return None;
+        }
+
         let overlap = estimate_overlap(session, table, field).await.ok()??;
         Some(Spread::from_overlap(table.file_count(), &ranges, overlap))
     }

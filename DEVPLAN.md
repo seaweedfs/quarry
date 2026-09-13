@@ -1196,10 +1196,8 @@ genuine Iceberg table, default policy, nothing supplied, and it reaches
 
 ### Still open
 
-- Bounds for non-Iceberg Parquet tables, from footer statistics. Without them
-  the gate declines on a plain Parquet table.
-- Bounds for non-Iceberg Parquet tables, from footer statistics. Without them
-  the gate declines on a plain Parquet table.
+
+
 
 
 
@@ -1303,3 +1301,35 @@ The first version used 1000 MB at 15% against 30 MB at 95%, which the ceiling
 and the expected saving *agree* on — 150 against 28.5. It would have passed
 whether or not the ranking worked. Caught only because the assertion comparing
 the two expected values failed before reaching the interesting part.
+
+
+---
+
+## Phase 17 — Bounds without a catalog `[x]`
+
+The gate declined every proposal on a plain Parquet table, because per-file
+ranges only arrived with Iceberg manifests. That confined self-optimization to
+tables behind a catalog.
+
+Parquet keeps the same statistics in every file's footer. So there was never
+really nothing to go on — only nothing already in hand.
+
+`parquet_bounds` reads footers, a few kilobytes per file and no column data,
+and takes the union of each file's row-group ranges. `evidence` uses the
+catalog's copy when the table came with one and falls back to footers
+otherwise; both describe the same thing.
+
+### A test asserted the old limitation and had to be rewritten
+
+`the_gate_refuses_when_it_knows_nothing` began failing with `NoAdvantage` where
+it expected `NoEvidence` — the gate now *had* evidence and reached a judgement.
+Strictly better, and the test was encoding a limitation rather than a
+requirement. It is now
+`the_gate_reads_bounds_from_parquet_footers_without_a_catalog` and asserts the
+judgement.
+
+`NoEvidence` is still reachable and still tested, on a **string** column:
+Parquet records bounds for it, but comparing the *width* of two string ranges
+would invent a distance that does not exist, so the estimate refuses them.
+Types whose values are ordered but not measurable get no automatic index,
+which is a real limitation and an honest one.
