@@ -307,7 +307,7 @@ behind `--features engine`.
 - [x] `RangeCache`: read-through cache for object ranges
 - [x] `Quarry` / `Session`: one place that assembles the stack
 - [x] `from_iceberg`: a `SnapshotGraph` derived from real Iceberg metadata
-- [ ] Wire a real Iceberg table end to end through `QuarryTable`
+- [x] `table_from_iceberg`: SQL over a real Iceberg table, planned by the rule
 - [ ] Iceberg REST catalog client
 
 **Design constraint.** Use DataFusion's own extension points —
@@ -486,6 +486,26 @@ possible; equality deletes apply by value across a partition, so exact
 attribution is not generally available. Over-invalidation is the safe
 direction: a delete anywhere makes every substituting piece look stale, while
 pruning keeps working because pruning tolerates any change.
+
+**The two halves joined without either side changing.** `table_from_iceberg`
+is about twenty lines: take the Arrow schema and field ids from Iceberg's
+schema, the graph from `snapshot_graph`, the file list from `live_data_files`,
+and hand them to `QuarryTable`. That it needed no change on either side is the
+useful signal — if joining them had forced one, the boundary would have been in
+the wrong place.
+
+`SELECT * FROM events WHERE tenant_id = 1` over a genuine Iceberg table now
+reads only the Parquet objects an index admits. The test deletes the excluded
+object first, so the query would fail rather than merely slow down if the plan
+reached for it.
+
+**One identity for a file path.** Iceberg records data file locations as URIs;
+an object store addresses them as paths *within* a store named separately. So
+`object_path` strips the scheme and authority — `s3://bucket/data/a.parquet`
+becomes `data/a.parquet`, and the bucket travels with the store's URL. Doing it
+once, in the bridge, means `FileId` means the same thing to the rule and to the
+scan, and neither converts. This was a latent mismatch: the engine tests had
+been using absolute local paths, which happened to work.
 
 **One API trap worth recording.** `ManifestWriter::add_delete_file` reads as
 though it adds a delete file. It does not — it sets the entry's status to

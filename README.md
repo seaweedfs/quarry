@@ -16,18 +16,18 @@ Everything else is derived, priced, and disposable.
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
 decision core is 98 tests with **no dependencies**. Two optional features add
-58 more: `engine` brings DataFusion and SQL over real Parquet, `iceberg` brings
-real table metadata.
+67 more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
+table metadata, and together they query a genuine Iceberg table.
 
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features engine,iceberg   # 156 tests
+cargo test --features engine,iceberg   # 165 tests
 cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 
-`SELECT * FROM events WHERE tenant_id = 1` reads only the Parquet objects an
-index says can match — measurably fewer bytes off the store — and still returns
+`SELECT * FROM events WHERE tenant_id = 1`, over a real Iceberg table, reads
+only the Parquet objects an index says can match — measurably fewer bytes off the store — and still returns
 every row when that index is stale, is refused outright when it was built on a
 rolled-back branch, and never opens a file that compaction removed. A byte
 budget aborts the scan rather than quietly returning fewer rows. Run the same
@@ -56,6 +56,7 @@ src/
     index.rs          equality on one field, prunes files (pruning)
   engine/             behind --features engine
     table.rs          a DataFusion TableProvider planned by the rule
+    iceberg_table.rs  a QuarryTable over a real Iceberg table
     materialized.rs   a Kind holding Arrow batches, defined outside the core
     store.rs          an object store that counts bytes and enforces budgets
     cache.rs          a read-through cache for ranges of immutable objects
@@ -66,6 +67,7 @@ tests/
   engine_sql.rs     SQL through DataFusion, asserting which files were read
   engine_parquet.rs real Parquet on an object store, selected by the rule
   iceberg_bridge.rs a genuine Iceberg table: metadata, manifest lists, manifests
+  iceberg_sql.rs    SQL over that table, with the rule choosing objects
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place

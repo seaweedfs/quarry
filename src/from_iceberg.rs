@@ -48,6 +48,31 @@ pub fn table_id(metadata: &TableMetadata) -> TableId {
     TableId(metadata.uuid().to_string())
 }
 
+/// The path a storage layer would use for a file Iceberg records.
+///
+/// Iceberg records data file locations as URIs, which the object store
+/// addresses as a path *within* a store identified separately. So
+/// `s3://bucket/data/a.parquet` becomes `data/a.parquet`, and the bucket is
+/// carried by the store's own URL.
+///
+/// This is the one place catalog identity and storage identity are reconciled,
+/// and doing it here means [`FileId`] means the same thing everywhere: the rule
+/// reasons about it, and the scan reads it, without either converting.
+pub fn object_path(file_path: &str) -> String {
+    match file_path.find("://") {
+        None => file_path.to_owned(),
+        Some(scheme_end) => {
+            let after_scheme = &file_path[scheme_end + 3..];
+            match after_scheme.find('/') {
+                // scheme://authority/path → path
+                Some(authority_end) => after_scheme[authority_end + 1..].to_owned(),
+                // scheme://authority with no path at all
+                None => String::new(),
+            }
+        }
+    }
+}
+
 /// The snapshot a query would read by default.
 pub fn current_snapshot(metadata: &TableMetadata) -> Option<SnapshotId> {
     metadata
@@ -130,7 +155,7 @@ async fn read_snapshot(
             let data_file = entry.data_file();
             match data_file.content_type() {
                 DataContentType::Data => {
-                    let id = FileId(data_file.file_path().to_owned());
+                    let id = FileId(object_path(data_file.file_path()));
                     contents
                         .sizes
                         .insert(id.clone(), data_file.file_size_in_bytes());
@@ -139,7 +164,7 @@ async fn read_snapshot(
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
                     contents
                         .delete_files
-                        .insert(data_file.file_path().to_owned());
+                        .insert(object_path(data_file.file_path()));
                 }
             }
         }
@@ -168,6 +193,29 @@ fn fingerprint(delete_files: &BTreeSet<String>) -> DeleteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_path_is_left_alone() {
+        assert_eq!(
+            object_path("/tmp/table/data/a.parquet"),
+            "/tmp/table/data/a.parquet"
+        );
+        assert_eq!(object_path("data/a.parquet"), "data/a.parquet");
+    }
+
+    #[test]
+    fn a_uri_loses_its_scheme_and_authority() {
+        // The authority is carried by the object store's own URL, so the path
+        // here is the path within that store.
+        assert_eq!(object_path("s3://bucket/data/a.parquet"), "data/a.parquet");
+        assert_eq!(object_path("file:///tmp/t/a.parquet"), "tmp/t/a.parquet");
+        assert_eq!(object_path("gs://b/x/y.parquet"), "x/y.parquet");
+    }
+
+    #[test]
+    fn a_uri_with_no_path_yields_nothing_rather_than_panicking() {
+        assert_eq!(object_path("s3://bucket"), "");
+    }
 
     #[test]
     fn an_empty_delete_set_is_clean() {
