@@ -77,6 +77,31 @@ impl Index {
         self.bytes
     }
 
+    /// Exactly how many bytes this index occupies when written down.
+    ///
+    /// Computed, not estimated, because it is what a storage budget is
+    /// enforced against. The previous estimate — a flat 16 bytes per posting —
+    /// measured 5.7x low against real data, so a "5% of the table" ceiling
+    /// really admitted about 30%.
+    ///
+    /// It also has to agree with what a *recovered* index reports, which is
+    /// the length of the blob it was read from. Otherwise the same index is
+    /// sized differently either side of a restart, and retirement and the
+    /// budget change their minds for no reason. A test in `engine::persist`
+    /// asserts the encoder produces exactly this many bytes.
+    ///
+    /// Most of it is file paths, one copy per posting.
+    pub fn encoded_len(&self) -> u64 {
+        let mut total = 8; // the number of values
+        for files in self.postings.values() {
+            total += 8 + 8; // the hashed value, and how many files hold it
+            for file in files {
+                total += 8 + file.0.len() as u64; // the path, and its length
+            }
+        }
+        total
+    }
+
     /// Every hashed value and the files holding it, in a fixed order.
     ///
     /// Ordered because it is written to storage: a `BTreeMap` makes the bytes

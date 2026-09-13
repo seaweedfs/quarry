@@ -30,13 +30,6 @@ use crate::snapshot::FileId;
 
 use super::{QuarryTable, Session, hash_scalar};
 
-/// Roughly what a posting costs on disk.
-///
-/// A hashed value and a file reference. Used only to price the index against
-/// what it saves, so an order of magnitude is enough; an on-disk format would
-/// replace this with its actual size.
-const BYTES_PER_POSTING: u64 = 16;
-
 /// Build an index over `field` by reading that column from `table`'s objects.
 ///
 /// Reads only the indexed column. Null values are skipped: `x = NULL` matches
@@ -63,7 +56,6 @@ pub async fn build_index(
     };
 
     let mut index = Index::new(field);
-    let mut postings = 0u64;
 
     for (file, size) in files {
         // One value may appear in many row groups; recording it once per file
@@ -72,12 +64,15 @@ pub async fn build_index(
         for value in read_column(session, url, &schema, position, file, *size).await? {
             if seen.insert(value) {
                 index.insert(value, file.clone());
-                postings += 1;
             }
         }
     }
 
-    Ok(index.with_bytes(postings.saturating_mul(BYTES_PER_POSTING)))
+    // The exact encoded size, not an estimate: this is what the storage
+    // budget is enforced against, and it must match what a recovered index
+    // reports or the two disagree across a restart.
+    let bytes = index.encoded_len();
+    Ok(index.with_bytes(bytes))
 }
 
 /// Build the index a proposal asked for, ready to register.

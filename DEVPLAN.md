@@ -1010,12 +1010,17 @@ the files it skipped were ones Parquet was already reading almost nothing from.
 The index's real value is confined to the case where a value is rare *and*
 ranges overlap, which is exactly the SELECTIVE regime.
 
-**3. `bytes_estimate` is wrong by 5.7x.** `BYTES_PER_POSTING = 16` against
-77–92 bytes measured. The budget — `optimize_budget_pct` — is enforced against
-that number, so a "5% of table" ceiling really admits about 30%. And a
-*recovered* index reports its true encoded length while a freshly built one
-reports the estimate, so the same index is sized differently either side of a
+**3. `bytes_estimate` was wrong by 5.7x — fixed.** `BYTES_PER_POSTING = 16`
+against 77–92 bytes measured. The budget — `optimize_budget_pct` — is enforced
+against that number, so a "5% of table" ceiling really admitted about 30%. And
+a *recovered* index reported its true encoded length while a freshly built one
+reported the estimate, so the same index was sized differently either side of a
 restart.
+
+`Index::encoded_len` now computes the exact figure instead, and a test asserts
+the encoder produces precisely that many bytes, since the two must agree or the
+budget changes its mind across a restart. Re-running the measurement confirms
+it: reported size now equals encoded size in all three regimes.
 
 **4. Most of a posting is a file path.** 91 bytes per posting, of which 8 is the
 hashed value and the rest is a path repeated once per posting. Interning paths

@@ -794,6 +794,27 @@ mod tests {
     }
 
     #[test]
+    fn the_encoder_produces_exactly_the_size_the_index_reports() {
+        // `Index::encoded_len` is what the storage budget is enforced against,
+        // and what a freshly built index reports. A recovered one reports the
+        // length of the blob it was read from. If these two ever disagree, the
+        // same index is sized differently either side of a restart.
+        for pairs in [
+            &[][..],
+            &[(1, "a.parquet")][..],
+            &[(1, "a.parquet"), (1, "c.parquet"), (2, "b.parquet")][..],
+            &[(7, "a/very/long/path/to/an/object/somewhere.parquet")][..],
+        ] {
+            let index = index_of(pairs);
+            assert_eq!(
+                encode(&index).len() as u64,
+                index.encoded_len(),
+                "disagreement for {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_index_survives_a_round_trip() {
         let index = index_of(&[(1, "a.parquet"), (1, "c.parquet"), (2, "b.parquet")]);
         let decoded = decode(4, &encode(&index)).expect("decodes");
