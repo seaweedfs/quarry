@@ -27,10 +27,11 @@ use url::Url;
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
 use quarry::engine::{
-    Optimizer, Quarry, QuarryTable, build_index, build_proposed_index, hash_scalar, index_id,
-    shared,
+    Declined, Optimizer, Quarry, QuarryTable, build_index, build_proposed_index, hash_scalar,
+    index_id, shared,
 };
 use quarry::kinds::Index;
+use quarry::layout::Spread;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 use quarry::workload::{Policy, Workload};
@@ -153,6 +154,24 @@ fn table(fixture: &Fixture, registry: Registry) -> QuarryTable {
         table = table.with_parquet_file(file.clone(), *size);
     }
     table
+}
+
+/// A policy for the tests that exercise the loop's *mechanism*.
+///
+/// `min_index_advantage_pct: 0.0` switches off the gate that asks whether an
+/// index beats the file format's own pruning. These tests are about
+/// propose/build/refresh/retire working at all, and this fixture puts one
+/// tenant in each file — perfectly disjoint ranges, which is precisely the
+/// case where measurement says an index is *not* worth building. Leaving the
+/// gate on would make them all decline, correctly, and test nothing.
+///
+/// The judgement itself is covered by `layout.rs` and by
+/// `the_gate_refuses_an_index_the_format_makes_redundant` below.
+fn mechanism_policy(base: Policy) -> Policy {
+    Policy {
+        min_index_advantage_pct: 0.0,
+        ..base
+    }
 }
 
 fn quarry() -> Quarry {
@@ -320,7 +339,7 @@ async fn the_optimizer_runs_the_loop_on_its_own() {
 
     let mut optimizer = Optimizer::new(
         Arc::clone(&registry),
-        Policy::automatic_pct(table_bytes, 5.0).with_min_queries(3),
+        mechanism_policy(Policy::automatic_pct(table_bytes, 5.0).with_min_queries(3)),
     )
     .for_reader(POLICY);
 
@@ -425,7 +444,7 @@ async fn a_budget_of_nothing_declines_the_build() {
     // Automatic, but with no room to keep anything.
     let mut optimizer = Optimizer::new(
         Arc::clone(&registry),
-        Policy::automatic(0).with_min_queries(3),
+        mechanism_policy(Policy::automatic(0).with_min_queries(3)),
     );
 
     let quarry = quarry();
@@ -481,10 +500,10 @@ async fn a_stale_index_is_refreshed_when_the_table_grows() {
     let mut optimizer = Optimizer::new(
         Arc::clone(&registry),
         // A tenth of the table is as far behind as an index may fall.
-        Policy {
+        mechanism_policy(Policy {
             max_residual_pct: 10.0,
             ..Policy::automatic(1 << 30).with_min_queries(3)
-        },
+        }),
     )
     .for_reader(POLICY);
 
@@ -576,10 +595,10 @@ async fn a_small_append_does_not_trigger_a_rebuild() {
 
     let mut optimizer = Optimizer::new(
         Arc::clone(&registry),
-        Policy {
+        mechanism_policy(Policy {
             max_residual_pct: 25.0,
             ..Policy::automatic(1 << 30).with_min_queries(3)
-        },
+        }),
     )
     .for_reader(POLICY);
 
@@ -786,5 +805,132 @@ async fn the_measured_saving_matches_the_files_avoided() {
     assert_eq!(
         credited.bytes_if_full_scan, total,
         "the baseline is the whole table, known from file sizes"
+    );
+}
+
+/// The judgement the measurement said was missing.
+///
+/// `examples/measure.rs` found three regimes where the loop built an index
+/// with equal enthusiasm and one of them saved 95% of a scan while two saved
+/// nothing. The gate is what tells them apart, from evidence available before
+/// anything is built.
+#[tokio::test]
+async fn the_gate_refuses_an_index_the_format_makes_redundant() {
+    let fixture = fixture("loop_gate");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    // This fixture puts one tenant in each file, so per-file ranges are
+    // disjoint: exactly the CLUSTERED regime, where Parquet's own row-group
+    // statistics already skip the files an index would skip.
+    let disjoint: Vec<(f64, f64)> = (1..=4).map(|t| (t as f64, t as f64)).collect();
+    let clustered = Spread::from_bounds(4, &disjoint, 500.0);
+    assert!(
+        clustered.index_advantage_pct() < 10.0,
+        "disjoint ranges should show no advantage, got {}%",
+        clustered.index_advantage_pct()
+    );
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30).with_min_queries(3),
+    )
+    .for_reader(POLICY)
+    .with_spreads(BTreeMap::from([(TENANT_FIELD, clustered)]));
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    // It still wants an index — the shape goes unaided — and refuses anyway.
+    assert_eq!(optimizer.proposals().len(), 1, "the shape is unaided");
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty(), "must not build: {round:?}");
+    assert_eq!(
+        round.declined.first().map(|(_, why)| *why),
+        Some(Declined::NoAdvantage),
+        "and it should say why: {round:?}"
+    );
+    assert_eq!(registry.read().expect("lock").len(), 0);
+}
+
+#[tokio::test]
+async fn the_gate_allows_an_index_the_format_cannot_replace() {
+    let fixture = fixture("loop_gate_allows");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    // The SELECTIVE regime: every file's range spans the whole domain, so
+    // ranges prune nothing, and a value occupies about one file.
+    let overlapping: Vec<(f64, f64)> = (0..4).map(|_| (0.0, 5_000_000.0)).collect();
+    let selective = Spread::from_bounds(4, &overlapping, 1.1);
+    assert!(selective.index_advantage_pct() > 50.0);
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30).with_min_queries(3),
+    )
+    .for_reader(POLICY)
+    .with_spreads(BTreeMap::from([(TENANT_FIELD, selective)]));
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "should build: {round:?}");
+}
+
+#[tokio::test]
+async fn the_gate_refuses_when_it_knows_nothing() {
+    // Building on no evidence is what measurement showed to be wrong, so the
+    // default is to decline and say so rather than to hope.
+    let fixture = fixture("loop_gate_blind");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30).with_min_queries(3),
+    )
+    .for_reader(POLICY);
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty());
+    assert_eq!(
+        round.declined.first().map(|(_, why)| *why),
+        Some(Declined::NoEvidence)
     );
 }

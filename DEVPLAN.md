@@ -990,7 +990,7 @@ SELECTIVE            67.8% of tbl  19/20    95.0%         1x  (accurate)
 
 ### Four findings, in order of how much they matter
 
-**1. The proposer cannot tell the useful case from the useless ones.**
+**1. The proposer could not tell the useful case from the useless ones — fixed.**
 `ceiling_usd` assumes perfect selectivity, and across these three it is 1775x
 optimistic, unboundedly optimistic, and exactly right — in that order. The loop
 would build the two worthless indexes as eagerly as the valuable one. This is
@@ -1048,3 +1048,78 @@ ones — which is finding 1 again, and the reason it is finding 1.
 
 Building allocates a `ScalarValue` per row, which looked like a scaling
 problem. A million rows indexes in 0.05–0.64s. Not worth optimising.
+
+
+---
+
+## Phase 14 — Judgement `[~]`
+
+The measurement's worst finding was not a bug. The loop would build an index
+that saves 95% of a scan and two that save nothing, with equal enthusiasm:
+`ceiling_usd` assumes perfect selectivity, so it was 1775x optimistic,
+unboundedly optimistic, and exactly right, in that order.
+
+### Selectivity cannot decide it
+
+```text
+             files per value   bytes saved
+CLUSTERED         1.0            1.1%
+SELECTIVE         1.1           95.0%
+```
+
+Nearly identical selectivity, opposite conclusions. What separates them is that
+on clustered data **Parquet's own row-group statistics already prune** — the
+index skips files the reader was barely touching.
+
+So the question is not "how selective is this field" but "how much better than
+per-file min/max ranges can an index do". `layout::Spread` answers it:
+
+```text
+files_by_bounds = sum of range widths / width of their union
+                  1 when files partition the domain, N when all overlap
+
+files_by_index  = min(files_by_bounds, rows per value)
+
+advantage       = (files_by_bounds - files_by_index) / files
+```
+
+Against the three measured regimes that gives ~0%, 0% and ~94.5%, versus
+realized savings of 1.1%, 0.0% and 95.0%. A test asserts the agreement, so if
+the estimator drifts from what was measured it fails.
+
+`Policy::min_index_advantage_pct` gates on it, and a round now declines with
+`Declined::NoAdvantage`.
+
+### Refusing without evidence, and what that costs
+
+Rows per value needs a count of distinct values, which Iceberg does not record.
+`Spread` takes it as an input rather than inventing it, so the requirement is
+visible rather than buried in a constant.
+
+The consequence is deliberate and worth stating plainly: with the default
+policy, an optimizer given **no** layout evidence declines everything with
+`Declined::NoEvidence`. Building on hope is what measurement showed to be
+wrong, and a useless index costs a build and storage forever. But it also means
+**the loop does nothing until per-field bounds are plumbed in** — which is the
+next piece of work, not a property to be happy about.
+
+### The fixture tests had to opt out, which is itself a finding
+
+Four existing tests started declining, correctly: the fixture puts one tenant
+per file, so its ranges are perfectly disjoint — the exact case where an index
+is redundant. They now pass `mechanism_policy`, which sets the threshold to
+zero, with a comment saying they test propose/build/refresh/retire rather than
+the judgement.
+
+That those tests were demonstrating the loop building a worthless index, and
+had been read as evidence it worked, is the clearest illustration of why the
+measurement was worth doing before more features.
+
+### Still open
+
+- Deriving `Spread` from Iceberg manifest `lower_bounds`/`upper_bounds`, so the
+  gate has evidence without a caller supplying it.
+- Estimating distinct values — a sample of one file, or a Puffin sketch.
+- `Proposal::ceiling_usd` remains a ceiling. It should become an expected
+  saving computed from the advantage, at which point proposals could be ranked
+  meaningfully rather than by an upper bound.

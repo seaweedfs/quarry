@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
+use crate::layout::Spread;
 use crate::workload::{Observation, Policy, Proposal, Workload};
 
 use super::{QuarryTable, Session, SharedRegistry, build_proposed_index, index_id};
@@ -62,6 +63,18 @@ pub enum Declined {
     RoundFull,
     /// The build itself failed.
     BuildFailed,
+    /// The file format's own pruning is already about as good.
+    ///
+    /// Measurement found this to be the common case rather than a rarity: an
+    /// index over a column the data is already clustered on skips files the
+    /// reader was barely touching. See [`Spread`](crate::layout::Spread).
+    NoAdvantage,
+    /// Nothing is known about how the field's values are laid out.
+    ///
+    /// Only reported when the policy requires an advantage to be demonstrated.
+    /// Refusing to build without evidence is the conservative direction: a
+    /// useless index costs storage and a build, forever, for nothing.
+    NoEvidence,
 }
 
 /// Watches a table, and keeps its derived state worth having.
@@ -84,6 +97,13 @@ pub struct Optimizer {
     /// default — and it is lost on restart, along with the in-memory registry
     /// itself.
     built: BTreeMap<DerivedId, FieldId>,
+    /// What is known about how each field's values sit across the files.
+    ///
+    /// Supplied rather than derived, because the two inputs come from
+    /// different places: per-file ranges from Iceberg manifest bounds, and
+    /// rows-per-value from an estimate of distinct values that Iceberg does
+    /// not record. Taking it as an input keeps the requirement visible.
+    spreads: BTreeMap<FieldId, Spread>,
 }
 
 impl Optimizer {
@@ -99,6 +119,7 @@ impl Optimizer {
             prices: PriceTable::default(),
             reader: PolicyFingerprint(0),
             built: BTreeMap::new(),
+            spreads: BTreeMap::new(),
         }
     }
 
@@ -137,6 +158,21 @@ impl Optimizer {
     /// and would build a second one beside it.
     pub fn adopt(&mut self, fields: impl IntoIterator<Item = (DerivedId, FieldId)>) {
         self.built.extend(fields);
+    }
+
+    /// Say how each field's values are laid out across the files.
+    ///
+    /// Without this, a policy requiring a demonstrated advantage declines
+    /// every proposal — deliberately, since building on no evidence is what
+    /// measurement showed to be wrong.
+    pub fn with_spreads(mut self, spreads: BTreeMap<FieldId, Spread>) -> Self {
+        self.spreads = spreads;
+        self
+    }
+
+    /// What is known about one field's layout.
+    pub fn spread(&self, field: FieldId) -> Option<Spread> {
+        self.spreads.get(&field).copied()
     }
 
     /// Record what a query cost.
@@ -255,6 +291,26 @@ impl Optimizer {
             if round.built.len() >= self.policy.max_builds_per_round {
                 round.declined.push((id, Declined::RoundFull));
                 continue;
+            }
+
+            // Would this beat what the file format prunes for free? Checked
+            // before building, because the answer is usually no, and because
+            // building first and measuring after means paying for the build
+            // and the storage to learn it was pointless.
+            if self.policy.min_index_advantage_pct > 0.0 {
+                match self.spread(proposal.field) {
+                    None => {
+                        round.declined.push((id, Declined::NoEvidence));
+                        continue;
+                    }
+                    Some(spread)
+                        if spread.index_advantage_pct() < self.policy.min_index_advantage_pct =>
+                    {
+                        round.declined.push((id, Declined::NoAdvantage));
+                        continue;
+                    }
+                    Some(_) => {}
+                }
             }
 
             let built =

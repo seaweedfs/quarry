@@ -29,6 +29,7 @@ pub mod facts;
 #[cfg(feature = "iceberg")]
 pub mod from_iceberg;
 pub mod kinds;
+pub mod layout;
 pub mod place;
 pub mod registry;
 pub mod snapshot;

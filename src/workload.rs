@@ -200,6 +200,16 @@ pub struct Policy {
     /// cheap to get wrong in one direction only — rebuilding costs a scan,
     /// while keeping a useless index for another round costs almost nothing.
     pub retire_after_queries: u64,
+    /// How much better than the file format's own pruning an index must be,
+    /// as a percentage of a full scan, before it is worth building.
+    ///
+    /// Without this the loop builds an index whenever a shape goes unaided,
+    /// which measurement showed to be badly wrong: of three regimes, one saved
+    /// 95% of a scan and two saved nothing, and nothing in the proposal could
+    /// tell them apart. See [`Spread`](crate::layout::Spread).
+    ///
+    /// Zero would restore the old behaviour of building on hope alone.
+    pub min_index_advantage_pct: f64,
 }
 
 impl Policy {
@@ -212,6 +222,7 @@ impl Policy {
         max_builds_per_round: 1,
         max_residual_pct: 25.0,
         retire_after_queries: 100,
+        min_index_advantage_pct: 10.0,
     };
 
     /// Act, keeping derived state under `budget_bytes`.
