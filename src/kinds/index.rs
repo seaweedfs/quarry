@@ -90,14 +90,24 @@ impl Index {
     /// budget change their minds for no reason. A test in `engine::persist`
     /// asserts the encoder produces exactly this many bytes.
     ///
-    /// Most of it is file paths, one copy per posting.
+    /// File paths are written once and referenced by number, which is where
+    /// most of the size went before: a path is 60–100 bytes and was repeated
+    /// once per posting, so the same handful of paths dominated an index of a
+    /// million postings.
     pub fn encoded_len(&self) -> u64 {
-        let mut total = 8; // the number of values
+        let paths: BTreeSet<&FileId> = self.postings.values().flatten().collect();
+
+        // The file table: how many, then each length-prefixed path.
+        let mut total = 4u64;
+        for file in &paths {
+            total += 4 + file.0.len() as u64;
+        }
+
+        // Then the postings, referring to that table by number.
+        total += 8; // the number of values
         for files in self.postings.values() {
-            total += 8 + 8; // the hashed value, and how many files hold it
-            for file in files {
-                total += 8 + file.0.len() as u64; // the path, and its length
-            }
+            total += 8 + 4; // the hashed value, and how many files hold it
+            total += 4 * files.len() as u64; // one index per file
         }
         total
     }

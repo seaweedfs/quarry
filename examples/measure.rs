@@ -198,16 +198,23 @@ fn mb(bytes: u64) -> f64 {
 
 /// The exact number of bytes this index occupies when written down.
 ///
-/// Mirrors the on-disk encoding: a count, then per value its hash, a file
-/// count, and each path with its length. Computed here rather than taken from
-/// the index so that this measurement is independent of what the code claims.
+/// Mirrors the on-disk encoding independently of `Index::encoded_len`, so that
+/// this measurement can contradict the code rather than agree with it by
+/// construction. Disagreement between the two lines below is the finding.
+///
+/// The encoding is a file table — each path once — then postings referring to
+/// it by number.
 fn encoded_len(index: &Index) -> u64 {
-    let mut total = 8u64;
+    let paths: std::collections::BTreeSet<&FileId> =
+        index.postings().flat_map(|(_, files)| files).collect();
+
+    let mut total = 4u64;
+    for file in &paths {
+        total += 4 + file.0.len() as u64;
+    }
+    total += 8;
     for (_, files) in index.postings() {
-        total += 8 + 8;
-        for file in files {
-            total += 8 + file.0.len() as u64;
-        }
+        total += 8 + 4 + 4 * files.len() as u64;
     }
     total
 }
@@ -285,8 +292,13 @@ async fn main() {
             100.0 * encoded as f64 / table.bytes as f64
         );
         println!(
-            "  what it reports  {:.2} MB  <-- what the budget is enforced against",
-            mb(index.bytes_estimate())
+            "  what it reports  {:.2} MB  <-- what the budget is enforced against{}",
+            mb(index.bytes_estimate()),
+            if index.bytes_estimate() == encoded {
+                ""
+            } else {
+                "   *** DISAGREES with the measured size ***"
+            }
         );
         println!(
             "  selectivity      {:.1} files per value out of {files}  \

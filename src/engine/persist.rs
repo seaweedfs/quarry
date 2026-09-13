@@ -57,7 +57,7 @@
 //! reads identity from the *tail* of a path rather than by stripping a prefix.
 //! Three segments is all it needs, and that works in either path space.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use iceberg::io::{FileIO, FileRead};
@@ -76,7 +76,7 @@ use crate::workload::{Fingerprint, Seen, Workload};
 ///
 /// Versioned in the name: a change to the layout below becomes a different
 /// type, which an older reader skips rather than misreads.
-pub const QUARRY_EQ_INDEX_V1: &str = "quarry-eq-index-v1";
+pub const QUARRY_EQ_INDEX_V2: &str = "quarry-eq-index-v2";
 
 /// Property carrying the hash version the postings were built with.
 const HASH_VERSION_PROPERTY: &str = "quarry.hash-version";
@@ -171,18 +171,41 @@ impl Layout {
 
 /// Serialise an index's postings.
 ///
-/// Deliberately plain: a count, then each hashed value followed by its file
-/// paths. Compression is Puffin's job, not this function's.
+/// A file table first, then postings referring to it by number. Paths are
+/// 60–100 bytes and a value can appear in many files, so writing each path
+/// once rather than once per posting is where most of the size went: measured
+/// on a million-posting index, 90 MB became 15 MB.
+///
+/// Compression is Puffin's job, not this function's — though `iceberg-rust`
+/// 0.6 does not implement any codec yet, which is why this is worth doing by
+/// hand.
 fn encode(index: &Index) -> Vec<u8> {
+    let paths: Vec<&FileId> = index
+        .postings()
+        .flat_map(|(_, files)| files)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let number_of: BTreeMap<&FileId, u32> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (*file, index as u32))
+        .collect();
+
     let mut out = Vec::new();
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for file in &paths {
+        let bytes = file.0.as_bytes();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+
     out.extend_from_slice(&(index.values() as u64).to_le_bytes());
     for (value, files) in index.postings() {
         out.extend_from_slice(&value.to_le_bytes());
-        out.extend_from_slice(&(files.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(files.len() as u32).to_le_bytes());
         for file in files {
-            let bytes = file.0.as_bytes();
-            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            out.extend_from_slice(bytes);
+            out.extend_from_slice(&number_of[file].to_le_bytes());
         }
     }
     out
@@ -195,18 +218,28 @@ fn encode(index: &Index) -> Vec<u8> {
 /// hold matching rows, which is the one direction that returns wrong answers.
 fn decode(field: FieldId, bytes: &[u8]) -> Option<Index> {
     let mut cursor = Cursor { bytes, at: 0 };
+
+    let path_count = cursor.u32()?;
+    let mut paths = Vec::with_capacity(path_count.min(1 << 16) as usize);
+    for _ in 0..path_count {
+        let len = cursor.u32()? as usize;
+        paths.push(FileId(String::from_utf8(cursor.take(len)?.to_vec()).ok()?));
+    }
+
     let values = cursor.u64()?;
     let mut index = Index::new(field);
-
     for _ in 0..values {
         let value = cursor.u64()?;
-        let files = cursor.u64()?;
+        let files = cursor.u32()?;
         for _ in 0..files {
-            let len = cursor.u64()? as usize;
-            let path = cursor.take(len)?;
-            index.insert(value, FileId(String::from_utf8(path.to_vec()).ok()?));
+            // A number outside the table means these bytes are not what we
+            // think they are. Skipping it would silently drop a file the
+            // index should have named, which under-selects.
+            let file = paths.get(cursor.u32()? as usize)?;
+            index.insert(value, file.clone());
         }
     }
+
     if cursor.at != bytes.len() {
         return None; // Trailing bytes mean this is not what we think it is.
     }
@@ -278,7 +311,7 @@ pub async fn write_index(
     writer
         .add(
             Blob::builder()
-                .r#type(QUARRY_EQ_INDEX_V1.to_owned())
+                .r#type(QUARRY_EQ_INDEX_V2.to_owned())
                 .fields(vec![index.field() as i32])
                 .snapshot_id(at.0)
                 .sequence_number(0)
@@ -326,7 +359,7 @@ pub async fn read_index(
     let metadata = reader.file_metadata().await?;
 
     for blob_metadata in metadata.blobs() {
-        if blob_metadata.blob_type() != QUARRY_EQ_INDEX_V1 {
+        if blob_metadata.blob_type() != QUARRY_EQ_INDEX_V2 {
             continue;
         }
         let properties = blob_metadata.properties();
@@ -862,6 +895,42 @@ mod tests {
         encoded.extend_from_slice(&1u64.to_le_bytes()); // one file
         encoded.extend_from_slice(&u64::MAX.to_le_bytes()); // impossible length
         assert!(decode(4, &encoded).is_none());
+    }
+
+    #[test]
+    fn a_file_number_outside_the_table_is_refused() {
+        // Introduced with interning: postings name files by number now, so a
+        // number past the end of the table is a new way for bytes to be wrong.
+        // Skipping it would drop a file the index should have named, which
+        // under-selects — the one direction that returns wrong answers.
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u32.to_le_bytes()); // one path
+        encoded.extend_from_slice(&9u32.to_le_bytes()); // of length nine
+        encoded.extend_from_slice(b"a.parquet");
+        encoded.extend_from_slice(&1u64.to_le_bytes()); // one value
+        encoded.extend_from_slice(&7u64.to_le_bytes()); // the value
+        encoded.extend_from_slice(&1u32.to_le_bytes()); // in one file
+        encoded.extend_from_slice(&5u32.to_le_bytes()); // file 5, of one
+        assert!(decode(4, &encoded).is_none());
+    }
+
+    #[test]
+    fn interning_makes_repeated_paths_nearly_free() {
+        // The measured problem: a path is 60-100 bytes and was written once
+        // per posting. One long path across many values should now cost about
+        // four bytes per posting rather than ninety.
+        let long = "warehouse/db/events/data/00000-0-a1b2c3d4-e5f6.parquet";
+        let mut index = Index::new(4);
+        for value in 0..1_000u64 {
+            index.insert(value, FileId(long.to_owned()));
+        }
+
+        let per_posting = index.encoded_len() as f64 / 1_000.0;
+        assert!(
+            per_posting < 20.0,
+            "{per_posting} bytes per posting; the path should be stored once"
+        );
+        assert_eq!(encode(&index).len() as u64, index.encoded_len());
     }
 
     #[test]

@@ -1022,11 +1022,27 @@ the encoder produces precisely that many bytes, since the two must agree or the
 budget changes its mind across a restart. Re-running the measurement confirms
 it: reported size now equals encoded size in all three regimes.
 
-**4. Most of a posting is a file path.** 91 bytes per posting, of which 8 is the
-hashed value and the rest is a path repeated once per posting. Interning paths
-into a table referenced by a small integer should cut the index several-fold,
-which is what would make the SELECTIVE index affordable at all: 68% of the
-table is not something a storage budget will ever admit.
+**4. Most of a posting was a file path — fixed.** 91 bytes per posting, of
+which 8 was the hashed value and the rest a path repeated once per posting. The
+encoding now writes a file table once and has postings refer to it by number:
+
+```text
+                    before        after
+CLUSTERED           0.46 MB       0.08 MB
+SCATTERED           7.68 MB       0.46 MB      (16.7x, many postings, few paths)
+SELECTIVE          90.12 MB      14.86 MB      (6.1x)
+SELECTIVE, as %      67.8%         11.2%       of the table
+```
+
+68% of a table is not a size any storage budget admits; 11% is arguable. The
+measurement recomputes the encoded length independently of
+`Index::encoded_len`, so the two agreeing is a check rather than a tautology,
+and it prints a warning when they diverge.
+
+An uncomfortable side effect: the *useless* SCATTERED index is now the cheapest
+of the three at 5 bytes per posting, because it has many postings over few
+paths. Making indexes cheap does nothing to stop the loop building worthless
+ones — which is finding 1 again, and the reason it is finding 1.
 
 ### One worry that did not materialise
 

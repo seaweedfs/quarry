@@ -37,7 +37,7 @@ pub use materialized::{MaterializedResult, hash_plan};
 pub use optimizer::{Declined, Optimizer, Round};
 #[cfg(feature = "iceberg")]
 pub use persist::{
-    Layout, QUARRY_EQ_INDEX_V1, QUARRY_WORKLOAD_V1, Recovered, Store, discard, read_index,
+    Layout, QUARRY_EQ_INDEX_V2, QUARRY_WORKLOAD_V1, Recovered, Store, discard, read_index,
     read_workload, recover, write_index, write_workload,
 };
 pub use quarry::{Quarry, Session};
