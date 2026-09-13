@@ -553,7 +553,7 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] Index bytes persisted as Puffin blobs at self-describing paths
 - [x] Registry rebuilt by listing after a restart
 - [ ] Publishing to Iceberg `TableMetadata.statistics`
-- [ ] Credits and the shape aggregate persisted
+- [x] Credits and the shape aggregate persisted, with a retirement grace window
 - [ ] `commit_notifications`, so a round knows the table moved without asking
 - [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
 
@@ -857,8 +857,36 @@ matching rows, which is the one direction that returns wrong answers. So
 `decode` refuses on any inconsistency, including trailing bytes, and the test
 truncates at **every** byte offset rather than at one convenient point.
 
-### Still in memory
+### Credits, and the grace window they still need
 
-Credits and the shape aggregate. Until they are written down, a restart
-recovers the indexes and then retires them for having saved nothing — which is
-worse than not recovering them at all, and is the next thing to fix.
+Credits and the shape aggregate are now written as a second Puffin blob type.
+The restart test asserts the whole cycle: learn, build, save, discard every
+in-memory structure, recover, and run a round that retires **nothing** and
+rebuilds **nothing**.
+
+Persisting credits was necessary and is not sufficient, so
+`Policy::retire_after_queries` holds retirement off until enough queries have
+been observed to judge by. Two reasons:
+
+```text
+cold start     credits can be lost or absent, and a recovered index that
+               has served nothing looks exactly like one that is useless
+
+concurrency    two optimizers over the same storage overwrite each other's
+               telemetry, so a busy index can legitimately read as unused
+```
+
+The asymmetry settles it rather than any cleverness: rebuilding a deleted index
+costs a full scan, while keeping a useless one for another round costs almost
+nothing. There is a test for the destructive case specifically — recovered
+index, no telemetry at all, round retires nothing.
+
+`Optimizer::adopt` exists because a recovered index is otherwise unmaintainable:
+the optimizer would not know what field it covers, so it could neither refresh
+it nor recognise it as already built, and would build a second one beside it.
+
+### Still not persisted
+
+Nothing that causes harm. The raw observation stream is dropped, which only
+affects how quickly proposals re-converge, and it is the one thing here large
+enough that writing it down would need compaction.

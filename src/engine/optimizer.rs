@@ -119,6 +119,26 @@ impl Optimizer {
         self
     }
 
+    /// Resume from a workload read back from storage.
+    ///
+    /// Credits are the part that matters: without them every recovered piece
+    /// of derived state looks as though it has saved nothing, and the first
+    /// round deletes all of it — worse than not recovering at all, because
+    /// the bytes were there and are now gone.
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.workload = workload;
+        self
+    }
+
+    /// Take over maintenance of derived state recovered from storage.
+    ///
+    /// Without this the optimizer would not know what a recovered index is
+    /// on, so it could neither refresh it nor recognise it as already built —
+    /// and would build a second one beside it.
+    pub fn adopt(&mut self, fields: impl IntoIterator<Item = (DerivedId, FieldId)>) {
+        self.built.extend(fields);
+    }
+
     /// Record what a query cost.
     ///
     /// The caller passes the observation rather than the optimizer hooking the
@@ -167,7 +187,17 @@ impl Optimizer {
         }
 
         // 1. Retire, so freed bytes are available to what follows.
-        let retire = {
+        //
+        // Held off until enough queries have been seen to judge by.
+        // Retirement asks what a piece has measurably saved and reads nothing
+        // as a reason to delete, which is right once traffic has run and
+        // wrong immediately after a restart, when a recovered index has
+        // served nothing yet. The asymmetry decides it: rebuilding a deleted
+        // index costs a scan, keeping a useless one another round costs
+        // almost nothing.
+        let retire = if self.workload.observed() < self.policy.retire_after_queries {
+            Vec::new()
+        } else {
             let registry = self.registry.read().expect("registry lock");
             self.workload
                 .retirements(&registry, &self.prices, self.policy.horizon_days)

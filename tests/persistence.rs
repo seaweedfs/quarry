@@ -27,11 +27,12 @@ use url::Url;
 
 use quarry::derived::PolicyFingerprint;
 use quarry::engine::{
-    Layout, Quarry, QuarryTable, Store, build_index, hash_scalar, index_id, read_index, shared,
-    write_index,
+    Layout, Optimizer, Quarry, QuarryTable, Store, build_index, hash_scalar, index_id, read_index,
+    shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
+use quarry::workload::{Policy, Workload};
 
 const TENANT_FIELD: u32 = 4;
 const POLICY: PolicyFingerprint = PolicyFingerprint(1);
@@ -430,6 +431,240 @@ async fn a_stale_hash_version_is_not_probed() {
             "an index built with a different hash version must be refused"
         );
     }
+}
+
+/// The whole restart: indexes recovered, credits recovered, nothing deleted.
+#[tokio::test]
+async fn a_restart_recovers_everything_and_destroys_nothing() {
+    let fixture = fixture("persist_restart");
+    let (_, store) = stacks(&fixture);
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let policy = Policy {
+        retire_after_queries: 3,
+        ..Policy::automatic(1 << 30).with_min_queries(3)
+    };
+
+    // --- Process one: learn, build, and write everything down.
+    let saved_credits = {
+        let registry = shared(Registry::new());
+        let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+        let mut optimizer = Optimizer::new(Arc::clone(&registry), policy).for_reader(POLICY);
+
+        let quarry = quarry();
+        let session = quarry.session();
+        session
+            .register("events", Arc::clone(&served))
+            .expect("register");
+
+        for _ in 0..5 {
+            session.sql(sql).await.expect("query");
+            let report = served.last_scan().expect("scan");
+            optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+        }
+        let round = optimizer.round(&session, &served).await;
+        assert_eq!(round.built.len(), 1, "built an index: {round:?}");
+
+        // Queries now served by it, so it accrues credit.
+        for _ in 0..5 {
+            session.sql(sql).await.expect("query");
+            let report = served.last_scan().expect("scan");
+            assert!(report.used.is_some(), "the index should be serving");
+            optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+        }
+
+        let id = index_id(&events(), TENANT_FIELD);
+        let credits = optimizer
+            .workload()
+            .credited(&id)
+            .expect("the index earned credit");
+        assert!(credits.bytes_saved() > 0);
+
+        // Write the index and the telemetry down.
+        let derived_bytes = registry.read().expect("lock").bytes();
+        assert!(derived_bytes > 0);
+        let index = build_index(&session, &served, TENANT_FIELD)
+            .await
+            .expect("rebuild for writing");
+        store
+            .write(&events(), SnapshotId(1), POLICY, &index)
+            .await
+            .expect("write index");
+        store
+            .save_workload(&events(), optimizer.workload())
+            .await
+            .expect("save workload");
+
+        credits
+    };
+
+    // --- Process two. Nothing in memory carried over.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    assert_eq!(recovered.registry.len(), 1, "the index came back");
+
+    let workload = store
+        .load_workload(&events())
+        .await
+        .expect("load")
+        .expect("a saved workload");
+
+    let id = index_id(&events(), TENANT_FIELD);
+    assert_eq!(
+        workload.credited(&id).map(|seen| seen.bytes_saved()),
+        Some(saved_credits.bytes_saved()),
+        "credits must survive, or the first round deletes what was recovered"
+    );
+
+    let registry = shared(recovered.registry);
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(Arc::clone(&registry), policy)
+        .for_reader(POLICY)
+        .with_workload(workload);
+    optimizer.adopt(recovered.fields);
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    // The first round after a restart must not destroy what it recovered.
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round.retired.is_empty(),
+        "a recovered index that has paid for itself must be kept: {round:?}"
+    );
+    assert!(
+        round.built.is_empty(),
+        "and it must not be built a second time: {round:?}"
+    );
+    assert_eq!(registry.read().expect("lock").len(), 1);
+
+    // And it is genuinely in use, not merely present.
+    session.sql(sql).await.expect("query");
+    let report = served.last_scan().expect("scan");
+    assert_eq!(report.used.as_deref(), Some(id.0.as_str()));
+}
+
+#[tokio::test]
+async fn a_cold_start_without_credits_still_does_not_delete() {
+    // The destructive case: an index recovered with no telemetry looks as
+    // though it has saved nothing, and retirement reads that as a reason to
+    // delete. The grace window is what stops it.
+    let fixture = fixture("persist_cold_start");
+    let (_, store) = stacks(&fixture);
+
+    {
+        let session = quarry().session();
+        let built = build_index(&session, &table(&fixture, Registry::new()), TENANT_FIELD)
+            .await
+            .expect("build");
+        store
+            .write(&events(), SnapshotId(1), POLICY, &built)
+            .await
+            .expect("write");
+    }
+
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let registry = shared(recovered.registry);
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+
+    // No workload at all, as though the telemetry were lost.
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy {
+            retire_after_queries: 100,
+            ..Policy::automatic(1 << 30)
+        },
+    );
+    optimizer.adopt(recovered.fields);
+
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round.retired.is_empty(),
+        "nothing may be retired on no evidence: {round:?}"
+    );
+    assert_eq!(registry.read().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn a_saved_workload_survives_a_round_trip() {
+    let fixture = fixture("persist_workload");
+    let (_, store) = stacks(&fixture);
+
+    let mut workload = Workload::new();
+    let served = Arc::new(table(&fixture, Registry::new()));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    session
+        .sql("SELECT tenant_id FROM events WHERE tenant_id = 3")
+        .await
+        .expect("query");
+    let report = served.last_scan().expect("scan");
+    workload.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+
+    store
+        .save_workload(&events(), &workload)
+        .await
+        .expect("save");
+    let read = store
+        .load_workload(&events())
+        .await
+        .expect("load")
+        .expect("present");
+
+    assert_eq!(read.shapes(), workload.shapes());
+    assert_eq!(read.observed(), workload.observed());
+    let (shape, seen) = workload.shapes_seen().next().expect("one shape");
+    assert_eq!(
+        read.seen(shape).map(|s| s.bytes_if_full_scan),
+        Some(seen.bytes_if_full_scan),
+        "the unaided baseline must survive, since savings are measured from it"
+    );
+}
+
+#[tokio::test]
+async fn no_saved_workload_is_not_an_error() {
+    let fixture = fixture("persist_no_workload");
+    let (_, store) = stacks(&fixture);
+    assert!(
+        store
+            .load_workload(&events())
+            .await
+            .expect("should not fail")
+            .is_none()
+    );
+}
+
+/// A table sharing `registry`, for the restart tests.
+fn shared_table(fixture: &Fixture, registry: quarry::engine::SharedRegistry) -> QuarryTable {
+    let mut table = QuarryTable::new(
+        schema(),
+        events(),
+        SnapshotId(1),
+        fixture.graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .with_shared_registry(registry)
+    .on_object_store(ObjectStoreUrl::local_filesystem());
+    for (file, size) in &fixture.sizes {
+        table = table.with_parquet_file(file.clone(), *size);
+    }
+    table
 }
 
 #[tokio::test]

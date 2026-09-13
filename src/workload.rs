@@ -187,6 +187,19 @@ pub struct Policy {
     /// Measured against bytes rather than commits: ten tiny appends matter
     /// less than one large one, and the file sizes are known exactly.
     pub max_residual_pct: f64,
+    /// Queries that must be observed before anything may be retired.
+    ///
+    /// A guard against judging derived state on no evidence. Retirement asks
+    /// what a piece has *measurably* saved, and treats nothing as a reason to
+    /// delete — which is right once queries have run and wrong immediately
+    /// after a restart, when a recovered index has served nothing yet.
+    ///
+    /// Persisted credits mostly close that window, but not entirely: two
+    /// processes sharing storage overwrite each other's telemetry, so a
+    /// recovered piece can legitimately look unused. Deleting an index is
+    /// cheap to get wrong in one direction only — rebuilding costs a scan,
+    /// while keeping a useless index for another round costs almost nothing.
+    pub retire_after_queries: u64,
 }
 
 impl Policy {
@@ -198,6 +211,7 @@ impl Policy {
         horizon_days: 30.0,
         max_builds_per_round: 1,
         max_residual_pct: 25.0,
+        retire_after_queries: 100,
     };
 
     /// Act, keeping derived state under `budget_bytes`.
@@ -277,6 +291,43 @@ impl Workload {
     /// What one piece of derived state has actually saved.
     pub fn credited(&self, id: &DerivedId) -> Option<Seen> {
         self.by_derived.get(id).copied()
+    }
+
+    /// Every shape seen, in a fixed order.
+    ///
+    /// Ordered because this is written to storage: the bytes should be a
+    /// function of the contents alone.
+    pub fn shapes_seen(&self) -> impl Iterator<Item = (&Fingerprint, &Seen)> {
+        self.by_shape.iter()
+    }
+
+    /// What each piece of derived state has saved, in a fixed order.
+    pub fn credits(&self) -> impl Iterator<Item = (&DerivedId, &Seen)> {
+        self.by_derived.iter()
+    }
+
+    /// Rebuild a workload that was written down.
+    ///
+    /// Credits matter far more than shapes here. Shapes only affect how
+    /// quickly the optimizer re-learns what to propose; credits are what
+    /// [`Workload::retirements`] judges against, and without them every
+    /// recovered piece looks like it has saved nothing and is deleted.
+    pub fn restore(
+        shapes: impl IntoIterator<Item = (Fingerprint, Seen)>,
+        credits: impl IntoIterator<Item = (DerivedId, Seen)>,
+    ) -> Self {
+        Workload {
+            by_shape: shapes.into_iter().collect(),
+            by_derived: credits.into_iter().collect(),
+        }
+    }
+
+    /// How many queries have been observed in total.
+    ///
+    /// Used to hold retirement off until enough has been seen to judge by —
+    /// see [`Policy::retire_after_queries`].
+    pub fn observed(&self) -> u64 {
+        self.by_shape.values().map(|seen| seen.queries).sum()
     }
 
     /// Indexes worth building, most promising first.

@@ -57,7 +57,7 @@
 //! reads identity from the *tail* of a path rather than by stripping a prefix.
 //! Three segments is all it needs, and that works in either path space.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use iceberg::io::{FileIO, FileRead};
@@ -70,6 +70,7 @@ use crate::kinds::Index;
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
 use crate::stable_hash::HASH_VERSION;
+use crate::workload::{Fingerprint, Seen, Workload};
 
 /// The blob type for an equality index.
 ///
@@ -113,6 +114,14 @@ impl Layout {
     /// Where one index belongs, in the path space `FileIO` uses.
     pub fn index_path(&self, table: &TableId, field: FieldId, at: SnapshotId) -> String {
         format!("{}/{}/{}/{}.puffin", self.prefix, table.0, field, at.0)
+    }
+
+    /// Where a table's saved workload belongs.
+    ///
+    /// Outside the `<field>/<snapshot>` tree on purpose, so listing for
+    /// indexes cannot mistake it for one.
+    pub fn workload_path(&self, table: &TableId) -> String {
+        format!("{}/{}/workload.puffin", self.prefix, table.0)
     }
 
     /// Everything for one table, in the path space `FileIO` uses.
@@ -220,6 +229,33 @@ impl<'a> Cursor<'a> {
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let len = self.u64()? as usize;
+        String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
+
+    fn fields(&mut self) -> Option<BTreeSet<FieldId>> {
+        let count = self.u64()?;
+        let mut fields = BTreeSet::new();
+        for _ in 0..count {
+            fields.insert(self.u32()?);
+        }
+        Some(fields)
+    }
+
+    fn seen(&mut self) -> Option<Seen> {
+        Some(Seen {
+            queries: self.u64()?,
+            bytes_read: self.u64()?,
+            bytes_if_full_scan: self.u64()?,
+            helped: self.u64()?,
+        })
+    }
 }
 
 /// Write an index to storage as a Puffin blob.
@@ -312,6 +348,155 @@ pub async fn read_index(
             let bytes = blob.data().len() as u64;
             return Ok(Some((index.with_bytes(bytes), policy)));
         }
+    }
+    Ok(None)
+}
+
+/// The blob type for a saved workload.
+pub const QUARRY_WORKLOAD_V1: &str = "quarry-workload-v1";
+
+/// Serialise a workload: shapes, then credits.
+fn encode_workload(workload: &Workload) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let shapes: Vec<_> = workload.shapes_seen().collect();
+    out.extend_from_slice(&(shapes.len() as u64).to_le_bytes());
+    for (fingerprint, seen) in shapes {
+        put_str(&mut out, &fingerprint.table.0);
+        put_fields(&mut out, &fingerprint.probeable);
+        put_fields(&mut out, &fingerprint.opaque);
+        put_fields(&mut out, &fingerprint.projected);
+        put_seen(&mut out, seen);
+    }
+
+    let credits: Vec<_> = workload.credits().collect();
+    out.extend_from_slice(&(credits.len() as u64).to_le_bytes());
+    for (id, seen) in credits {
+        put_str(&mut out, &id.0);
+        put_seen(&mut out, seen);
+    }
+    out
+}
+
+fn put_str(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn put_fields(out: &mut Vec<u8>, fields: &BTreeSet<FieldId>) {
+    out.extend_from_slice(&(fields.len() as u64).to_le_bytes());
+    for field in fields {
+        out.extend_from_slice(&field.to_le_bytes());
+    }
+}
+
+fn put_seen(out: &mut Vec<u8>, seen: &Seen) {
+    out.extend_from_slice(&seen.queries.to_le_bytes());
+    out.extend_from_slice(&seen.bytes_read.to_le_bytes());
+    out.extend_from_slice(&seen.bytes_if_full_scan.to_le_bytes());
+    out.extend_from_slice(&seen.helped.to_le_bytes());
+}
+
+/// Read a workload back, or `None` if the bytes are not one.
+///
+/// Same discipline as the index decoder: nothing partial. A half-read
+/// workload would under-report what derived state has saved, and
+/// under-reporting savings is what causes a useful index to be retired.
+fn decode_workload(bytes: &[u8]) -> Option<Workload> {
+    let mut cursor = Cursor { bytes, at: 0 };
+
+    let shape_count = cursor.u64()?;
+    let mut shapes = Vec::new();
+    for _ in 0..shape_count {
+        let table = TableId(cursor.string()?);
+        let probeable = cursor.fields()?;
+        let opaque = cursor.fields()?;
+        let projected = cursor.fields()?;
+        shapes.push((
+            Fingerprint {
+                table,
+                probeable,
+                opaque,
+                projected,
+            },
+            cursor.seen()?,
+        ));
+    }
+
+    let credit_count = cursor.u64()?;
+    let mut credits = Vec::new();
+    for _ in 0..credit_count {
+        credits.push((DerivedId(cursor.string()?), cursor.seen()?));
+    }
+
+    if cursor.at != bytes.len() {
+        return None;
+    }
+    Some(Workload::restore(shapes, credits))
+}
+
+/// Write the workload down.
+///
+/// One object per table prefix. Concurrent optimizers over the same storage
+/// overwrite each other, which is why
+/// [`retire_after_queries`](crate::workload::Policy::retire_after_queries) exists:
+/// losing telemetry must not be able to delete a useful index.
+pub async fn write_workload(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    workload: &Workload,
+) -> iceberg::Result<String> {
+    let path = layout.workload_path(table);
+    let output = file_io.new_output(&path)?;
+
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_WORKLOAD_V1.to_owned())
+                .fields(Vec::new())
+                .snapshot_id(0)
+                .sequence_number(0)
+                .data(encode_workload(workload))
+                .properties(HashMap::from([(
+                    HASH_VERSION_PROPERTY.to_owned(),
+                    HASH_VERSION.to_string(),
+                )]))
+                .build(),
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(path)
+}
+
+/// Read the workload back, or `None` if there is none to read.
+pub async fn read_workload(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+) -> iceberg::Result<Option<Workload>> {
+    let path = layout.workload_path(table);
+    if !file_io.exists(&path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    if !is_plausible_puffin(file_io, &path).await? {
+        return Ok(None);
+    }
+
+    let reader = PuffinReader::new(file_io.new_input(&path)?);
+    let metadata = reader.file_metadata().await?;
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_WORKLOAD_V1 {
+            continue;
+        }
+        // Shape fingerprints hold field ids, not hashes, so they do not
+        // depend on the hash version. Credits are keyed on derived ids, which
+        // do not either. The stamp is recorded anyway, so that a future
+        // format change has a version to refuse on.
+        let blob = reader.blob(blob_metadata).await?;
+        return Ok(decode_workload(blob.data()));
     }
     Ok(None)
 }
@@ -537,6 +722,20 @@ impl Store {
     /// Delete unusable objects.
     pub async fn discard(&self, paths: &[String]) -> iceberg::Result<usize> {
         discard(&self.file_io, paths).await
+    }
+
+    /// Write the workload down.
+    pub async fn save_workload(
+        &self,
+        table: &TableId,
+        workload: &Workload,
+    ) -> iceberg::Result<String> {
+        write_workload(&self.file_io, &self.layout, table, workload).await
+    }
+
+    /// Read a saved workload, if there is one.
+    pub async fn load_workload(&self, table: &TableId) -> iceberg::Result<Option<Workload>> {
+        read_workload(&self.file_io, &self.layout, table).await
     }
 }
 
