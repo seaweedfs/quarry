@@ -19,7 +19,9 @@ use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 
 use crate::derived::FieldId;
-use crate::from_iceberg::{current_snapshot, live_data_files, snapshot_graph, table_id};
+use crate::from_iceberg::{
+    bounds_by_field, current_snapshot, live_data_files, snapshot_graph, table_id,
+};
 use crate::snapshot::SnapshotId;
 
 use super::QuarryTable;
@@ -50,8 +52,12 @@ pub async fn table_from_iceberg(
         .or_else(|| current_snapshot(metadata))
         .unwrap_or(SnapshotId(0));
 
+    // Per-file bounds come along, because they are what decides whether an
+    // index would beat the format's own pruning and they cost one metadata
+    // pass. Without them the optimizer declines to judge.
     let mut table = QuarryTable::new(schema, table_id(metadata), snapshot, graph, field_ids)
-        .on_object_store(url);
+        .on_object_store(url)
+        .with_field_bounds(bounds_by_field(metadata, file_io, snapshot).await?);
     for (file, size) in live_data_files(metadata, file_io, snapshot).await? {
         table = table.with_parquet_file(file, size);
     }

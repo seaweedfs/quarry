@@ -441,6 +441,11 @@ async fn a_restart_recovers_everything_and_destroys_nothing() {
     let sql = "SELECT * FROM events WHERE tenant_id = 1";
     let policy = Policy {
         retire_after_queries: 3,
+        // This test is about surviving a restart, not about whether the index
+        // is worth having. The table is built by hand so it carries no
+        // per-file bounds, and the gate correctly declines to judge without
+        // them — which would leave nothing to restart with.
+        min_index_advantage_pct: 0.0,
         ..Policy::automatic(1 << 30).with_min_queries(3)
     };
 

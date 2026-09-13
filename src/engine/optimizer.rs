@@ -28,7 +28,9 @@ use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
 use crate::workload::{Observation, Policy, Proposal, Workload};
 
-use super::{QuarryTable, Session, SharedRegistry, build_proposed_index, index_id};
+use super::{
+    QuarryTable, Session, SharedRegistry, build_proposed_index, estimate_overlap, index_id,
+};
 
 /// What one round did, or would have done.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -298,7 +300,7 @@ impl Optimizer {
             // building first and measuring after means paying for the build
             // and the storage to learn it was pointless.
             if self.policy.min_index_advantage_pct > 0.0 {
-                match self.spread(proposal.field) {
+                match self.evidence(session, table, proposal.field).await {
                     None => {
                         round.declined.push((id, Declined::NoEvidence));
                         continue;
@@ -339,6 +341,36 @@ impl Optimizer {
         }
 
         round
+    }
+
+    /// How a field's values sit across the files, gathered if not supplied.
+    ///
+    /// Two inputs, from two places, both cheap:
+    ///
+    /// ```text
+    /// per-file ranges   from the table, which took them from the catalog's
+    ///                   manifest bounds at no extra cost
+    /// value overlap     measured from two files, not the whole table
+    /// ```
+    ///
+    /// `None` when the ranges are missing, which is the honest answer rather
+    /// than the convenient one. Absent bounds would make the format look as
+    /// though it prunes nothing, and an index maximally valuable — optimistic
+    /// in exactly the direction that produced the useless indexes to begin
+    /// with. A caller who knows better can still say so with
+    /// [`Optimizer::with_spreads`].
+    async fn evidence(
+        &self,
+        session: &Session,
+        table: &QuarryTable,
+        field: FieldId,
+    ) -> Option<Spread> {
+        if let Some(supplied) = self.spread(field) {
+            return Some(supplied);
+        }
+        let ranges = table.bounds_of(field)?.to_vec();
+        let overlap = estimate_overlap(session, table, field).await.ok()??;
+        Some(Spread::from_overlap(table.file_count(), &ranges, overlap))
     }
 
     /// Derived state this optimizer built that has fallen too far behind.

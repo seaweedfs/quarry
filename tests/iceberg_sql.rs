@@ -11,7 +11,7 @@
 
 #![cfg(all(feature = "engine", feature = "iceberg"))]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,17 +22,18 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::ArrowWriter;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter, ManifestWriterBuilder,
-    Struct, TableMetadata,
+    DataContentType, DataFileBuilder, DataFileFormat, Datum, ManifestListWriter,
+    ManifestWriterBuilder, Struct, TableMetadata,
 };
 use object_store::local::LocalFileSystem;
 use url::Url;
 
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{Quarry, hash_scalar, table_from_iceberg};
+use quarry::engine::{Declined, Optimizer, Quarry, hash_scalar, shared, table_from_iceberg};
 use quarry::kinds::Index;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, SnapshotId, TableId};
+use quarry::workload::Policy;
 
 const TENANT_FIELD: u32 = 1;
 const POLICY: PolicyFingerprint = PolicyFingerprint(1);
@@ -140,7 +141,15 @@ async fn iceberg_table(name: &str) -> (TableMetadata, FileIO, PathBuf, [String; 
     )
     .build_v2_data();
 
-    for (path, size) in [(&a, a_size), (&b, b_size), (&c, c_size)] {
+    // Tenant ranges per file, as a real Iceberg writer records them. Without
+    // these the table carries no statistics and the optimizer has nothing to
+    // judge an index against — which is exactly what happens with a table
+    // written by something that omits them.
+    for (path, size, tenants) in [
+        (&a, a_size, (1i64, 1i64)),
+        (&b, b_size, (2, 2)),
+        (&c, c_size, (1, 1)),
+    ] {
         writer
             .add_file(
                 DataFileBuilder::default()
@@ -151,6 +160,8 @@ async fn iceberg_table(name: &str) -> (TableMetadata, FileIO, PathBuf, [String; 
                     .file_size_in_bytes(size)
                     .record_count(1)
                     .partition(Struct::empty())
+                    .lower_bounds(HashMap::from([(1, Datum::long(tenants.0))]))
+                    .upper_bounds(HashMap::from([(1, Datum::long(tenants.1))]))
                     .build()
                     .expect("data file"),
                 1,
@@ -404,4 +415,90 @@ async fn a_repeated_iceberg_query_stops_touching_the_store() {
         quarry.cache_stats().expect("a cache").hits > 0,
         "the second run should have been served from cache"
     );
+}
+
+/// The gate deciding for itself, on a real Iceberg table.
+///
+/// Everything else hands the optimizer a `Spread`. Here it gathers both inputs
+/// on its own: per-file ranges came from the manifests when the table was
+/// loaded, and value overlap is measured from two files. This is the loop
+/// running without anyone telling it what the data looks like.
+#[tokio::test]
+async fn the_gate_judges_a_real_iceberg_table_for_itself() {
+    let (metadata, file_io, _, _) = iceberg_table("iceberg_gate").await;
+
+    let table = Arc::new(
+        table_from_iceberg(
+            &metadata,
+            &file_io,
+            ObjectStoreUrl::local_filesystem(),
+            None,
+        )
+        .await
+        .expect("build table")
+        .with_policy(POLICY),
+    );
+
+    // The manifests carried bounds for tenant_id, so the table knows them
+    // without anything extra being read.
+    assert!(
+        table.bounds_of(TENANT_FIELD).is_some(),
+        "manifest bounds should have come along with the table"
+    );
+    assert_eq!(table.file_count(), 3);
+
+    let registry = shared(Registry::new());
+    let served = Arc::new(
+        table_from_iceberg(
+            &metadata,
+            &file_io,
+            ObjectStoreUrl::local_filesystem(),
+            None,
+        )
+        .await
+        .expect("build table")
+        .with_policy(POLICY)
+        .with_shared_registry(Arc::clone(&registry)),
+    );
+
+    // Default policy: the gate is on and nothing is supplied to it.
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        Policy::automatic(1 << 30).with_min_queries(3),
+    )
+    .for_reader(POLICY);
+
+    let quarry = Quarry::new(
+        Url::parse("file://").expect("url"),
+        Arc::new(LocalFileSystem::new()),
+    );
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(0));
+    }
+    assert_eq!(optimizer.proposals().len(), 1, "the shape goes unaided");
+
+    // This fixture holds one tenant per file with disjoint ranges, so the
+    // format already prunes and the honest answer is to refuse. Whichever way
+    // it goes, it must be a judgement rather than a shrug.
+    let round = optimizer.round(&session, &served).await;
+    let reason = round.declined.first().map(|(_, why)| *why);
+    assert_ne!(
+        reason,
+        Some(Declined::NoEvidence),
+        "the gate should have gathered its own evidence: {round:?}"
+    );
+    assert_eq!(
+        reason,
+        Some(Declined::NoAdvantage),
+        "disjoint ranges mean the format already prunes: {round:?}"
+    );
+    assert!(round.built.is_empty());
 }

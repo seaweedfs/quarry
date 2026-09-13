@@ -1155,11 +1155,51 @@ Tests now measure both regimes off real data — one tenant per file gives an
 overlap of exactly 0.0, four tenants in every file exactly 1.0 — and a
 single-file table reports `None` rather than a guess.
 
+### The gate now gathers its own evidence
+
+`Optimizer::round` asks for it rather than being handed it. The two inputs come
+from two places, and both are cheap:
+
+```text
+per-file ranges   from the table, which took them from the catalog's
+                  manifest bounds during load, at no extra cost
+value overlap     measured from two files, not the whole table
+```
+
+Bounds belong on `QuarryTable` because they describe the table's files, so
+`table_from_iceberg` fills them in with one metadata pass over all fields —
+walking the manifests per field would have multiplied the reads by the width of
+the table.
+
+**Absent bounds means declining, not assuming.** `Spread::from_bounds` treats
+missing ranges as "the format prunes nothing", which is right as a statement
+about the spread and wrong as a basis for building: it makes an index look
+maximally valuable, optimistic in exactly the direction that produced the
+useless indexes. So `evidence()` returns `None` without ranges and the round
+reports `NoEvidence`. A caller who knows better can still override with
+`with_spreads`.
+
+The consequence is worth stating: a table built by hand, or written by
+something that omits statistics, gets no automatic indexes at all.
+
+**A test fixture was unfaithful and it mattered.** `tests/iceberg_sql.rs` built
+its `DataFile`s without `lower_bounds`/`upper_bounds` — something real Iceberg
+writers always populate — so the gate correctly found nothing to judge. The
+fixture now records them, which makes it a more honest Iceberg table in
+general. Three tests across two files also had to opt out of the gate with
+`min_index_advantage_pct: 0.0`, since they exercise mechanism on hand-built
+tables.
+
+`the_gate_judges_a_real_iceberg_table_for_itself` is the one that matters: a
+genuine Iceberg table, default policy, nothing supplied, and it reaches
+`NoAdvantage` rather than `NoEvidence` — a judgement rather than a shrug.
+
 ### Still open
 
-- Wiring `field_bounds` + `estimate_overlap` into `Optimizer::round`, so the
-  gate gathers its own evidence instead of being handed a `Spread`. Both halves
-  exist and are tested; nothing calls them together yet.
 - `Proposal::ceiling_usd` remains a ceiling. With an advantage available it
   could become an expected saving, at which point proposals could be ranked
-  meaningfully rather than by an upper bound.
+  meaningfully rather than by an upper bound that measured 1775x off.
+- Bounds for non-Iceberg Parquet tables, from footer statistics. Without them
+  the gate declines on a plain Parquet table.
+- Overlap is sampled from two files. A wider sample would cost more and be
+  more accurate; nothing has measured whether two is enough.

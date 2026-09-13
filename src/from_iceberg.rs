@@ -141,17 +141,18 @@ pub async fn live_data_files(
 /// Only orderable numeric and temporal types are mapped. Strings and binary
 /// are left out: they have bounds, but projecting them onto a number to
 /// compare range *widths* would invent a distance that does not exist.
-pub async fn field_bounds(
+pub async fn bounds_by_field(
     metadata: &TableMetadata,
     file_io: &FileIO,
     at: SnapshotId,
-    field: FieldId,
-) -> iceberg::Result<Vec<(f64, f64)>> {
+) -> iceberg::Result<BTreeMap<FieldId, Vec<(f64, f64)>>> {
     let Some(snapshot) = metadata.snapshot_by_id(at.0) else {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     };
 
-    let mut ranges = Vec::new();
+    // Every field in one pass. Walking the manifests per field would multiply
+    // the metadata reads by the width of the table for no reason.
+    let mut bounds: BTreeMap<FieldId, Vec<(f64, f64)>> = BTreeMap::new();
     let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
     for manifest_file in manifest_list.entries() {
         let manifest = manifest_file.load_manifest(file_io).await?;
@@ -163,15 +164,16 @@ pub async fn field_bounds(
             if data_file.content_type() != DataContentType::Data {
                 continue;
             }
-            let key = field as i32;
-            let low = data_file.lower_bounds().get(&key).and_then(as_number);
-            let high = data_file.upper_bounds().get(&key).and_then(as_number);
-            if let (Some(low), Some(high)) = (low, high) {
-                ranges.push((low, high));
+            for (key, low) in data_file.lower_bounds() {
+                let Some(low) = as_number(low) else { continue };
+                let Some(high) = data_file.upper_bounds().get(key).and_then(as_number) else {
+                    continue;
+                };
+                bounds.entry(*key as FieldId).or_default().push((low, high));
             }
         }
     }
-    Ok(ranges)
+    Ok(bounds)
 }
 
 /// One bound as a number, if the type has a meaningful distance.

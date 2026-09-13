@@ -155,6 +155,14 @@ pub struct QuarryTable {
     field_ids: BTreeMap<String, FieldId>,
     policy: PolicyFingerprint,
     prices: PriceTable,
+    /// Per-file value ranges per field, when the catalog records them.
+    ///
+    /// Iceberg keeps a lower and upper bound per field per data file, which is
+    /// what decides whether an index could beat the format's own pruning. It
+    /// belongs on the table because it describes the table's files, and it is
+    /// empty for a table built by hand — in which case the optimizer declines
+    /// to judge rather than guessing.
+    field_bounds: BTreeMap<FieldId, Vec<(f64, f64)>>,
     /// Stored rows for substituting derived state, keyed by its id.
     ///
     /// Kept beside the registry rather than inside the kind so that no
@@ -188,6 +196,7 @@ impl QuarryTable {
             field_ids,
             policy: PolicyFingerprint(0),
             prices: PriceTable::default(),
+            field_bounds: BTreeMap::new(),
             materialized: BTreeMap::new(),
             last_scan: Mutex::new(None),
         }
@@ -293,6 +302,28 @@ impl QuarryTable {
     /// The snapshot this table reads.
     pub fn snapshot(&self) -> SnapshotId {
         self.snapshot
+    }
+
+    /// Record per-file value ranges per field, as a catalog reports them.
+    pub fn with_field_bounds(mut self, bounds: BTreeMap<FieldId, Vec<(f64, f64)>>) -> Self {
+        self.field_bounds = bounds;
+        self
+    }
+
+    /// How many data files the queried snapshot holds.
+    pub fn file_count(&self) -> u64 {
+        self.graph
+            .get(self.snapshot)
+            .map(|snapshot| snapshot.files().len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Per-file value ranges for one field, if the catalog recorded any.
+    pub fn bounds_of(&self, field: FieldId) -> Option<&[(f64, f64)]> {
+        self.field_bounds
+            .get(&field)
+            .filter(|ranges| !ranges.is_empty())
+            .map(Vec::as_slice)
     }
 
     /// The table's snapshot history.
