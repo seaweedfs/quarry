@@ -26,7 +26,9 @@ use url::Url;
 
 use quarry::cost::PriceTable;
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{Quarry, QuarryTable, hash_scalar};
+use quarry::engine::{
+    Quarry, QuarryTable, build_index, build_proposed_index, hash_scalar, index_id,
+};
 use quarry::kinds::Index;
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -164,8 +166,12 @@ async fn run_and_observe(
     rows
 }
 
-/// The index the loop proposed, built for real.
-fn build_index(fixture: &Fixture, field: u32, tenant: i64) -> Registry {
+/// An index written by hand, for the tests that are not about building.
+///
+/// `run_and_observe` needs a fresh registry per query because `QuarryTable`
+/// owns one, and rebuilding by reading the data for each is wasteful when the
+/// test is about what the index *does* rather than how it was made.
+fn hand_written_index(fixture: &Fixture, field: u32, tenant: i64) -> Registry {
     let mut index = Index::new(field);
     // Only the first file holds tenant 1, which is what makes the index worth
     // having; a real builder would learn this by reading the data.
@@ -186,6 +192,130 @@ fn build_index(fixture: &Fixture, field: u32, tenant: i64) -> Registry {
         Box::new(index.with_bytes(4096)),
     ));
     registry
+}
+
+/// The whole loop with nothing hand-fed: the index is built by reading data.
+#[tokio::test]
+async fn the_loop_builds_its_own_index_from_the_data() {
+    let fixture = fixture("loop_self_built");
+    let prices = PriceTable::default();
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let mut workload = Workload::new();
+
+    // OBSERVE: unaided queries, reading the whole table each time.
+    for _ in 0..10 {
+        run_and_observe(&fixture, Registry::new(), &mut workload, sql).await;
+    }
+
+    // PROPOSE.
+    let proposals = workload.proposals(&prices, 5);
+    assert_eq!(proposals.len(), 1);
+    let field = proposals[0].field;
+
+    // BUILD, for real: read the proposed column off the objects.
+    let quarry = quarry();
+    let session = quarry.session();
+    let bare = table(&fixture, Registry::new());
+    let derived = build_proposed_index(
+        &session,
+        &bare,
+        field,
+        index_id(&TableId("events".into()), field),
+        POLICY,
+    )
+    .await
+    .expect("build the proposed index");
+
+    // Building reads only the indexed column, so it costs a fraction of the
+    // table. The fixture's other column is the bulky one.
+    let build_bytes = quarry.origin_stats().bytes_fetched;
+    let table_bytes: u64 = fixture.sizes.values().sum();
+    assert!(
+        build_bytes < table_bytes,
+        "building read {build_bytes} of {table_bytes} bytes; projection \
+         pushdown should have skipped the message column"
+    );
+
+    let built_id = derived.id.clone();
+    assert!(derived.bytes > 0, "the index should price itself");
+
+    let mut registry = Registry::new();
+    registry.register(derived);
+
+    // MEASURE: the same query, served by the index just built — not by a
+    // hand-written stand-in. This is the step that makes the loop real.
+    let served = Arc::new(table(&fixture, registry));
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let rows: usize = session
+        .sql(sql)
+        .await
+        .expect("query")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 500, "the answer must not change");
+
+    let report = served.last_scan().expect("a scan happened");
+    assert_eq!(
+        report.used.as_deref(),
+        Some(built_id.0.as_str()),
+        "the self-built index should have served the query"
+    );
+
+    let mut after = Workload::new();
+    after.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+
+    let credited = after.credited(&built_id).expect("the index served a query");
+    assert!(
+        credited.bytes_saved() > 0,
+        "an index it built itself must still save bytes"
+    );
+
+    // STOP PROPOSING.
+    assert!(after.proposals(&prices, 1).is_empty());
+}
+
+#[tokio::test]
+async fn a_built_index_finds_every_value_in_the_data() {
+    let fixture = fixture("loop_build_contents");
+    let session = quarry().session();
+    let bare = table(&fixture, Registry::new());
+
+    let index = build_index(&session, &bare, TENANT_FIELD)
+        .await
+        .expect("build index");
+
+    // The fixture puts one tenant per file, so each tenant maps to one file.
+    assert_eq!(index.values(), 4, "four distinct tenants across four files");
+    for (position, tenant) in [1i64, 2, 3, 4].into_iter().enumerate() {
+        let hash = hash_scalar(&ScalarValue::Int64(Some(tenant)));
+        assert_eq!(
+            index.files_for(hash),
+            Some(&std::collections::BTreeSet::from([
+                fixture.files[position].clone()
+            ])),
+            "tenant {tenant} should be found in exactly its own file"
+        );
+    }
+}
+
+#[tokio::test]
+async fn building_an_index_on_an_unknown_field_fails_clearly() {
+    let fixture = fixture("loop_build_bad_field");
+    let session = quarry().session();
+    let bare = table(&fixture, Registry::new());
+
+    let error = build_index(&session, &bare, 999)
+        .await
+        .expect_err("field 999 is not a column");
+    assert!(
+        error.to_string().contains("999"),
+        "unhelpful error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -213,14 +343,14 @@ async fn the_loop_proposes_builds_and_then_stops_proposing() {
     );
 
     // 3. BUILD what was proposed.
-    let registry = build_index(&fixture, proposals[0].field, 1);
+    let registry = hand_written_index(&fixture, proposals[0].field, 1);
 
     // 4. MEASURE. The same queries now read less, for the same answer.
     let mut after = Workload::new();
     for _ in 0..10 {
         let rows = run_and_observe(
             &fixture,
-            build_index(&fixture, TENANT_FIELD, 1),
+            hand_written_index(&fixture, TENANT_FIELD, 1),
             &mut after,
             sql,
         )
@@ -299,7 +429,7 @@ async fn the_measured_saving_matches_the_files_avoided() {
     let mut aided = Workload::new();
     run_and_observe(
         &fixture,
-        build_index(&fixture, TENANT_FIELD, 1),
+        hand_written_index(&fixture, TENANT_FIELD, 1),
         &mut aided,
         sql,
     )

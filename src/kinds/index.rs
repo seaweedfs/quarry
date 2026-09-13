@@ -71,6 +71,11 @@ impl Index {
     pub fn files_for(&self, value: u64) -> Option<&BTreeSet<FileId>> {
         self.postings.get(&value)
     }
+
+    /// How many bytes this index was declared to occupy.
+    pub fn bytes_estimate(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Kind for Index {

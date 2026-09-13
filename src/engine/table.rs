@@ -225,6 +225,43 @@ impl QuarryTable {
         self.last_scan.lock().expect("scan report lock").clone()
     }
 
+    /// Where this table's Parquet objects are, and how big they are.
+    ///
+    /// `None` for an in-memory table, which has no objects to read.
+    pub fn parquet_files(&self) -> Option<(&ObjectStoreUrl, &BTreeMap<FileId, u64>)> {
+        match &self.files {
+            Files::Parquet { url, sizes } => Some((url, sizes)),
+            Files::Memory(_) => None,
+        }
+    }
+
+    /// The field id a column name maps to.
+    pub fn field_id_of(&self, column: &str) -> Option<FieldId> {
+        self.field_ids.get(column).copied()
+    }
+
+    /// The column a field id names.
+    ///
+    /// The inverse of [`QuarryTable::field_id_of`], needed to go from a
+    /// proposal — which speaks in field ids, because derived state is keyed on
+    /// them — back to something a reader can project.
+    pub fn column_of(&self, field: FieldId) -> Option<&str> {
+        self.field_ids
+            .iter()
+            .find(|(_, id)| **id == field)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The snapshot this table reads.
+    pub fn snapshot(&self) -> SnapshotId {
+        self.snapshot
+    }
+
+    /// This table's identity.
+    pub fn table_id(&self) -> &TableId {
+        &self.table
+    }
+
     /// Translate DataFusion filters into the predicates the rule understands.
     ///
     /// A comparison of a known column against a literal becomes

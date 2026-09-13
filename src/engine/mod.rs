@@ -17,6 +17,7 @@
 //! nothing in `derived`, `registry`, or `explain` knows it exists, and none of
 //! them changed to accommodate it.
 
+mod build;
 mod cache;
 #[cfg(feature = "iceberg")]
 mod iceberg_table;
@@ -25,6 +26,7 @@ mod quarry;
 mod store;
 mod table;
 
+pub use build::{build_index, build_proposed_index, columns, index_id};
 pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
 pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};

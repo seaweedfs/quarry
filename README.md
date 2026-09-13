@@ -15,7 +15,7 @@ Everything else is derived, priced, and disposable.
 ## Status
 
 Phases 0–8 of [DEVPLAN.md](DEVPLAN.md) are done; 9 and 10 are under way. The
-decision core is 111 tests with **no dependencies**. Optional features add 74
+decision core is 111 tests with **no dependencies**. Optional features add 77
 more: `engine` brings DataFusion and SQL over Parquet, `iceberg` brings real
 table metadata, and `rest-catalog` queries a table loaded from a live Iceberg
 REST catalog over HTTP.
@@ -23,7 +23,7 @@ REST catalog over HTTP.
 Real SQL is planned by the rule today:
 
 ```sh
-cargo test --features rest-catalog     # 185 tests, incl. a live REST catalog
+cargo test --features rest-catalog     # 188 tests, incl. a live REST catalog
 cargo run --example explain            # no dependencies; a table over 4 commits
 ```
 
@@ -35,8 +35,9 @@ budget aborts the scan rather than quietly returning fewer rows. Run the same
 query twice and the second fetches zero bytes from storage.
 
 And the loop closes: the engine watches what queries ask for, proposes the
-index that would help, credits it with what it measurably saved, and retires
-derived state that has not paid for keeping it.
+index that would help, **builds it by reading only that column**, credits it
+with what it measurably saved, and retires derived state that has not paid for
+keeping it.
 
 The design is in [`../core-design.md`](../core-design.md); the longer documents
 beside it are rationale and detail. Two corrections to the design were found by
@@ -63,6 +64,7 @@ src/
   engine/             behind --features engine
     table.rs          a DataFusion TableProvider planned by the rule
     iceberg_table.rs  a QuarryTable over a real Iceberg table
+    build.rs          builds the index the loop proposed, by reading the data
     materialized.rs   a Kind holding Arrow batches, defined outside the core
     store.rs          an object store that counts bytes and enforces budgets
     cache.rs          a read-through cache for ranges of immutable objects
@@ -75,7 +77,7 @@ tests/
   iceberg_bridge.rs a genuine Iceberg table: metadata, manifest lists, manifests
   iceberg_sql.rs    SQL over that table, with the rule choosing objects
   iceberg_rest.rs   the same, loaded from a REST catalog over a real socket
-  loop_closes.rs    observe, propose, build, measure, stop proposing
+  loop_closes.rs    observe, propose, build for real, measure, stop proposing
 ```
 
 The file to read first is `derived.rs`. `Derived::may_serve` is the only place

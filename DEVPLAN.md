@@ -546,9 +546,10 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] `retirements`: what has not paid for keeping it
 - [x] `PriceTable::byte_day_usd`, so retention and reads compare
 - [x] The loop, tested end to end on real queries over real Parquet
+- [x] `build_index`: building a proposed index by reading the data
 - [ ] `commit_notifications`, when there is something to consume it
-- [ ] Building a proposed index by reading the data
 - [ ] Iceberg `ScanReport` ingestion, for queries run by other engines
+- [ ] A driver that runs the loop on its own, rather than a caller doing it
 
 **Done when** the optimizer contains no backend name, and an unused derived
 state is retired on its own. **Both halves now hold.** `MeteredStore` used to
@@ -594,6 +595,32 @@ rather than ten.
 Retirement treats *never used* as a reason to retire. Something built and never
 touched is indistinguishable from a leak, and rebuilding is cheap because
 derived state is disposable.
+
+**Building costs a fraction of a scan, for free.** `build_index` projects to
+the single indexed column, so Parquet reads one column chunk per row group and
+skips the rest — the same projection pushdown a query gets, through the same
+DataFusion file source rather than a separate reader. The test asserts that
+building read fewer bytes than the table holds.
+
+Values are hashed through `ScalarValue`, the same path a query literal takes,
+so build and probe cannot disagree about what a value hashes to. That is slower
+than reading the array's native type and is the obvious thing to optimise once
+correctness is pinned; getting it wrong would produce an index that silently
+never matches.
+
+Nulls are skipped. `x = NULL` matches nothing in SQL, and `IS NULL` is an
+opaque predicate the index would not be probed for.
+
+**A test caught itself being circular.** The first version of
+`the_loop_builds_its_own_index_from_the_data` built an index and then measured
+a *hand-written* one, so it would have passed whether or not the builder
+worked. It now queries through the index it built and asserts by id that the
+built one served the query.
+
+What remains before this is genuinely automatic: nothing yet *drives* the loop.
+A caller still observes, asks for proposals, builds, and registers. Every step
+works and is tested; the scheduler that runs them without being asked is the
+next piece.
 
 **Found while implementing — "assume the worst" is wrong for one dimension.**
 `core-design.md` says an unanswered capability should default to "unknown,
