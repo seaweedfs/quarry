@@ -63,3 +63,7 @@ missing_docs = "warn"
 
 [lints.clippy]
 all = "warn"
+
+[[example]]
+name = "measure"
+required-features = ["engine"]

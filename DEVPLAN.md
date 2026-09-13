@@ -969,3 +969,61 @@ One precondition remains a caller's to keep and is documented on
 the plan. DataFusion passes `scan` a row limit as a hint and applies `LIMIT`
 above the scan, so returning more rows than asked is safe and returning fewer
 is not.
+
+
+---
+
+## Phase 13 — Measurement `[~]`
+
+234 tests, all on three or four files and at most a couple of thousand rows,
+deciding with five constants chosen by reasoning. `examples/measure.rs` runs the
+same machinery on a million rows and prints what actually happens.
+
+Three regimes, and they behave completely differently:
+
+```text
+                     index size   prunes   bytes saved   proposer ceiling
+CLUSTERED             0.4% of tbl  19/20     1.1%         1775x optimistic
+SCATTERED             6.3% of tbl   0/20     0.0%         unboundedly so
+SELECTIVE            67.8% of tbl  19/20    95.0%         1x  (accurate)
+```
+
+### Four findings, in order of how much they matter
+
+**1. The proposer cannot tell the useful case from the useless ones.**
+`ceiling_usd` assumes perfect selectivity, and across these three it is 1775x
+optimistic, unboundedly optimistic, and exactly right — in that order. The loop
+would build the two worthless indexes as eagerly as the valuable one. This is
+the most damaging result for the self-optimizing claim, because the mechanism
+works and the *judgement* does not.
+
+Selectivity alone cannot fix it: CLUSTERED has 1.0 files per value and saves
+nothing, SELECTIVE has 1.1 and saves 95%. What separates them is whether
+**Parquet's own row-group statistics already prune**, which is a question about
+per-file min/max ranges overlapping — disjoint in CLUSTERED, total in
+SELECTIVE. Iceberg manifests carry `lower_bounds` and `upper_bounds` per file
+per field, so that is answerable from metadata alone, before building anything.
+
+**2. A file-level equality index is largely redundant with the format.** On
+clustered data it pruned 19 of 20 files and saved 1.1% of the bytes, because
+the files it skipped were ones Parquet was already reading almost nothing from.
+The index's real value is confined to the case where a value is rare *and*
+ranges overlap, which is exactly the SELECTIVE regime.
+
+**3. `bytes_estimate` is wrong by 5.7x.** `BYTES_PER_POSTING = 16` against
+77–92 bytes measured. The budget — `optimize_budget_pct` — is enforced against
+that number, so a "5% of table" ceiling really admits about 30%. And a
+*recovered* index reports its true encoded length while a freshly built one
+reports the estimate, so the same index is sized differently either side of a
+restart.
+
+**4. Most of a posting is a file path.** 91 bytes per posting, of which 8 is the
+hashed value and the rest is a path repeated once per posting. Interning paths
+into a table referenced by a small integer should cut the index several-fold,
+which is what would make the SELECTIVE index affordable at all: 68% of the
+table is not something a storage budget will ever admit.
+
+### One worry that did not materialise
+
+Building allocates a `ScalarValue` per row, which looked like a scaling
+problem. A million rows indexes in 0.05–0.64s. Not worth optimising.

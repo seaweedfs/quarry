@@ -25,6 +25,7 @@ Real SQL is planned by the rule today:
 ```sh
 cargo test --features rest-catalog     # 234 tests, incl. a live REST catalog
 cargo run --example explain            # no dependencies; a table over 4 commits
+cargo run --release --features engine --example measure   # a million rows
 ```
 
 `SELECT * FROM events WHERE tenant_id = 1`, over a real Iceberg table, reads
