@@ -95,6 +95,14 @@ impl MeteredStore {
         self
     }
 
+    /// The commit log the backend pushes into, if it offers one.
+    ///
+    /// Hand this to [`Optimizer::with_commits`](super::Optimizer::with_commits):
+    /// a backend that can hear commits is how the loop stops polling.
+    pub fn commits(&self) -> Option<crate::snapshot::Commits> {
+        self.facts.commits()
+    }
+
     /// What has been fetched so far.
     pub fn stats(&self) -> StoreStats {
         self.state.lock().expect("store state").stats

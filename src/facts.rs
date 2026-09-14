@@ -19,10 +19,11 @@ use std::fmt;
 
 use crate::cost::Tier;
 use crate::place::{Distance, Place};
+use crate::snapshot::Commits;
 
 /// What a backend can say about its objects.
 ///
-/// Both methods return `None` for "cannot say". See [`resolve`] for what is
+/// All methods return `None` for "cannot say". See [`resolve`] for what is
 /// assumed then, and why the two dimensions do *not* default the same way.
 pub trait StorageFacts: fmt::Debug + Send + Sync {
     /// Which tier `object` is stored in.
@@ -30,6 +31,16 @@ pub trait StorageFacts: fmt::Debug + Send + Sync {
 
     /// How far `object` is from a reader at `reader`.
     fn distance(&self, object: &str, reader: &Place) -> Option<Distance>;
+
+    /// The commit log this backend pushes into, if it can.
+    ///
+    /// A backend that sees commits — a catalog, a volume server — hands the
+    /// optimizer the same [`Commits`] it notes them on, and a round hears the
+    /// table moved without asking. `None` means poll: the table's own
+    /// snapshot is the fallback and nothing is lost.
+    fn commits(&self) -> Option<Commits> {
+        None
+    }
 }
 
 /// What the engine concluded about an object, after defaults.
@@ -178,6 +189,38 @@ mod tests {
 
     fn here() -> Place {
         Place::parse("/onprem/dc1/rack2/node7")
+    }
+
+    #[test]
+    fn a_backend_with_nothing_to_push_offers_no_log() {
+        assert!(OpaqueStorage.commits().is_none());
+        assert!(PlacedStorage::new().commits().is_none());
+    }
+
+    #[test]
+    fn a_backend_that_hears_commits_shares_its_log() {
+        use crate::snapshot::{Commits, SnapshotId, TableId};
+
+        #[derive(Debug)]
+        struct HearsCommits(Commits);
+        impl StorageFacts for HearsCommits {
+            fn tier(&self, _: &str) -> Option<Tier> {
+                None
+            }
+            fn distance(&self, _: &str, _: &Place) -> Option<Distance> {
+                None
+            }
+            fn commits(&self) -> Option<Commits> {
+                Some(self.0.clone())
+            }
+        }
+
+        let facts = HearsCommits(Commits::new());
+        let shared = facts.commits().expect("a log to share");
+        shared.note(TableId("events".into()), SnapshotId(7));
+
+        // The same log the optimizer would hold hears what the backend noted.
+        assert_eq!(facts.0.drain()[&TableId("events".into())], SnapshotId(7));
     }
 
     #[test]
