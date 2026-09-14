@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use url::Url;
 
