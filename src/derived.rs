@@ -31,6 +31,19 @@ pub struct DerivedId(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicyFingerprint(pub u64);
 
+impl PolicyFingerprint {
+    /// Hash the components of a principal's effective policy — row filters,
+    /// column masks, grants — in a canonical order the caller chooses.
+    ///
+    /// [`StableHasher`](crate::stable_hash::StableHasher), not
+    /// `DefaultHasher`: the fingerprint is written into persisted blobs, and
+    /// a hash that changes across restarts or toolchains makes stored derived
+    /// state silently match nothing.
+    pub fn of(parts: &[&str]) -> Self {
+        PolicyFingerprint(crate::stable_hash::StableHasher::of(&parts))
+    }
+}
+
 /// A field within a table, identified the way Iceberg identifies it.
 ///
 /// Field *ids*, never names: renaming a column must not silently invalidate or
@@ -928,6 +941,16 @@ mod tests {
             index_at(s(812), &["a"]).may_serve(&query_at(s(810)), &g),
             Decision::Reject(Reason::NotDescendant)
         );
+    }
+
+    #[test]
+    fn a_policy_fingerprint_is_stable_and_sensitive() {
+        let a = PolicyFingerprint::of(&["tenant=1", "mask:email"]);
+        let again = PolicyFingerprint::of(&["tenant=1", "mask:email"]);
+        let other = PolicyFingerprint::of(&["tenant=2", "mask:email"]);
+
+        assert_eq!(a, again, "the same policy must hash identically");
+        assert_ne!(a, other, "a different filter is a different policy");
     }
 
     #[test]
