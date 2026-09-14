@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
-use crate::snapshot::SnapshotId;
+use crate::snapshot::{Commits, SnapshotId};
 use crate::workload::{AggregateAsk, Observation, Policy, Proposal, Workload};
 
 use super::{
@@ -127,6 +127,12 @@ pub struct Optimizer {
     built: BTreeMap<DerivedId, FieldId>,
     /// Cubes this optimizer built, keyed the same way.
     built_cubes: BTreeMap<DerivedId, AggregateAsk>,
+    /// Commits heard about between rounds.
+    ///
+    /// A notification's only fact is "this table moved to at least this
+    /// snapshot", which is exactly what `failed_at` suppression and `stale`
+    /// ask about. Drained each round; an empty log changes nothing.
+    commits: Commits,
     /// The snapshot at which each id's last build failed.
     ///
     /// A failed build is retried only when the table has moved, because a
@@ -157,6 +163,7 @@ impl Optimizer {
             reader: PolicyFingerprint(0),
             built: BTreeMap::new(),
             built_cubes: BTreeMap::new(),
+            commits: Commits::new(),
             failed_at: BTreeMap::new(),
             spreads: BTreeMap::new(),
         }
@@ -165,6 +172,17 @@ impl Optimizer {
     /// Price with this table instead of the default.
     pub fn with_prices(mut self, prices: PriceTable) -> Self {
         self.prices = prices;
+        self
+    }
+
+    /// Listen for commits pushed by a catalog or storage backend.
+    ///
+    /// The log is shared: whoever hears the commit notes it, the next round
+    /// drains it. A missed or absent notification is safe — the table's own
+    /// snapshot is always the fallback — and a commit the graph cannot
+    /// relate is ignored rather than trusted.
+    pub fn with_commits(mut self, commits: Commits) -> Self {
+        self.commits = commits;
         self
     }
 
@@ -251,6 +269,17 @@ impl Optimizer {
         let mut round = Round::default();
         let proposals = self.proposals();
 
+        // The newest position the table is known to have reached: the pushed
+        // commit when there is one, what the table says otherwise. A commit
+        // the graph cannot relate reduces to the table's own snapshot.
+        let head = self
+            .commits
+            .drain()
+            .get(table.table_id())
+            .copied()
+            .filter(|moved| table.graph().get(*moved).is_some())
+            .unwrap_or_else(|| table.snapshot());
+
         if !self.policy.auto_optimize {
             for proposal in &proposals {
                 round.declined.push((
@@ -302,9 +331,9 @@ impl Optimizer {
         // queries, so its shape counts as helped and nothing asks for it
         // again. Left alone it decays while still being credited with what it
         // once saved, which is why retirement does not catch it either.
-        for id in self.stale(table) {
-            if self.failed_at.get(&id) == Some(&table.snapshot()) {
-                // Already failed on exactly this table state; see failed_at.
+        for id in self.stale(table, head) {
+            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
+                // Already failed on the newest known table state.
                 continue;
             }
             let rebuilt = if let Some(&field) = self.built.get(&id) {
@@ -315,7 +344,7 @@ impl Optimizer {
                 continue;
             };
             let Ok(derived) = rebuilt else {
-                self.failed_at.insert(id.clone(), table.snapshot());
+                self.failed_at.insert(id.clone(), head);
                 round.declined.push((id, Declined::BuildFailed));
                 continue;
             };
@@ -399,14 +428,14 @@ impl Optimizer {
                 continue;
             }
 
-            if self.failed_at.get(&id) == Some(&table.snapshot()) {
+            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
                 continue;
             }
             let built =
                 build_proposed_index(session, table, proposal.field, id.clone(), self.reader).await;
 
             let Ok(derived) = built else {
-                self.failed_at.insert(id.clone(), table.snapshot());
+                self.failed_at.insert(id.clone(), head);
                 round.declined.push((id, Declined::BuildFailed));
                 continue;
             };
@@ -446,13 +475,13 @@ impl Optimizer {
                 round.declined.push((id, Declined::RoundFull));
                 continue;
             }
-            if self.failed_at.get(&id) == Some(&table.snapshot()) {
+            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
                 continue;
             }
             let derived = match build_cube(session, table, &proposal.ask, id.clone()).await {
                 Ok(derived) => derived,
                 Err(_) => {
-                    self.failed_at.insert(id.clone(), table.snapshot());
+                    self.failed_at.insert(id.clone(), head);
                     round.declined.push((id, Declined::BuildFailed));
                     continue;
                 }
@@ -521,7 +550,10 @@ impl Optimizer {
     /// the files added since it was built, which every query must scan
     /// alongside it. Bytes rather than commits, because ten tiny appends
     /// matter less than one large one, and both are known exactly.
-    fn stale(&self, table: &QuarryTable) -> Vec<DerivedId> {
+    /// `head` is the newest snapshot the table is known to have reached —
+    /// pushed or polled. When a commit names one the graph cannot relate,
+    /// the caller has already reduced it to the table's own.
+    fn stale(&self, table: &QuarryTable, head: SnapshotId) -> Vec<DerivedId> {
         let live = table.live_bytes();
         if live == 0 {
             return Vec::new();
@@ -543,10 +575,7 @@ impl Optimizer {
                 if derived.source.table != *table.table_id() {
                     return false;
                 }
-                let Some(diff) = table
-                    .graph()
-                    .diff(derived.source.snapshot, table.snapshot())
-                else {
+                let Some(diff) = table.graph().diff(derived.source.snapshot, head) else {
                     // Lineage the graph cannot relate: the rule already
                     // refuses it, so it saves nothing and retirement will
                     // drop it. Rebuilding is not this step's job.

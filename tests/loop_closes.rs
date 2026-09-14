@@ -33,7 +33,7 @@ use quarry::engine::{
 use quarry::kinds::Index;
 use quarry::layout::Spread;
 use quarry::registry::Registry;
-use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
+use quarry::snapshot::{Commits, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 use quarry::workload::{ForeignScan, Policy, Workload};
 
 const TENANT_FIELD: u32 = 4;
@@ -1492,5 +1492,110 @@ async fn a_failed_rebuild_waits_for_the_table_to_move() {
             .iter()
             .any(|(_, why)| *why == Declined::BuildFailed),
         "a moved table earns a retry: {round:?}"
+    );
+}
+
+/// A pushed commit says the table moved before the table object does. That is
+/// the whole point of the feed: the optimizer hears "snapshot 3 exists" from
+/// the catalog while the table it was handed is still at 2, and a build that
+/// failed at 2 is worth retrying.
+#[tokio::test]
+async fn a_commit_notification_retries_a_build_the_unchanged_table_suppressed() {
+    let mut fixture = fixture("loop_commit_notify");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let registry = shared(Registry::new());
+    let commits = Commits::new();
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        mechanism_policy(Policy {
+            max_residual_pct: 10.0,
+            ..Policy::automatic(1 << 30).with_min_queries(3)
+        }),
+    )
+    .for_reader(POLICY)
+    .with_commits(commits.clone());
+
+    // Build an index at snapshot 1.
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "built: {round:?}");
+
+    // The table grows to 2 and the build is made impossible. The failure is
+    // recorded, then suppressed while the newest known position stays 2.
+    fixture.append(1, 2_000);
+    fs::remove_file(&fixture.files[0].0).expect("delete a live data file");
+
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "the first failure is reported: {round:?}"
+    );
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        !round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "an unchanged table is not retried: {round:?}"
+    );
+
+    // The catalog commits snapshot 3 and pushes the notification. The table
+    // the optimizer is handed is still at 2 — but its graph can relate 3, so
+    // the commit stands and the retry happens.
+    fixture.append(1, 100);
+    let mut pinned = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(2),
+        fixture.graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .with_shared_registry(Arc::clone(&registry))
+    .on_object_store(ObjectStoreUrl::local_filesystem());
+    for (file, size) in &fixture.sizes {
+        pinned = pinned.with_parquet_file(file.clone(), *size);
+    }
+    let pinned = Arc::new(pinned);
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&pinned))
+        .expect("register");
+
+    let round = optimizer.round(&session, &pinned).await;
+    assert!(
+        !round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "nothing heard yet, nothing retried: {round:?}"
+    );
+
+    commits.note(TableId("events".into()), SnapshotId(3));
+    let round = optimizer.round(&session, &pinned).await;
+    assert!(
+        round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "a pushed commit lifts the suppression: {round:?}"
     );
 }

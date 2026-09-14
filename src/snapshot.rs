@@ -99,6 +99,45 @@ impl Snapshot {
     }
 }
 
+/// A shared log of commits: which table moved to which snapshot.
+///
+/// Push rather than poll. Whatever learns of a commit — a catalog, a
+/// re-pointed table, a test — notes it, and the optimizer drains it each
+/// round to learn the newest known position of each table. A missed or
+/// duplicated note costs nothing: the table's own snapshot is always the
+/// fallback.
+#[derive(Clone, Debug, Default)]
+pub struct Commits(std::sync::Arc<std::sync::Mutex<Vec<(TableId, SnapshotId)>>>);
+
+impl Commits {
+    /// An empty log.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that `table` moved to `snapshot`.
+    pub fn note(&self, table: TableId, snapshot: SnapshotId) {
+        self.0.lock().expect("commits").push((table, snapshot));
+    }
+
+    /// The newest snapshot noted per table, draining the log.
+    ///
+    /// Duplicates and out-of-order notes collapse to the maximum per table:
+    /// the only fact a commit carries is that a newer snapshot exists.
+    pub fn drain(&self) -> BTreeMap<TableId, SnapshotId> {
+        self.0.lock().expect("commits").drain(..).fold(
+            BTreeMap::new(),
+            |mut latest, (table, snapshot)| {
+                let entry = latest.entry(table).or_insert(snapshot);
+                if snapshot > *entry {
+                    *entry = snapshot;
+                }
+                latest
+            },
+        )
+    }
+}
+
 /// What changed between two snapshots, classified by whether derived state
 /// built from the earlier one can be repaired by reading more data.
 ///
@@ -232,6 +271,10 @@ mod tests {
         SnapshotId(id)
     }
 
+    fn t(name: &str) -> TableId {
+        TableId(name.to_owned())
+    }
+
     /// 810 -> 811 -> 812, with one file added at each step.
     fn linear() -> SnapshotGraph {
         SnapshotGraph::new()
@@ -354,5 +397,26 @@ mod tests {
         let g = linear();
         assert!(g.diff(s(810), s(999)).is_none());
         assert!(g.diff(s(999), s(810)).is_none());
+    }
+
+    #[test]
+    fn an_empty_commit_log_drains_to_nothing() {
+        assert!(Commits::new().drain().is_empty());
+    }
+
+    #[test]
+    fn commits_collapse_to_the_newest_per_table() {
+        let commits = Commits::new();
+        commits.note(t("a"), s(810));
+        commits.note(t("a"), s(812)); // out of order with the line below
+        commits.note(t("a"), s(811));
+        commits.note(t("a"), s(812)); // a duplicate is harmless
+        commits.note(t("b"), s(900));
+
+        let latest = commits.drain();
+        assert_eq!(latest[&t("a")], s(812));
+        assert_eq!(latest[&t("b")], s(900));
+        assert_eq!(latest.len(), 2);
+        assert!(commits.drain().is_empty());
     }
 }

@@ -554,7 +554,7 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] Registry rebuilt by listing after a restart
 - [ ] Publishing to Iceberg `TableMetadata.statistics`
 - [x] Credits and the shape aggregate persisted, with a retirement grace window
-- [ ] `commit_notifications`, so a round knows the table moved without asking
+- [x] `commit_notifications`, so a round knows the table moved without asking
 - [x] Telemetry from other engines, so the workload is the table's, not ours
 
 **Done when** the optimizer contains no backend name, and an unused derived
@@ -720,11 +720,13 @@ Pessimism about a dimension a backend does not have is not caution, it is a
 made-up cost. `Resolved` carries an `assumed` flag so a caller can tell a
 reported answer from a defaulted one.
 
-**`commit_notifications` deliberately deferred.** The design names it as the
-third method and calls it the capability that decides whether derived state is
-maintainable. It is omitted until phase 10's loop can consume it: a method
-nothing reads is the speculative generality this project has already deleted
-once (`ByteRange`, phase 9).
+**`commit_notifications` is a shared log, not a trait.** `Commits` is an
+append-only list of `(table, snapshot)` a catalog or storage backend can push
+into; `Optimizer::round` drains it and takes the newest position the graph can
+relate as the head for stale-state evaluation and failed-build suppression. A
+missed notification is safe because the table's own snapshot is the fallback;
+duplicates, out-of-order commits, and commits the graph cannot relate are all
+harmless. Backend-neutral on purpose: whoever hears the commit notes it.
 
 ---
 
