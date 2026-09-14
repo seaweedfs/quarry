@@ -60,8 +60,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use iceberg::Catalog;
 use iceberg::io::{FileIO, FileRead};
 use iceberg::puffin::{Blob, CompressionCodec, PuffinReader, PuffinWriter};
+use iceberg::spec::StatisticsFile;
+use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
@@ -127,6 +131,15 @@ impl Layout {
     /// Everything for one table, in the path space `FileIO` uses.
     pub fn table_prefix(&self, table: &TableId) -> String {
         format!("{}/{}/", self.prefix, table.0)
+    }
+
+    /// Where the manifest published for one snapshot lives.
+    ///
+    /// `manifest` does not parse as a field id, so [`Layout::parse`] — and
+    /// therefore listing-driven recovery — cannot mistake it for derived
+    /// state.
+    pub fn statistics_path(&self, table: &TableId, at: SnapshotId) -> String {
+        format!("{}/{}/manifest/{}.puffin", self.prefix, table.0, at.0)
     }
 
     /// The same prefix as an object store addresses it.
@@ -699,6 +712,123 @@ pub async fn discard(file_io: &FileIO, paths: &[String]) -> iceberg::Result<usiz
     Ok(removed)
 }
 
+/// Property carrying the path an advertised piece's bytes live at.
+///
+/// A manifest blob has no payload; it points at the file that does. Entries
+/// lacking this property are another engine's statistics, not ours.
+pub const QUARRY_PATH_PROPERTY: &str = "quarry.path";
+
+/// One piece of derived state to advertise in a snapshot's statistics.
+#[derive(Clone, Debug)]
+pub struct Advertised {
+    /// The blob type a reader would find at `path`.
+    pub kind: String,
+    /// The field ids the piece covers.
+    pub fields: Vec<i32>,
+    /// Where the bytes are, in `FileIO` path space.
+    pub path: String,
+    /// Whatever the real blob recorded — policy, hash version.
+    pub properties: HashMap<String, String>,
+}
+
+/// What a published [`StatisticsFile`] advertises.
+///
+/// Reads `blob_metadata` directly rather than the file: the catalog's copy
+/// is the authority, so discovery costs no read at all.
+pub fn advertised(stats: &StatisticsFile) -> Vec<Advertised> {
+    stats
+        .blob_metadata
+        .iter()
+        .filter_map(|blob| {
+            let path = blob.properties.get(QUARRY_PATH_PROPERTY)?.clone();
+            Some(Advertised {
+                kind: blob.r#type.clone(),
+                fields: blob.fields.clone(),
+                path,
+                properties: blob.properties.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Write a manifest advertising `entries` for `at`, and return the
+/// [`StatisticsFile`] committing it needs.
+///
+/// Statistics give a snapshot one file, so a `prior` file's blobs are carried
+/// forward first: replacing it without them would delete another engine's
+/// statistics rather than add ours.
+pub async fn write_manifest(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    entries: &[Advertised],
+    prior: Option<&StatisticsFile>,
+) -> iceberg::Result<StatisticsFile> {
+    let path = layout.statistics_path(table, at);
+    let output = file_io.new_output(&path)?;
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+
+    if let Some(stats) = prior {
+        if file_io.exists(&stats.statistics_path).await? {
+            let reader = PuffinReader::new(file_io.new_input(&stats.statistics_path)?);
+            let metadata = reader.file_metadata().await?;
+            for prior_blob in metadata.blobs() {
+                let blob = reader.blob(prior_blob).await?;
+                writer.add(blob, prior_blob.compression_codec()).await?;
+            }
+        }
+    }
+
+    for entry in entries {
+        let mut properties = entry.properties.clone();
+        properties.insert(QUARRY_PATH_PROPERTY.to_owned(), entry.path.clone());
+        writer
+            .add(
+                Blob::builder()
+                    .r#type(entry.kind.clone())
+                    .fields(entry.fields.clone())
+                    .snapshot_id(at.0)
+                    .sequence_number(0)
+                    .data(Vec::new())
+                    .properties(properties)
+                    .build(),
+                CompressionCodec::None,
+            )
+            .await?;
+    }
+    writer.close().await?;
+
+    let input = file_io.new_input(&path)?;
+    let size = input.metadata().await?.size as i64;
+    let reader = PuffinReader::new(input);
+    let metadata = reader.file_metadata().await?;
+    let blobs_end = metadata
+        .blobs()
+        .iter()
+        .map(|blob| blob.offset() + blob.length())
+        .max()
+        .unwrap_or(4) as i64;
+    Ok(StatisticsFile {
+        snapshot_id: at.0,
+        statistics_path: path,
+        file_size_in_bytes: size,
+        file_footer_size_in_bytes: size - blobs_end,
+        key_metadata: None,
+        blob_metadata: metadata
+            .blobs()
+            .iter()
+            .map(|blob| iceberg::spec::BlobMetadata {
+                r#type: blob.blob_type().to_owned(),
+                snapshot_id: blob.snapshot_id(),
+                sequence_number: blob.sequence_number(),
+                fields: blob.fields().to_vec(),
+                properties: blob.properties().clone(),
+            })
+            .collect(),
+    })
+}
+
 /// Shared handle to a table's on-disk derived state.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -755,6 +885,96 @@ impl Store {
     /// Delete unusable objects.
     pub async fn discard(&self, paths: &[String]) -> iceberg::Result<usize> {
         discard(&self.file_io, paths).await
+    }
+
+    /// Write a manifest for `entries`, carrying forward whatever `prior`
+    /// already published for the same snapshot.
+    pub async fn manifest(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        entries: &[Advertised],
+        prior: Option<&StatisticsFile>,
+    ) -> iceberg::Result<StatisticsFile> {
+        write_manifest(&self.file_io, &self.layout, table, at, entries, prior).await
+    }
+
+    /// Advertise derived state through the table's own metadata.
+    ///
+    /// The merge runs against the metadata `table` carries, so publish the
+    /// freshest load available.
+    pub async fn publish(
+        &self,
+        table: &Table,
+        catalog: &dyn Catalog,
+        at: SnapshotId,
+        entries: &[Advertised],
+    ) -> iceberg::Result<StatisticsFile> {
+        let metadata = table.metadata();
+        let stats = self
+            .manifest(
+                &crate::from_iceberg::table_id(metadata),
+                at,
+                entries,
+                metadata.statistics_for_snapshot(at.0),
+            )
+            .await?;
+        Transaction::new(table)
+            .update_statistics()
+            .set_statistics(stats.clone())
+            .apply(Transaction::new(table))?
+            .commit(catalog)
+            .await?;
+        Ok(stats)
+    }
+
+    /// Register what a published statistics file advertises.
+    ///
+    /// The published discovery path, where [`Store::recover`'s](Self::recover)
+    /// is listing: the catalog's `blob_metadata` names every entry, so this
+    /// costs no listing and no read of the manifest itself.
+    pub async fn recover_published(
+        &self,
+        table: &TableId,
+        stats: &StatisticsFile,
+        known_snapshots: &[SnapshotId],
+    ) -> iceberg::Result<Recovered> {
+        let mut recovered = Recovered::default();
+        let at = SnapshotId(stats.snapshot_id);
+        if !known_snapshots.contains(&at) {
+            recovered.discarded.push(stats.statistics_path.clone());
+            return Ok(recovered);
+        }
+        for entry in advertised(stats) {
+            if entry.kind != QUARRY_EQ_INDEX_V2 {
+                continue;
+            }
+            let Some(&field) = entry.fields.first() else {
+                continue;
+            };
+            let Ok(field) = u32::try_from(field) else {
+                continue;
+            };
+            match read_index(&self.file_io, &entry.path, field).await? {
+                Some((index, policy)) => {
+                    let id = super::index_id(table, field);
+                    let bytes = index.bytes_estimate();
+                    recovered.fields.insert(id.clone(), field);
+                    recovered.registry.register(Derived::new(
+                        id,
+                        Source {
+                            table: table.clone(),
+                            snapshot: at,
+                        },
+                        policy,
+                        bytes,
+                        Box::new(index),
+                    ));
+                }
+                None => recovered.discarded.push(entry.path),
+            }
+        }
+        Ok(recovered)
     }
 
     /// Reclaim the bytes behind what a round retired.

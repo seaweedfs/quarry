@@ -11,7 +11,7 @@
 
 #![cfg(all(feature = "engine", feature = "iceberg"))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,10 +25,11 @@ use iceberg::io::FileIO;
 use object_store::local::LocalFileSystem;
 use url::Url;
 
+use iceberg::puffin::{Blob, CompressionCodec, PuffinWriter};
 use quarry::derived::PolicyFingerprint;
 use quarry::engine::{
-    Layout, Optimizer, Quarry, QuarryTable, Retired, Store, build_index, hash_scalar, index_id,
-    read_index, shared, write_index,
+    Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_index,
+    hash_scalar, index_id, read_index, shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -784,4 +785,142 @@ async fn a_retired_index_stays_retired_only_if_reclaimed() {
         .await
         .expect("recover after reclaim");
     assert_eq!(gone.registry.len(), 0, "the retirement should stick");
+}
+
+#[tokio::test]
+async fn a_published_manifest_recovers_without_listing() {
+    let fixture = fixture("persist_publish");
+    let (_, store) = stacks(&fixture);
+
+    let session = quarry().session();
+    let built = build_index(&session, &table(&fixture, Registry::new()), TENANT_FIELD)
+        .await
+        .expect("build");
+    let path = store
+        .write(&events(), SnapshotId(1), POLICY, &built)
+        .await
+        .expect("write");
+
+    // The manifest advertises the index by pointing at its path; the kind is
+    // the blob's own type, so a reader sees exactly what exists.
+    let stats = store
+        .manifest(
+            &events(),
+            SnapshotId(1),
+            &[Advertised {
+                kind: quarry::engine::QUARRY_EQ_INDEX_V2.to_owned(),
+                fields: vec![TENANT_FIELD as i32],
+                path: path.clone(),
+                properties: HashMap::new(),
+            }],
+            None,
+        )
+        .await
+        .expect("manifest");
+
+    let entries = advertised(&stats);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, path);
+    assert_eq!(entries[0].fields, vec![TENANT_FIELD as i32]);
+
+    // Recovery through the published copy: no listing, just the paths the
+    // catalog's metadata names.
+    let recovered = store
+        .recover_published(&events(), &stats, &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    assert_eq!(recovered.registry.len(), 1, "the index should be found");
+    assert!(recovered.discarded.is_empty());
+}
+
+#[tokio::test]
+async fn publishing_carries_forward_statistics_already_there() {
+    let fixture = fixture("persist_merge");
+    let (file_io, store) = stacks(&fixture);
+
+    // Another engine already published statistics for the snapshot.
+    let prior_path = fixture.dir.join("their-stats.puffin");
+    let output = file_io
+        .new_output(prior_path.to_str().expect("utf-8"))
+        .expect("output");
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false)
+        .await
+        .expect("writer");
+    writer
+        .add(
+            Blob::builder()
+                .r#type("ndv".to_owned())
+                .fields(vec![1])
+                .snapshot_id(1)
+                .sequence_number(0)
+                .data(vec![1, 2, 3])
+                .properties(HashMap::new())
+                .build(),
+            CompressionCodec::None,
+        )
+        .await
+        .expect("add");
+    writer.close().await.expect("close");
+    let prior = iceberg::spec::StatisticsFile {
+        snapshot_id: 1,
+        statistics_path: prior_path.to_string_lossy().into_owned(),
+        file_size_in_bytes: 0,
+        file_footer_size_in_bytes: 0,
+        key_metadata: None,
+        blob_metadata: vec![],
+    };
+
+    let stats = store
+        .manifest(
+            &events(),
+            SnapshotId(1),
+            &[Advertised {
+                kind: quarry::engine::QUARRY_EQ_INDEX_V2.to_owned(),
+                fields: vec![TENANT_FIELD as i32],
+                path: "anywhere.puffin".to_owned(),
+                properties: HashMap::new(),
+            }],
+            Some(&prior),
+        )
+        .await
+        .expect("manifest");
+
+    let types: Vec<_> = stats
+        .blob_metadata
+        .iter()
+        .map(|blob| blob.r#type.as_str())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["ndv", quarry::engine::QUARRY_EQ_INDEX_V2],
+        "the prior engine's blob must be carried forward, not replaced"
+    );
+
+    // Ours advertise a path; theirs does not, so it is never mistaken for
+    // derived state.
+    let entries = advertised(&stats);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "anywhere.puffin");
+}
+
+#[tokio::test]
+async fn a_manifest_for_a_forgotten_snapshot_is_discarded() {
+    let fixture = fixture("persist_publish_stale");
+    let (_, store) = stacks(&fixture);
+
+    let stats = store
+        .manifest(&events(), SnapshotId(7), &[], None)
+        .await
+        .expect("manifest");
+
+    let recovered = store
+        .recover_published(&events(), &stats, &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    assert_eq!(recovered.registry.len(), 0);
+    assert_eq!(
+        recovered.discarded,
+        vec![stats.statistics_path.clone()],
+        "a manifest for a snapshot the table forgot is disposable"
+    );
 }

@@ -15,7 +15,7 @@
 
 #![cfg(feature = "rest-catalog")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use object_store::local::LocalFileSystem;
 use url::Url;
 
 use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
-use quarry::engine::{Quarry, hash_scalar, table_from_catalog};
+use quarry::engine::{Advertised, Layout, Quarry, Store, hash_scalar, table_from_catalog};
 use quarry::from_iceberg::object_path;
 use quarry::kinds::Index;
 use quarry::registry::Registry;
@@ -330,4 +330,101 @@ async fn the_table_identity_survives_the_catalog() {
         quarry::from_iceberg::current_snapshot(loaded.metadata()),
         Some(SnapshotId(1))
     );
+}
+
+#[tokio::test]
+async fn publish_commits_the_manifest_to_table_metadata() {
+    let (dir, metadata, _) = table_on_disk("rest_publish").await;
+    let mut server = mockito::Server::new_async().await;
+
+    server
+        .mock("GET", "/v1/config")
+        .with_status(200)
+        .with_body(r#"{"overrides": {}, "defaults": {}}"#)
+        .create_async()
+        .await;
+    let load_table = format!(
+        r#"{{"metadata-location": "{}/metadata/v1.metadata.json",
+            "metadata": {metadata}, "config": {{}}}}"#,
+        dir.to_string_lossy()
+    );
+    server
+        .mock("GET", "/v1/namespaces/db/tables/events")
+        .with_status(200)
+        .with_body(load_table)
+        .create_async()
+        .await;
+    // The commit: a POST of requirements + updates to the table resource.
+    let committed = server
+        .mock("POST", "/v1/namespaces/db/tables/events")
+        .match_body(mockito::Matcher::Regex(
+            "set-statistics.*manifest/1\\.puffin".to_owned(),
+        ))
+        .with_status(200)
+        .with_body(format!(
+            r#"{{"metadata-location": "{}/metadata/v2.metadata.json",
+                "metadata": {metadata}}}"#,
+            dir.to_string_lossy()
+        ))
+        .create_async()
+        .await;
+
+    let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build());
+    let loaded = catalog.load_table(&events()).await.expect("load table");
+
+    // Real derived state on disk first, advertised second — the same order as
+    // `write`, so a published path never dangles.
+    let file_io = Arc::new(
+        FileIO::from_path(dir.to_str().expect("utf-8"))
+            .expect("file io")
+            .build()
+            .expect("build file io"),
+    );
+    let store = Store::new(
+        file_io,
+        Arc::new(LocalFileSystem::new()),
+        Layout::beside(&dir.to_string_lossy()),
+    );
+    let index_path = store
+        .write(&TableId(TABLE_UUID.into()), SnapshotId(1), POLICY, &{
+            let mut index = Index::new(TENANT_FIELD);
+            index.insert(
+                hash_scalar(&datafusion::scalar::ScalarValue::Int64(Some(1))),
+                FileId("a.parquet".into()),
+            );
+            index.with_bytes(128)
+        })
+        .await
+        .expect("write index");
+
+    let stats = store
+        .publish(
+            &loaded,
+            &catalog,
+            SnapshotId(1),
+            &[Advertised {
+                kind: quarry::engine::QUARRY_EQ_INDEX_V2.to_owned(),
+                fields: vec![TENANT_FIELD as i32],
+                path: index_path.clone(),
+                properties: HashMap::new(),
+            }],
+        )
+        .await
+        .expect("publish");
+
+    committed.assert_async().await;
+    assert_eq!(stats.snapshot_id, 1);
+    assert!(
+        stats.statistics_path.ends_with("manifest/1.puffin"),
+        "published path: {}",
+        stats.statistics_path
+    );
+
+    // And the advertisement resolves: what the catalog now records points at
+    // bytes that recover.
+    let recovered = store
+        .recover_published(&TableId(TABLE_UUID.into()), &stats, &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    assert_eq!(recovered.registry.len(), 1);
 }

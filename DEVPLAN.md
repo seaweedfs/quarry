@@ -552,7 +552,7 @@ deletes vanish rather than fail, and it was the bridge's
 - [x] `StableHasher` and `HASH_VERSION`, gating anything written down
 - [x] Index bytes persisted as Puffin blobs at self-describing paths
 - [x] Registry rebuilt by listing after a restart
-- [ ] Publishing to Iceberg `TableMetadata.statistics`
+- [x] Publishing to Iceberg `TableMetadata.statistics`
 - [x] Credits and the shape aggregate persisted, with a retirement grace window
 - [x] `commit_notifications`, so a round knows the table moved without asking
 - [x] Telemetry from other engines, so the workload is the table's, not ours
@@ -719,6 +719,15 @@ unknown tier → Hot, NOT Cold
 Pessimism about a dimension a backend does not have is not caution, it is a
 made-up cost. `Resolved` carries an `assumed` flag so a caller can tell a
 reported answer from a defaulted one.
+
+**Statistics are one file per snapshot, so publishing merges.** A manifest
+puffin — one blob per piece, its `quarry.path` property pointing at the real
+file — is written under `manifest/<snapshot>.puffin` (a name `Layout::parse`
+rejects, so listing-driven recovery never mistakes it for data) and committed
+with `SetStatistics`. Whatever blobs the snapshot's prior statistics held are
+carried forward first: replacing the file without them would delete another
+engine's statistics rather than add ours. Discovery through the catalog reads
+`blob_metadata` directly — no listing, no read of the manifest itself.
 
 **`commit_notifications` is a shared log, not a trait.** `Commits` is an
 append-only list of `(table, snapshot)` a catalog or storage backend can push
