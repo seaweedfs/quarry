@@ -103,6 +103,30 @@ pub enum Declined {
     /// Refusing to build without evidence is the conservative direction: a
     /// useless index costs storage and a build, forever, for nothing.
     NoEvidence,
+    /// Built before, and it did not pay.
+    ///
+    /// Retirement removes a piece; this is what stops the next round from
+    /// rebuilding it. The negative evidence the design's calibration section
+    /// calls for: a node retained and never reused says the prediction was
+    /// wrong, and building it again would spend a scan relearning that.
+    NotWorthIt,
+}
+
+/// Predicted versus realized for one piece of derived state.
+///
+/// `realized` counts only bytes not read: the wait a skipped file would have
+/// cost is not metered per observation, so it understates what a piece
+/// actually saved. Honest, and biased in the direction that underclaims.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Calibration {
+    /// What was measured.
+    pub id: DerivedId,
+    /// What the proposal expected it to save when it was built.
+    pub predicted_usd: f64,
+    /// What it measurably did save: bytes not read, priced.
+    pub realized_usd: f64,
+    /// Queries it has served.
+    pub queries: u64,
 }
 
 /// Watches a table, and keeps its derived state worth having.
@@ -127,6 +151,12 @@ pub struct Optimizer {
     built: BTreeMap<DerivedId, FieldId>,
     /// Cubes this optimizer built, keyed the same way.
     built_cubes: BTreeMap<DerivedId, AggregateAsk>,
+    /// What each build was expected to save, in dollars.
+    ///
+    /// Kept so a prediction can be held against the realized credit later:
+    /// without it, what a proposal claimed evaporates at build time and there
+    /// is nothing to calibrate against.
+    predicted: BTreeMap<DerivedId, f64>,
     /// Commits heard about between rounds.
     ///
     /// A notification's only fact is "this table moved to at least this
@@ -163,6 +193,7 @@ impl Optimizer {
             reader: PolicyFingerprint(0),
             built: BTreeMap::new(),
             built_cubes: BTreeMap::new(),
+            predicted: BTreeMap::new(),
             commits: Commits::new(),
             failed_at: BTreeMap::new(),
             spreads: BTreeMap::new(),
@@ -249,6 +280,58 @@ impl Optimizer {
     /// The policy in force.
     pub fn policy(&self) -> Policy {
         self.policy
+    }
+
+    /// Predicted versus realized for everything measured on both sides.
+    ///
+    /// Only pieces this optimizer built have a prediction, and only pieces
+    /// that have served have a realized figure — the intersection is where
+    /// calibration is possible. The deferred future-reuse work needs exactly
+    /// this comparison to exist.
+    pub fn calibration(&self) -> Vec<Calibration> {
+        use crate::cost::Tier;
+        use crate::place::Distance;
+
+        self.predicted
+            .iter()
+            .filter_map(|(id, predicted)| {
+                let seen = self.workload.credited(id)?;
+                Some(Calibration {
+                    id: id.clone(),
+                    predicted_usd: *predicted,
+                    realized_usd: seen.bytes_saved() as f64
+                        * self.prices.byte_usd(Tier::Hot, Distance::Far),
+                    queries: seen.helped,
+                })
+            })
+            .collect()
+    }
+
+    /// How much this id's last build proved out, as a multiplier on its next
+    /// expectation: `realized / predicted`, capped at one — evidence can
+    /// deflate a prediction, never inflate it.
+    ///
+    /// Reached only for ids absent from the registry, so a piece with a
+    /// prediction but no credit is one that was built and then dropped —
+    /// retired or rejected — having served nothing. That is a zero.
+    fn proven(&self, id: &DerivedId) -> f64 {
+        use crate::cost::Tier;
+        use crate::place::Distance;
+
+        let Some(&predicted) = self.predicted.get(id) else {
+            return 1.0;
+        };
+        let realized = self
+            .workload
+            .credited(id)
+            .map(|seen| {
+                seen.bytes_saved() as f64 * self.prices.byte_usd(Tier::Hot, Distance::Far)
+            })
+            .unwrap_or(0.0);
+        if predicted <= 0.0 {
+            return if realized > 0.0 { 1.0 } else { 0.0 };
+        }
+        (realized / predicted).clamp(0.0, 1.0)
     }
 
     /// What a round would do, without doing it.
@@ -411,7 +494,8 @@ impl Optimizer {
             // only happens when the policy does not require evidence.
             let expected = spread
                 .map(|spread| proposal.expected_usd(&spread, &self.prices))
-                .unwrap_or(proposal.ceiling_usd);
+                .unwrap_or(proposal.ceiling_usd)
+                * self.proven(&id);
             ranked.push((proposal, expected));
         }
 
@@ -421,10 +505,25 @@ impl Optimizer {
                 .then_with(|| left.field.cmp(&right.field))
         });
 
-        for (proposal, _) in ranked {
+        for (proposal, expected) in ranked {
             let id = index_id(&proposal.table, proposal.field);
             if round.built.len() >= self.policy.max_builds_per_round {
                 round.declined.push((id, Declined::RoundFull));
+                continue;
+            }
+
+            // Building costs a scan; a build whose own evidence says it will
+            // not pay that back is declined rather than re-tried. Only
+            // measured under-prediction triggers this — a first-time proposal
+            // is judged by its estimate alone.
+            if self.proven(&id) < 1.0
+                && expected
+                    <= table.live_bytes() as f64
+                        * self
+                            .prices
+                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+            {
+                round.declined.push((id, Declined::NotWorthIt));
                 continue;
             }
 
@@ -455,6 +554,7 @@ impl Optimizer {
                 .expect("registry lock")
                 .register(derived);
             self.built.insert(id.clone(), proposal.field);
+            self.predicted.insert(id.clone(), expected);
             round.built.push(id);
         }
 
@@ -473,6 +573,21 @@ impl Optimizer {
             }
             if round.built.len() >= self.policy.max_builds_per_round {
                 round.declined.push((id, Declined::RoundFull));
+                continue;
+            }
+            // Same gate as indexes: a ceiling scaled by how the last build of
+            // this ask proved out, against the scan a rebuild costs. A cube's
+            // prediction is a bound rather than an estimate, but a served
+            // cube replaces the whole scan, so realized lands close to it.
+            let proven = self.proven(&id);
+            if proven < 1.0
+                && proposal.ceiling_usd * proven
+                    <= table.live_bytes() as f64
+                        * self
+                            .prices
+                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+            {
+                round.declined.push((id, Declined::NotWorthIt));
                 continue;
             }
             if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
@@ -497,6 +612,7 @@ impl Optimizer {
                 .expect("registry lock")
                 .register(derived);
             self.built_cubes.insert(id.clone(), proposal.ask);
+            self.predicted.insert(id.clone(), proposal.ceiling_usd);
             round.built.push(id);
         }
 

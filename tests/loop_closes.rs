@@ -1495,10 +1495,137 @@ async fn a_failed_rebuild_waits_for_the_table_to_move() {
     );
 }
 
+/// Retirement removes a useless index; measured futility is what stops the
+/// next proposal from rebuilding it. Without that, the loop would spend a
+/// scan every cycle relearning that this build does not pay.
+#[tokio::test]
+async fn a_retired_index_is_not_built_again() {
+    let fixture = fixture("loop_suppress");
+    let filtered = "SELECT * FROM events WHERE tenant_id = 1";
+    let table_bytes: u64 = fixture.sizes.values().sum();
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        mechanism_policy(Policy {
+            retire_after_queries: 8,
+            ..Policy::automatic_pct(table_bytes, 5.0).with_min_queries(3)
+        }),
+    )
+    .for_reader(POLICY);
+
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    // Enough of the shape to build for it.
+    for _ in 0..5 {
+        session.sql(filtered).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "built: {round:?}");
+    let id = round.built[0].clone();
+
+    // The traffic moves on: scans the index cannot help, enough of them for
+    // retirement to judge it by.
+    for _ in 0..10 {
+        session.sql("SELECT * FROM events").await.expect("scan");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round.retired.iter().any(|retired| retired.id == id),
+        "an index that served nothing is retired: {round:?}"
+    );
+
+    // The shape returns. The proposal returns with it — but the last build
+    // already proved worthless, so it is declined rather than re-tried.
+    for _ in 0..5 {
+        session.sql(filtered).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round
+            .declined
+            .iter()
+            .any(|(declined, why)| *declined == id && *why == Declined::NotWorthIt),
+        "the last build's failure to pay must be remembered: {round:?}"
+    );
+    assert!(round.built.is_empty(), "must not rebuild: {round:?}");
+}
+
 /// A pushed commit says the table moved before the table object does. That is
 /// the whole point of the feed: the optimizer hears "snapshot 3 exists" from
 /// the catalog while the table it was handed is still at 2, and a build that
 /// failed at 2 is worth retrying.
+/// A build keeps a record of what it promised: predicted versus realized can
+/// be asked of the optimizer, which is what the deferred calibration work
+/// needs.
+#[tokio::test]
+async fn a_build_records_what_it_expected_so_calibration_can_judge_it() {
+    let fixture = fixture("loop_calibrate");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let table_bytes: u64 = fixture.sizes.values().sum();
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    // A supplied spread, so the prediction is nonzero: the fixture's own data
+    // is clustered, which would honestly predict zero.
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        mechanism_policy(Policy::automatic_pct(table_bytes, 5.0).with_min_queries(3)),
+    )
+    .for_reader(POLICY)
+    .with_spreads(BTreeMap::from([(
+        TENANT_FIELD,
+        Spread::from_bounds(4, &[(1.0, 4.0); 4], 1.0),
+    )]));
+
+    assert!(
+        optimizer.calibration().is_empty(),
+        "nothing built, nothing predicted"
+    );
+
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+    let round = optimizer.round(&session, &served).await;
+    let id = round.built[0].clone();
+
+    assert!(
+        optimizer.calibration().is_empty(),
+        "a prediction with nothing served yet has nothing to be held against"
+    );
+
+    session.sql(sql).await.expect("query");
+    let report = served.last_scan().expect("scan");
+    assert_eq!(report.used.as_deref(), Some(id.0.as_str()));
+    optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+
+    let calibration = optimizer.calibration();
+    let [entry] = calibration.as_slice() else {
+        panic!("one calibrated piece: {calibration:?}")
+    };
+    assert_eq!(entry.id, id);
+    assert!(entry.predicted_usd > 0.0);
+    assert!(
+        entry.realized_usd > 0.0,
+        "a skipped file is bytes not read: {entry:?}"
+    );
+    assert_eq!(entry.queries, 1);
+}
+
 #[tokio::test]
 async fn a_commit_notification_retries_a_build_the_unchanged_table_suppressed() {
     let mut fixture = fixture("loop_commit_notify");
