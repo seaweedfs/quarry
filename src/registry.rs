@@ -216,11 +216,19 @@ mod tests {
         }
         fn matches(&self, query: &Query) -> Option<Rewrite> {
             match self.wants {
-                None => Some(Rewrite::Substitute { unionable: true }),
-                Some(field) => query
-                    .filtered_fields()
-                    .contains(&field)
-                    .then_some(Rewrite::Substitute { unionable: true }),
+                None => Some(Rewrite::Substitute {
+                    unionable: true,
+                    rollup: None,
+                }),
+                Some(field) => {
+                    query
+                        .filtered_fields()
+                        .contains(&field)
+                        .then_some(Rewrite::Substitute {
+                            unionable: true,
+                            rollup: None,
+                        })
+                }
             }
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {

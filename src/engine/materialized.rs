@@ -102,6 +102,7 @@ impl Kind for MaterializedResult {
     fn matches(&self, query: &Query) -> Option<Rewrite> {
         (query.plan.as_ref() == Some(&self.plan)).then_some(Rewrite::Substitute {
             unionable: self.unionable,
+            rollup: None,
         })
     }
 

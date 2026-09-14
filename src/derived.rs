@@ -311,6 +311,13 @@ pub enum Rewrite {
         /// engine does not have yet, so aggregated derived state is only
         /// admitted when there is no residual at all.
         unionable: bool,
+        /// The grain the stored rows are aggregated at, if they are.
+        ///
+        /// `Some` means the derived state holds partial aggregates, not raw
+        /// rows: whoever serves the rewrite must re-aggregate to the query's
+        /// grain, and additive residual cannot be unioned — which is why such
+        /// state is always `unionable: false`.
+        rollup: Option<Aggregate>,
     },
 }
 
@@ -324,7 +331,7 @@ impl Rewrite {
     pub fn can_union_residual(&self) -> bool {
         match self {
             Rewrite::Prune { .. } => true,
-            Rewrite::Substitute { unionable } => *unionable,
+            Rewrite::Substitute { unionable, .. } => *unionable,
         }
     }
 }
@@ -629,7 +636,10 @@ mod tests {
             "result"
         }
         fn matches(&self, query: &Query) -> Option<Rewrite> {
-            (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute { unionable: true })
+            (query.plan_hash == self.plan_hash).then_some(Rewrite::Substitute {
+                unionable: true,
+                rollup: None,
+            })
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {
             Cost::ZERO
@@ -737,7 +747,10 @@ mod tests {
         assert_eq!(
             decision,
             Decision::UseWith {
-                rewrite: Rewrite::Substitute { unionable: true },
+                rewrite: Rewrite::Substitute {
+                    unionable: true,
+                    rollup: None,
+                },
                 also_scan: BTreeSet::from([f("c")]),
             }
         );
@@ -755,7 +768,10 @@ mod tests {
                 "aggregate"
             }
             fn matches(&self, _query: &Query) -> Option<Rewrite> {
-                Some(Rewrite::Substitute { unionable: false })
+                Some(Rewrite::Substitute {
+                    unionable: false,
+                    rollup: None,
+                })
             }
             fn cost(&self, _prices: &PriceTable) -> Cost {
                 Cost::ZERO
@@ -781,7 +797,10 @@ mod tests {
         // Nothing added yet: usable.
         assert_eq!(
             aggregate.may_serve(&query_at(s(810)), &g),
-            Decision::Use(Rewrite::Substitute { unionable: false })
+            Decision::Use(Rewrite::Substitute {
+                unionable: false,
+                rollup: None,
+            })
         );
 
         // A file has been appended: refused, where a table-shaped result

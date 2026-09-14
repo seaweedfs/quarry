@@ -315,7 +315,13 @@ mod tests {
         let used = e.used.as_ref().expect("something was used");
         assert_eq!(used.id, DerivedId("res".into()));
         assert_eq!(used.kind, "result");
-        assert_eq!(used.rewrite, Rewrite::Substitute { unionable: true });
+        assert_eq!(
+            used.rewrite,
+            Rewrite::Substitute {
+                unionable: true,
+                rollup: None,
+            }
+        );
         assert_eq!(e.cost.bytes, 64);
         assert!(e.to_string().contains("substitutes"));
     }

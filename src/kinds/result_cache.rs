@@ -94,6 +94,7 @@ impl Kind for ResultCache {
     fn matches(&self, query: &Query) -> Option<Rewrite> {
         (query.plan.as_ref() == Some(&self.plan)).then_some(Rewrite::Substitute {
             unionable: self.unionable,
+            rollup: None,
         })
     }
 
@@ -153,7 +154,10 @@ mod tests {
         let c = ResultCache::rows_of(plan("tenant = 1"), 10, 100);
         assert_eq!(
             c.matches(&query(Some(plan("tenant = 1")), 0xBEEF)),
-            Some(Rewrite::Substitute { unionable: true })
+            Some(Rewrite::Substitute {
+                unionable: true,
+                rollup: None,
+            })
         );
     }
 
