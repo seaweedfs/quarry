@@ -27,8 +27,8 @@ use url::Url;
 
 use quarry::derived::PolicyFingerprint;
 use quarry::engine::{
-    Layout, Optimizer, Quarry, QuarryTable, Store, build_index, hash_scalar, index_id, read_index,
-    shared, write_index,
+    Layout, Optimizer, Quarry, QuarryTable, Retired, Store, build_index, hash_scalar, index_id,
+    read_index, shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -727,4 +727,61 @@ async fn recovery_composes_with_a_shared_registry() {
         "tenant 2 lives only in the second file"
     );
     assert_eq!(registry.read().expect("lock").len(), 1);
+}
+
+/// A retired index whose blob survives is *re-registered* by recovery: its
+/// snapshot is still known, so nothing in `recover` knows it was dropped.
+/// Reclaiming the bytes is therefore not housekeeping — it is what makes
+/// retirement stick across a restart.
+#[tokio::test]
+async fn a_retired_index_stays_retired_only_if_reclaimed() {
+    let fixture = fixture("persist_reclaim");
+    let (_, store) = stacks(&fixture);
+
+    let index = {
+        let session = quarry().session();
+        build_index(&session, &table(&fixture, Registry::new()), TENANT_FIELD)
+            .await
+            .expect("build")
+    };
+    store
+        .write(&events(), SnapshotId(1), POLICY, &index)
+        .await
+        .expect("write");
+
+    // Retired the way a round reports it: enough to find the blob.
+    let retired = [Retired {
+        id: index_id(&events(), TENANT_FIELD),
+        field: Some(TENANT_FIELD),
+        at: SnapshotId(1),
+    }];
+
+    // Without reclamation the restart undoes the retirement.
+    let resurrected = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover without reclaim");
+    assert_eq!(
+        resurrected.registry.len(),
+        1,
+        "recovery cannot tell retired from live"
+    );
+    store
+        .discard(&resurrected.discarded)
+        .await
+        .expect("discard");
+    // The blob was never discarded (the snapshot is known), so delete it now
+    // the way a caller should have.
+    assert_eq!(
+        store.reclaim(&events(), &retired).await.expect("reclaim"),
+        1,
+        "one blob to delete"
+    );
+
+    // With reclamation, the restart leaves the retirement in place.
+    let gone = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover after reclaim");
+    assert_eq!(gone.registry.len(), 0, "the retirement should stick");
 }

@@ -757,6 +757,32 @@ impl Store {
         discard(&self.file_io, paths).await
     }
 
+    /// Reclaim the bytes behind what a round retired.
+    ///
+    /// Retirement removes an index from the registry but not from storage —
+    /// the optimizer holds none — so without this every retired index is an
+    /// orphan that only a forgotten snapshot would ever clean up.
+    ///
+    /// Pieces whose field the optimizer never knew are skipped: their blob
+    /// name cannot be reconstructed, and deleting every index of the same
+    /// snapshot to be sure would throw away work the caller did not retire.
+    /// Such orphans are still collected by [`Store::recover`], which discards
+    /// what it cannot use.
+    pub async fn reclaim(
+        &self,
+        table: &TableId,
+        retired: &[super::optimizer::Retired],
+    ) -> iceberg::Result<usize> {
+        let paths: Vec<String> = retired
+            .iter()
+            .filter_map(|r| {
+                r.field
+                    .map(|field| self.layout.index_path(table, field, r.at))
+            })
+            .collect();
+        discard(&self.file_io, &paths).await
+    }
+
     /// Write the workload down.
     pub async fn save_workload(
         &self,

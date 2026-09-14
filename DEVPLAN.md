@@ -293,7 +293,7 @@ instead of being a boolean.
 
 ---
 
-## Phase 9 — Engine integration `[~]`
+## Phase 9 — Engine integration `[x]`
 
 Where external dependencies arrive. Everything above stays dependency-free,
 behind `--features engine`.
@@ -535,7 +535,7 @@ deletes vanish rather than fail, and it was the bridge's
 
 ---
 
-## Phase 10 — Facts, telemetry, and the loop `[~]`
+## Phase 10 — Facts, telemetry, and the loop `[x]`
 
 - [x] `StorageFacts`: `tier` and `distance`, both `Option`
 - [x] Two implementations: `OpaqueStorage` (all `None`) and `PlacedStorage`
@@ -747,7 +747,7 @@ natural-language queries     belongs in the client, not the engine
 
 ---
 
-## Phase 11 — Persistence `[~]`
+## Phase 11 — Persistence `[x]`
 
 Everything the optimizer learned and built lived in memory. A restart lost it,
 and then — with credits gone — retirement would have deleted the indexes whose
@@ -973,7 +973,7 @@ is not.
 
 ---
 
-## Phase 13 — Measurement `[~]`
+## Phase 13 — Measurement `[x]`
 
 234 tests, all on three or four files and at most a couple of thousand rows,
 deciding with five constants chosen by reasoning. `examples/measure.rs` runs the
@@ -1052,7 +1052,7 @@ problem. A million rows indexes in 0.05–0.64s. Not worth optimising.
 
 ---
 
-## Phase 14 — Judgement `[~]`
+## Phase 14 — Judgement `[x]`
 
 The measurement's worst finding was not a bug. The loop would build an index
 that saves 95% of a scan and two that save nothing, with equal enthusiasm:
@@ -1552,3 +1552,53 @@ Whether `target_partitions` is the true read fan-out. It is DataFusion's
 *execution* parallelism, and a single partition may have several reads in flight
 inside one Parquet reader — so this is a lower bound on overlap, and therefore
 still errs toward overstating waiting.
+
+
+---
+
+## Phase 21 — Closing the leaks `[x]`
+
+Follow-ups from a coverage audit. Three findings, all small, all real.
+
+### Waiting is now measured, not just charged
+
+`wait_seconds` was priced entirely from benchmark figures — a charge with no
+observation behind it. `MeteredStore` times every `get_opts` and `StoreStats`
+carries `observed_seconds`, summed per request so it compares directly with
+what the meter charges before the overlap discount.
+
+The first ground truth on that axis:
+
+```text
+local filesystem   45us/read observed vs 100us charged   2.2x overstated
+in-memory          1.4us/read        vs 100us charged   70x overstated
+```
+
+The `local` link was modelled on a cache hit or local NVMe, and 100us is
+within sight of a real disk. `charged_waiting_stays_within_sight_of_observed`
+pins the ratio to within 25x, with a comment saying what to do if it fails:
+fix the table or the store, not the tolerance.
+
+### Retired indexes came back after a restart
+
+Retirement removed an index from the registry but left its blob, and
+`recover` keeps anything whose snapshot is still known — which a retired
+index's always is. So every retirement was undone by the next restart. This
+was not a leak; it was resurrection.
+
+`Round::retired` now carries `Retired { id, field, at }` — enough for
+`Layout::index_path` — and `Store::reclaim` deletes the blobs. `field` is
+`Option` because a piece the optimizer neither built nor adopted has no
+recorded field; its blob cannot be named without it, and guessing by
+snapshot alone could delete work the caller did not retire. Those orphans
+still get collected at recovery.
+`a_retired_index_stays_retired_only_if_reclaimed` demonstrates both halves:
+recovering without reclaiming brings the index back, and reclaiming first
+leaves it gone.
+
+### `charge_cpu` removed
+
+Nothing called it. The `cpu_seconds` axis stays in `Cost` because `price`
+uses it for plan costing, but a charge path nobody takes is the speculative
+surface this project keeps deleting. When cpu metering becomes real it can
+come back with a caller.

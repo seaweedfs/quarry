@@ -36,7 +36,7 @@ pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
 pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};
 pub use materialized::{MaterializedResult, hash_plan};
-pub use optimizer::{Declined, Optimizer, Round};
+pub use optimizer::{Declined, Optimizer, Retired, Round};
 #[cfg(feature = "iceberg")]
 pub use persist::{
     Layout, QUARRY_EQ_INDEX_V2, QUARRY_WORKLOAD_V1, Recovered, Store, discard, read_index,

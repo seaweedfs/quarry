@@ -27,12 +27,20 @@ use crate::facts::{OpaqueStorage, StorageFacts, resolve};
 use crate::place::Place;
 
 /// What a [`MeteredStore`] has fetched.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
     /// Bytes returned by the underlying store.
     pub bytes_fetched: u64,
     /// Requests made to the underlying store.
     pub requests: u64,
+    /// Seconds the requests took, summed per request.
+    ///
+    /// A sum, not wall time: parallel reads each contribute their own
+    /// duration, so this is directly comparable to what the meter charges
+    /// *before* the overlap discount. Whether the [`Link`](crate::cost::Link)
+    /// figures describe reality is checkable as `observed / requests` against
+    /// `first_byte_seconds`.
+    pub observed_seconds: f64,
 }
 
 /// Wraps an object store to count reads and enforce a budget.
@@ -125,12 +133,15 @@ impl MeteredStore {
     /// The price comes from the backend rather than from a field here, so a
     /// colocated hot object and a cold remote one are charged differently
     /// without this code knowing which is which.
-    fn charge(&self, object: &Path, bytes: u64) -> OsResult<()> {
+    /// `elapsed` is what the request actually took, recorded so the charged
+    /// wait can be checked against reality rather than trusted.
+    fn charge(&self, object: &Path, bytes: u64, elapsed: f64) -> OsResult<()> {
         let resolved = resolve(self.facts.as_ref(), object.as_ref(), &self.reader);
 
         let mut state = self.state.lock().expect("store state");
         state.stats.bytes_fetched = state.stats.bytes_fetched.saturating_add(bytes);
         state.stats.requests += 1;
+        state.stats.observed_seconds += elapsed;
 
         let Some(meter) = state.meter.as_mut() else {
             return Ok(());
@@ -196,9 +207,10 @@ impl ObjectStore for MeteredStore {
     /// of them. `GetResult::range` gives the byte count without consuming the
     /// payload stream.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let started = std::time::Instant::now();
         let result = self.inner.get_opts(location, options).await?;
         let fetched = result.range.end.saturating_sub(result.range.start);
-        self.charge(location, fetched)?;
+        self.charge(location, fetched, started.elapsed().as_secs_f64())?;
         Ok(result)
     }
 
@@ -244,7 +256,9 @@ impl ObjectStore for MeteredStore {
 mod tests {
     use super::*;
     use crate::cost::Tier;
+    use crate::facts::{PlacedStorage, Placement};
     use crate::place::Distance;
+    use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
 
     fn store() -> Arc<dyn ObjectStore> {
@@ -402,5 +416,45 @@ mod tests {
 
         metered.delete(&Path::from("dir/a")).await.expect("delete");
         assert!(metered.get(&Path::from("dir/a")).await.is_err());
+    }
+
+    /// Charged waiting is an estimate; `observed_seconds` is what actually
+    /// happened. This test exists so the two cannot silently diverge.
+    ///
+    /// The `Link` figures come from benchmarks of real storage. A local
+    /// filesystem read measured ~45us against a charged 100us — within 2.2x.
+    /// If this starts failing, the right response is to update the table or
+    /// the store, not to widen the tolerance: the number exists to be checked.
+    #[tokio::test]
+    async fn charged_waiting_stays_within_sight_of_observed() {
+        let dir = std::env::temp_dir().join(format!("quarry_obs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let local = LocalFileSystem::new_with_prefix(&dir).expect("local store");
+        local
+            .put(&Path::from("x"), PutPayload::from(vec![0u8; 4096]))
+            .await
+            .expect("put");
+
+        let store = MeteredStore::new(Arc::new(local)).with_facts(
+            Arc::new(PlacedStorage::new().with_fallback(Placement::hot(Place::parse("/a/b")))),
+            Place::parse("/a/b"),
+        );
+        for _ in 0..20 {
+            store.get(&Path::from("x")).await.expect("get");
+        }
+
+        let stats = store.stats();
+        assert_eq!(stats.requests, 20);
+        assert!(stats.observed_seconds > 0.0, "observed time was recorded");
+
+        let observed_per_read = stats.observed_seconds / stats.requests as f64;
+        let charged_per_read = PriceTable::default().local_link.first_byte_seconds;
+        let ratio = charged_per_read / observed_per_read;
+        assert!(
+            (1.0 / 25.0..25.0).contains(&ratio),
+            "charged {charged_per_read}s vs observed {observed_per_read}s per read ({ratio}x)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

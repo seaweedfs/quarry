@@ -26,12 +26,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
+use crate::snapshot::SnapshotId;
 use crate::workload::{Observation, Policy, Proposal, Workload};
 
 use super::{
     QuarryTable, Session, SharedRegistry, build_proposed_index, estimate_overlap, index_id,
     parquet_bounds,
 };
+
+/// A piece of derived state a round dropped, identified enough to delete it.
+///
+/// `field` and `at` are what [`Layout::index_path`](super::persist::Layout)
+/// needs, so a caller holding a [`Store`](super::persist::Store) can
+/// reclaim the bytes rather than leaving them as orphans.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Retired {
+    /// What was dropped.
+    pub id: DerivedId,
+    /// The field it indexed, when the optimizer knows it.
+    ///
+    /// `None` for state this optimizer neither built nor adopted: the
+    /// registry keeps no field, so the caller falls back to listing the
+    /// table's prefix and matching `at`.
+    pub field: Option<FieldId>,
+    /// The snapshot it was built from.
+    pub at: SnapshotId,
+}
 
 /// What one round did, or would have done.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -41,7 +61,11 @@ pub struct Round {
     /// Derived state rebuilt because the table had moved out from under it.
     pub refreshed: Vec<DerivedId>,
     /// Derived state dropped because it had not paid for itself.
-    pub retired: Vec<DerivedId>,
+    ///
+    /// In-memory it is gone; anything it persisted is not. Deleting the blob
+    /// is the caller's — the optimizer holds no storage — and [`Retired`]
+    /// carries what it needs to do it.
+    pub retired: Vec<Retired>,
     /// Proposals not acted on, and why.
     pub declined: Vec<(DerivedId, Declined)>,
 }
@@ -244,8 +268,18 @@ impl Optimizer {
         if !retire.is_empty() {
             let mut registry = self.registry.write().expect("registry lock");
             for id in retire {
-                if registry.remove(&id).is_some() {
-                    round.retired.push(id);
+                // Read before removing: the caller needs the field and the
+                // snapshot to find the blob, and both live on the entry.
+                let Some(derived) = registry.get(&id) else {
+                    continue;
+                };
+                let retired = Retired {
+                    field: self.built.get(&id).copied(),
+                    at: derived.source.snapshot,
+                    id,
+                };
+                if registry.remove(&retired.id).is_some() {
+                    round.retired.push(retired);
                 }
             }
         }

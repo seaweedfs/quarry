@@ -168,22 +168,6 @@ impl Meter {
         }
     }
 
-    /// Account for cpu time.
-    pub fn charge_cpu(&mut self, seconds: f64) -> Permit {
-        if let Some(exceeded) = self.stopped {
-            return Permit::Stop(exceeded);
-        }
-        self.serial = self.serial + self.prices.price(0, Tier::Hot, Distance::Local, seconds);
-        let spent = self.spent();
-        match self.budget.breach(&spent) {
-            None => Permit::Continue,
-            Some(exceeded) => {
-                self.stopped = Some(exceeded);
-                Permit::Stop(exceeded)
-            }
-        }
-    }
-
     /// What has been spent so far.
     ///
     /// Waiting is discounted by however many reads overlapped, which is why
@@ -313,18 +297,6 @@ mod tests {
         let second = m.charge(100 * MB, Tier::Hot, Distance::Local);
         assert_eq!(first, second, "the original cause must not be overwritten");
         assert_eq!(m.spent(), spent, "no further charge after stopping");
-    }
-
-    #[test]
-    fn cpu_time_is_charged_against_the_money_ceiling() {
-        let prices = PriceTable::default();
-        let mut m = Meter::new(Budget::usd(prices.cpu_second_usd * 1.5), prices);
-        assert!(m.charge_cpu(1.0).is_continue());
-        assert!(!m.charge_cpu(1.0).is_continue());
-        assert!(matches!(
-            m.outcome(),
-            Outcome::Aborted(Exceeded::Usd { .. })
-        ));
     }
 
     #[test]
