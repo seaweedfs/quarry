@@ -476,6 +476,91 @@ async fn two_different_filters_do_not_share_a_cached_answer() {
     );
 }
 
+/// The same bug class one step further out: filters that are not
+/// `BinaryExpr` at all.
+///
+/// `tenant_id IN (1, 2)` does not translate to a `Predicate` — `predicate()`
+/// drops to marking the column opaque — so the shape loses the entire
+/// filter. Whether the *plan* still tells `IN (1, 2)` from `IN (1, 3)` is
+/// the Phase-12 question again, and it is only answered if the fallback
+/// rendering is faithful.
+#[tokio::test]
+async fn an_in_list_does_not_share_a_cached_answer_with_a_different_one() {
+    let graph = flat_graph(&["a", "b", "c"], 810);
+    let stored_for = "SELECT * FROM events WHERE tenant_id IN (1, 2)";
+    let asked = "SELECT * FROM events WHERE tenant_id IN (1, 3)";
+
+    let probe = Arc::new(table_with_three_files(graph.clone(), SnapshotId(810)));
+    run(Arc::clone(&probe), stored_for).await;
+    let for_first = probe.last_scan().expect("scan");
+    run(Arc::clone(&probe), asked).await;
+    let for_second = probe.last_scan().expect("scan");
+
+    // Same shape blindness, one level deeper: to the predicates these are
+    // identical AND carry no comparison at all, just `Opaque { tenant_id }`.
+    assert_eq!(
+        for_first.fingerprint, for_second.fingerprint,
+        "the shape cannot see inside an IN list"
+    );
+
+    let stored_plan = for_first.plan.clone().expect("describable");
+    let asked_plan = for_second.plan.clone().expect("describable");
+    assert_ne!(stored_plan, asked_plan, "the plan must see inside it");
+
+    let stored = vec![batch(&[(1, "in12"), (2, "in12")])];
+    let id = DerivedId("answer".into());
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        id.clone(),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        128,
+        Box::new(MaterializedResult::rows_of(stored_plan, stored.clone())),
+    ));
+    let table = Arc::new(
+        table_with_three_files(graph, SnapshotId(810))
+            .with_registry(registry)
+            .with_materialized(id, stored),
+    );
+
+    let rows = run(Arc::clone(&table), asked).await;
+    let report = table.last_scan().expect("scan");
+    assert!(
+        !report.substituted,
+        "a result stored for IN (1, 2) must not answer IN (1, 3)"
+    );
+    // IN (1, 3) over tenants 1, 1, 2, 1 keeps the three 1s.
+    assert_eq!(total_rows(&rows), 3);
+}
+
+/// The checkable half of the completeness precondition.
+///
+/// Row *count* cannot be verified — that would take the scan being avoided —
+/// but schema can: stored rows are served under the table's schema, so a
+/// batch that does not have it is a caller bug, and it is louder to refuse it
+/// at registration than to let Arrow error mid-query.
+#[test]
+#[should_panic(expected = "must be table-shaped")]
+fn rows_stored_under_the_wrong_schema_are_rejected_on_the_way_in() {
+    let graph = flat_graph(&["a"], 810);
+    let wrong_schema = Arc::new(Schema::new(vec![Field::new(
+        "tenant_id",
+        DataType::Utf8, // the table's is Int64
+        false,
+    )]));
+    let wrong = RecordBatch::try_new(
+        wrong_schema,
+        vec![Arc::new(StringArray::from(vec!["not-an-int"]))],
+    )
+    .expect("batch matches its own schema");
+
+    table_with_three_files(graph, SnapshotId(810))
+        .with_materialized(DerivedId("bad".into()), vec![wrong]);
+}
+
 #[tokio::test]
 async fn a_materialised_result_is_read_instead_of_the_table() {
     let graph = flat_graph(&["a", "b", "c"], 810);

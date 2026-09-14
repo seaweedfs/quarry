@@ -1402,3 +1402,93 @@ async fn a_foreign_scan_never_credits_an_index() {
         "no foreign scan may credit anything"
     );
 }
+
+/// A build that fails on an unchanged table is not retried every round.
+///
+/// The inputs are identical, so the outcome would be too — and each retry
+/// reads the whole table to learn it. Retrying makes sense only once the
+/// table has moved. The counters are the ground truth here: a skipped retry
+/// reads nothing, and the store counts every request.
+#[tokio::test]
+async fn a_failed_rebuild_waits_for_the_table_to_move() {
+    let mut fixture = fixture("loop_retry");
+    let sql = "SELECT * FROM events WHERE tenant_id = 1";
+    let registry = shared(Registry::new());
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        mechanism_policy(Policy {
+            max_residual_pct: 10.0,
+            ..Policy::automatic(1 << 30).with_min_queries(3)
+        }),
+    )
+    .for_reader(POLICY);
+
+    // Build an index at snapshot 1.
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "built: {round:?}");
+
+    // The table grows, and then the build is made impossible: one live file
+    // is deleted from under it, so reading its column fails.
+    fixture.append(1, 2_000);
+    let removed = fixture.files[0].clone();
+    fs::remove_file(&removed.0).expect("delete a live data file");
+
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    // First round on this snapshot: the refresh is attempted and fails.
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "the first failure is reported: {round:?}"
+    );
+
+    // Second round, same snapshot: the same inputs, so not attempted at all.
+    // `declined` is the ground truth here — the build fails at `head`, which
+    // is not a metered read, so the request counter cannot see the attempt.
+    // A standing proposal may still appear as `AlreadyBuilt`; what must not
+    // reappear is another `BuildFailed` for the same unchanged table.
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        !round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "an unchanged table is not retried: {round:?}"
+    );
+    assert!(round.refreshed.is_empty() && round.built.is_empty());
+
+    // The table moves: now the rebuild is worth attempting again, and it
+    // fails again because the file is still gone.
+    fixture.append(1, 100);
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+    let round = optimizer.round(&session, &served).await;
+    assert!(
+        round
+            .declined
+            .iter()
+            .any(|(_, why)| *why == Declined::BuildFailed),
+        "a moved table earns a retry: {round:?}"
+    );
+}

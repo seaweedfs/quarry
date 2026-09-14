@@ -124,6 +124,13 @@ pub struct Optimizer {
     /// default — and it is lost on restart, along with the in-memory registry
     /// itself.
     built: BTreeMap<DerivedId, FieldId>,
+    /// The snapshot at which each id's last build failed.
+    ///
+    /// A failed build is retried only when the table has moved, because a
+    /// build that failed on an unchanged table fails the same way: the inputs
+    /// are identical. Retrying every round would read the whole table once
+    /// per round forever, for a failure that cannot resolve itself.
+    failed_at: BTreeMap<DerivedId, SnapshotId>,
     /// What is known about how each field's values sit across the files.
     ///
     /// Supplied rather than derived, because the two inputs come from
@@ -146,6 +153,7 @@ impl Optimizer {
             prices: PriceTable::default(),
             reader: PolicyFingerprint(0),
             built: BTreeMap::new(),
+            failed_at: BTreeMap::new(),
             spreads: BTreeMap::new(),
         }
     }
@@ -291,12 +299,18 @@ impl Optimizer {
         // again. Left alone it decays while still being credited with what it
         // once saved, which is why retirement does not catch it either.
         for (id, field) in self.stale(table) {
+            if self.failed_at.get(&id) == Some(&table.snapshot()) {
+                // Already failed on exactly this table state; see failed_at.
+                continue;
+            }
             let rebuilt =
                 build_proposed_index(session, table, field, id.clone(), self.reader).await;
             let Ok(derived) = rebuilt else {
+                self.failed_at.insert(id.clone(), table.snapshot());
                 round.declined.push((id, Declined::BuildFailed));
                 continue;
             };
+            self.failed_at.remove(&id);
             // Replaced only once the replacement exists, so a failed rebuild
             // leaves the stale-but-correct piece in place rather than nothing.
             self.registry
@@ -376,13 +390,18 @@ impl Optimizer {
                 continue;
             }
 
+            if self.failed_at.get(&id) == Some(&table.snapshot()) {
+                continue;
+            }
             let built =
                 build_proposed_index(session, table, proposal.field, id.clone(), self.reader).await;
 
             let Ok(derived) = built else {
+                self.failed_at.insert(id.clone(), table.snapshot());
                 round.declined.push((id, Declined::BuildFailed));
                 continue;
             };
+            self.failed_at.remove(&id);
 
             // The ceiling, applied to what was produced. An index's size
             // cannot be known before building it, so this is the only honest

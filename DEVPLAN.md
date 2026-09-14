@@ -1602,3 +1602,57 @@ Nothing called it. The `cpu_seconds` axis stays in `Cost` because `price`
 uses it for plan costing, but a charge path nobody takes is the speculative
 surface this project keeps deleting. When cpu metering becomes real it can
 come back with a caller.
+
+
+---
+
+## Phase 22 — The rest of the audit `[x]`
+
+The remaining findings, in the order they were listed.
+
+### Non-binary predicates keep their identity `[x]`
+
+`IN`, `IS NULL`, `BETWEEN`, column-vs-column do not translate to `Predicate` —
+they fall back to marking the column opaque, which is the *safe* direction for
+pruning but erases the entire filter from the shape. Whether the *plan* still
+told `IN (1, 2)` from `IN (1, 3)` was the Phase-12 question one level deeper,
+answered only if the `Debug` fallback is faithful. It is:
+`an_in_list_does_not_share_a_cached_answer_with_a_different_one` asserts the
+shapes are identical, the plans differ, and nothing substitutes.
+
+### Stored rows are schema-checked on the way in `[x]`
+
+`MaterializedResult`'s completeness precondition has a checkable half and an
+uncheckable one. Row count cannot be verified — checking it would take the
+scan being avoided. Schema can be: stored rows are served under the table's
+schema, so a batch that does not have it is a caller bug. `with_materialized`
+now rejects one at registration, where the mistake is made, rather than
+leaving Arrow to error mid-query, where it is made visible. A probe confirmed
+the old behaviour did fail loudly — `Invalid comparison operation` — so this
+changes *when*, not *whether*.
+
+### Corrupt files fail the query `[x]`
+
+A `.parquet` file holding garbage makes the scan error rather than return the
+readable files' rows. `a_corrupt_file_fails_the_query_rather_than_shortening_it`
+— the worst outcome this system can produce is a query that looks complete and
+is wrong, and this is the test that it does not.
+
+### Failed builds wait for the table to move `[x]`
+
+A failed rebuild was attempted every round — each attempt reading the whole
+table to learn the same thing, forever. `failed_at` records the snapshot a
+build failed at, and an id is not retried until the snapshot moves. Not
+backoff: the inputs are identical, so the outcome would be, and the right
+interval is "when something changed".
+
+`a_failed_rebuild_waits_for_the_table_to_move` deletes a live data file and
+watches: failure once, silence on the unchanged snapshot, a retry — and the
+same failure — after the next commit.
+
+### Still not covered, honestly
+
+- `head` and `list` are not metered. The corrupt-file test showed it: the
+  build fails at `head` and the request counter sees nothing. S3 bills HEAD
+  at GET rates, so a workload of many small metadata calls is uncounted.
+- `target_partitions` remains a lower bound on read overlap.

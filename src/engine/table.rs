@@ -239,7 +239,26 @@ impl QuarryTable {
     ///
     /// The id must match one registered in the [`Registry`]; the rule decides
     /// whether it may be used, and these are the rows read when it is.
+    ///
+    /// Rows are stored **table-shaped** — the table's full schema, projected
+    /// above the scan — and a batch that is not is rejected here rather than
+    /// left to fail inside Arrow mid-query. What cannot be checked is whether
+    /// the rows are the *complete* answer: verifying that would take the scan
+    /// being avoided, so it stays the caller's precondition, documented on
+    /// [`MaterializedResult::rows_of`](super::MaterializedResult::rows_of).
+    ///
+    /// # Panics
+    ///
+    /// If any batch's schema is not the table's.
     pub fn with_materialized(mut self, id: DerivedId, batches: Vec<RecordBatch>) -> Self {
+        for batch in &batches {
+            assert_eq!(
+                batch.schema().as_ref(),
+                self.schema.as_ref(),
+                "stored rows for {id:?} must be table-shaped: the full schema, \
+                 projected above the scan"
+            );
+        }
         self.materialized.insert(id, batches);
         self
     }

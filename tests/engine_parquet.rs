@@ -485,6 +485,49 @@ async fn a_session_charges_for_overlapping_reads_not_serial_ones() {
     );
 }
 
+/// A file that cannot be read must fail the query, not quietly drop its rows.
+///
+/// A scan that returned the two good files' rows would look complete and be
+/// wrong — the worst outcome this system can produce. The error should say
+/// what failed, and no rows should come back.
+#[tokio::test]
+async fn a_corrupt_file_fails_the_query_rather_than_shortening_it() {
+    let dir = scratch("parquet_corrupt");
+    let (a, a_size) = write_parquet(&dir, "a.parquet", &[(1, "a1")]);
+    let (b, b_size) = write_parquet(&dir, "b.parquet", &[(2, "b1")]);
+
+    // Third file is named like data and priced like data but is not Parquet.
+    let corrupt = dir.join("c.parquet");
+    fs::write(&corrupt, b"this is not a parquet file").expect("write garbage");
+    let c_size = fs::metadata(&corrupt).expect("stat").len();
+    let c = FileId(corrupt.to_string_lossy().into_owned());
+
+    let graph = SnapshotGraph::new().with(
+        Snapshot::root(SnapshotId(810))
+            .with_clean_file(a.clone())
+            .with_clean_file(b.clone())
+            .with_clean_file(c.clone()),
+    );
+    let table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(810),
+        graph,
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .on_object_store(ObjectStoreUrl::local_filesystem())
+    .with_parquet_file(a, a_size)
+    .with_parquet_file(b, b_size)
+    .with_parquet_file(c, c_size);
+
+    let result = run_metered(Arc::new(table), "SELECT * FROM events", metered_local()).await;
+    assert!(
+        result.is_err(),
+        "a corrupt file must fail the query, not return two of three files' rows"
+    );
+}
+
 #[tokio::test]
 async fn a_generous_budget_lets_the_query_finish() {
     let dir = scratch("parquet_budget_ok");
