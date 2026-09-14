@@ -757,6 +757,21 @@ cross-principal sharing      PARTIAL — the fingerprint now has a stable
                              constructor; sharing still needs its audit
 writes (INSERT/MERGE/DELETE) read-only; iceberg-rust lacks row-level writes
 natural-language queries     belongs in the client, not the engine
+
+accelerator taxonomy (core-design §4):
+bitmap indexes               file-level postings already exist and now
+                             intersect; row-level bitmaps need intra-file
+                             Rewrite granularity
+L3 reusable computation      subplan substitution keyed by ComputeID; the
+                             cube path proves the seam on Aggregate only —
+                             revisit when telemetry demands a second
+                             position (filter candidates, join hash tables)
+FTS / vector / spatial       FTS needs a MATCH predicate variant; vector
+                             and sketch aggregates are approximate and need
+                             the approximate-answer marker decided first
+join accelerators            need a repeated-join workload to justify
+SegmentDirectory             pays only once the registry is observed
+                             probing hundreds of pieces per query
 ```
 
 
