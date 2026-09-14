@@ -116,6 +116,15 @@ impl Link {
 pub struct PriceTable {
     /// Price of one hot, local byte.
     pub hot_byte_usd: f64,
+    /// The fee for a request that moves no bytes: a HEAD, or a GET of an
+    /// empty range. Reads pay it inside `hot_byte_usd`, amortised over
+    /// `average_read_bytes`; metadata requests have no bytes to amortise it
+    /// over, so it is charged directly. AWS bills HEAD at the GET rate.
+    pub request_usd: f64,
+    /// The fee for listing a page. Higher than a GET on AWS — billed at the
+    /// PUT rate — and a workload heavy on it is exactly the kind that goes
+    /// unmetered.
+    pub list_usd: f64,
     /// Multiplier applied to cold bytes, relative to hot.
     pub cold_multiplier: f64,
     /// Multiplier applied for [`Distance::Near`].
@@ -180,6 +189,11 @@ impl PriceTable {
 
         PriceTable {
             hot_byte_usd: hot_local,
+            request_usd: per_request,
+            // AWS bills LIST at the PUT rate: $0.005 per 1,000 against GET's
+            // $0.0004, a ratio of 12.5x. Not universal — a deployment that
+            // prices listings differently sets the field directly.
+            list_usd: per_request * 12.5,
             cold_multiplier: (cold_retrieval_usd_per_gb / GB + hot_local) / hot_local,
             // Transfer within a region is not billed, so a byte from the next
             // rack costs exactly what a local one does. See the note on

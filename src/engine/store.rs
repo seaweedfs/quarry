@@ -154,6 +154,37 @@ impl MeteredStore {
             }),
         }
     }
+
+    /// Charge a request that returns no payload: a HEAD, or a page of
+    /// listing. Counted like a read and billed like one too — AWS does not
+    /// distinguish "how much did you fetch" from "how often did you ask".
+    ///
+    /// `object` is what the request was about, so a HEAD of a cold or far
+    /// object is charged like one. A listing has no single object; "" is
+    /// whatever the backend reports for a path it does not know.
+    fn charge_meta(&self, object: &str, listed: bool, elapsed: f64) -> OsResult<()> {
+        let resolved = resolve(self.facts.as_ref(), object, &self.reader);
+
+        let mut state = self.state.lock().expect("store state");
+        state.stats.requests += 1;
+        state.stats.observed_seconds += elapsed;
+
+        let Some(meter) = state.meter.as_mut() else {
+            return Ok(());
+        };
+        let permit = if listed {
+            meter.charge_list(resolved.tier, resolved.distance)
+        } else {
+            meter.charge_meta(resolved.tier, resolved.distance)
+        };
+        match permit {
+            Permit::Continue => Ok(()),
+            Permit::Stop(exceeded) => Err(object_store::Error::Generic {
+                store: "quarry",
+                source: Box::new(BudgetExceeded(exceeded)),
+            }),
+        }
+    }
 }
 
 /// The error a [`MeteredStore`] returns when a budget stops a read.
@@ -200,17 +231,23 @@ impl fmt::Display for MeteredStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for MeteredStore {
-    /// The one counted method.
+    /// The counted read.
     ///
-    /// Every other read path — `get`, `get_range`, `get_ranges`, `head` —
-    /// reaches the store through here by default, so counting once covers all
-    /// of them. `GetResult::range` gives the byte count without consuming the
-    /// payload stream.
+    /// `get`, `get_range`, `get_ranges` and `head` all reach the store through
+    /// here by default — `head` arrives as `options.head` and is charged as a
+    /// request rather than a read, since it returns no payload for the byte
+    /// price to attach to.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let started = std::time::Instant::now();
+        let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
-        let fetched = result.range.end.saturating_sub(result.range.start);
-        self.charge(location, fetched, started.elapsed().as_secs_f64())?;
+        let elapsed = started.elapsed().as_secs_f64();
+        if head {
+            self.charge_meta(location.as_ref(), false, elapsed)?;
+        } else {
+            let fetched = result.range.end.saturating_sub(result.range.start);
+            self.charge(location, fetched, elapsed)?;
+        }
         Ok(result)
     }
 
@@ -235,12 +272,29 @@ impl ObjectStore for MeteredStore {
         self.inner.delete(location).await
     }
 
+    /// Charged once per call.
+    ///
+    /// The returned stream paginates *inside* the inner store, so the number
+    /// of LIST requests is invisible here — a long listing is undercharged
+    /// rather than uncharged. `list_with_delimiter` is exact.
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
-        self.inner.list(prefix)
+        // A listing that is refused still has to return a stream, so the
+        // refusal becomes its one item.
+        match self.charge_meta(prefix.map_or("", |p| p.as_ref()), true, 0.0) {
+            Ok(()) => self.inner.list(prefix),
+            Err(err) => Box::pin(futures::stream::once(async move { Err(err) })),
+        }
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
+        let started = std::time::Instant::now();
+        let result = self.inner.list_with_delimiter(prefix).await?;
+        self.charge_meta(
+            prefix.map_or("", |p| p.as_ref()),
+            true,
+            started.elapsed().as_secs_f64(),
+        )?;
+        Ok(result)
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
@@ -456,5 +510,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `head` reaches the meter: it routes through `get_opts` with an empty
+    /// range, which used to be counted and charged nothing.
+    #[tokio::test]
+    async fn a_head_is_counted_and_charged() {
+        let metered = MeteredStore::new(store());
+        put(&metered, "a", b"data").await;
+
+        metered.head(&Path::from("a")).await.expect("head");
+
+        let stats = metered.stats();
+        assert_eq!(stats.requests, 1);
+        assert!(stats.observed_seconds > 0.0);
+        assert_eq!(stats.bytes_fetched, 0, "a HEAD moves no payload");
+    }
+
+    #[tokio::test]
+    async fn a_budget_stops_repeated_metadata_calls() {
+        // A workload of many small metadata calls — exactly the pattern that
+        // went unmetered — is now inside the budget like any other spend.
+        let prices = PriceTable::default();
+        let per_head = prices.request_usd
+            + prices.wait_seconds(0, Tier::Hot, Distance::Far) * prices.cpu_second_usd;
+        let metered = MeteredStore::new(store()).with_budget(Budget::usd(per_head * 1.5), prices);
+        put(&metered, "a", b"data").await;
+
+        assert!(metered.head(&Path::from("a")).await.is_ok(), "one fits");
+        assert!(
+            metered.head(&Path::from("a")).await.is_err(),
+            "the second does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_is_charged() {
+        use futures::TryStreamExt;
+        let metered = MeteredStore::new(store());
+        put(&metered, "dir/a", b"x").await;
+        put(&metered, "dir/b", b"y").await;
+
+        let found: Vec<_> = metered
+            .list(Some(&Path::from("dir")))
+            .try_collect()
+            .await
+            .expect("list");
+        assert_eq!(found.len(), 2);
+        assert_eq!(metered.stats().requests, 1, "one chargeable call");
+
+        // And a budget can refuse it — the refusal arrives as the stream's
+        // first item, since a refused listing still has to produce a stream.
+        let priced = PriceTable::default();
+        let refused = MeteredStore::new(store()).with_budget(Budget::usd(0.0), priced);
+        let result = refused
+            .list(Some(&Path::from("dir")))
+            .try_collect::<Vec<_>>()
+            .await;
+        assert!(result.is_err(), "a zero budget refuses the listing");
     }
 }

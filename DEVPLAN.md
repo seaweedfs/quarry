@@ -1652,7 +1652,37 @@ same failure — after the next commit.
 
 ### Still not covered, honestly
 
-- `head` and `list` are not metered. The corrupt-file test showed it: the
-  build fails at `head` and the request counter sees nothing. S3 bills HEAD
-  at GET rates, so a workload of many small metadata calls is uncounted.
 - `target_partitions` remains a lower bound on read overlap.
+
+---
+
+## Phase 23 — Metering metadata `[x]`
+
+The corrupt-file test exposed it: `head` routes through `get_opts` with an
+empty range, so it was *counted* and charged nothing — no bytes for the price
+to attach to. `list` did not go through the meter at all. A workload of small
+metadata calls — exactly the shape object stores bill — was invisible.
+
+```text
+HEAD     request_usd + one first-byte wait    billed at the GET rate
+LIST     list_usd     + one first-byte wait    billed at the PUT rate, 12.5x
+empty GET  same as HEAD                        the request still happened
+```
+
+`PriceTable` gains the two fees, derived in `from_rates` rather than guessed:
+`request_usd` is the GET fee whole (reads pay it amortised inside
+`hot_byte_usd`), `list_usd` is 12.5x it, the published PUT/LIST ratio. Both are
+plain public fields — a deployment that prices listings differently sets them.
+
+Three details worth recording:
+
+- **A zero-byte `charge` is a request**, not a no-op. `charge(0)` used to be
+  free; an empty GET still round-trips and is still billed. The old test that
+  pinned free-ness now pins the opposite.
+- **A refused `list` returns the error as the stream's one item.** The trait
+  wants a stream back, so a refusal cannot return `Err` — it has to *become*
+  one. Callers see it when they collect, which is where they'd see any other
+  listing failure.
+- **`list` is charged once per call, not per page.** The stream paginates
+  inside the inner store, so page count is invisible: undercharged rather than
+  uncharged, and `list_with_delimiter` is exact.

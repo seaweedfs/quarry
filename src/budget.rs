@@ -153,10 +153,49 @@ impl Meter {
     /// nothing further: a caller that keeps going gets the same refusal
     /// rather than a new one that hides the original cause.
     pub fn charge(&mut self, bytes: u64, tier: Tier, distance: Distance) -> Permit {
+        // A request happened even when it returned no bytes: a GET of an
+        // empty range is still billed, and still waited for.
+        if bytes == 0 {
+            return self.charge_meta(tier, distance);
+        }
+        self.account(self.prices.price(bytes, tier, distance, 0.0))
+    }
+
+    /// Account for a metadata request: a HEAD, or any call that returns
+    /// properties rather than a payload.
+    ///
+    /// Billed at the GET rate on AWS and round-trips like one, so it costs a
+    /// request fee plus one first-byte wait. It has no bytes — pricing it as
+    /// `price(0, ..)` would charge nothing, which is exactly the unmetered
+    /// surface this exists to close.
+    pub fn charge_meta(&mut self, tier: Tier, distance: Distance) -> Permit {
+        self.request(tier, distance, self.prices.request_usd)
+    }
+
+    /// Account for a listing request.
+    ///
+    /// AWS bills LIST at the PUT rate, twelve and a half times a GET. A call
+    /// that paginates invisibly is charged once per page *the caller can see*
+    /// — the [`ObjectStore`](object_store::ObjectStore) `list` stream hides
+    /// its pages, so a long listing is undercharged rather than uncharged.
+    pub fn charge_list(&mut self, tier: Tier, distance: Distance) -> Permit {
+        self.request(tier, distance, self.prices.list_usd)
+    }
+
+    fn request(&mut self, tier: Tier, distance: Distance, fee: f64) -> Permit {
+        let wait = self.prices.wait_seconds(0, tier, distance);
+        self.account(Cost {
+            wait_seconds: wait,
+            usd: fee + wait * self.prices.cpu_second_usd,
+            ..Cost::ZERO
+        })
+    }
+
+    fn account(&mut self, cost: Cost) -> Permit {
         if let Some(exceeded) = self.stopped {
             return Permit::Stop(exceeded);
         }
-        self.serial = self.serial + self.prices.price(bytes, tier, distance, 0.0);
+        self.serial = self.serial + cost;
         self.reads += 1;
         let spent = self.spent();
         match self.budget.breach(&spent) {
@@ -327,9 +366,64 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_byte_read_never_breaches() {
+    fn a_zero_byte_read_is_still_a_request() {
+        // An empty GET moves no bytes, so the byte ceiling has nothing to
+        // say — but the request happened, and it is billed and waited for.
         let mut m = meter(Budget::bytes(0));
         assert!(m.charge(0, Tier::Hot, Distance::Local).is_continue());
+
+        let prices = PriceTable::default();
+        let mut m = meter(Budget::usd(prices.request_usd * 1.5));
+        assert!(m.charge(0, Tier::Hot, Distance::Local).is_continue());
+        assert!(
+            !m.charge(0, Tier::Hot, Distance::Local).is_continue(),
+            "two requests cost more than one, even fetching nothing"
+        );
+    }
+
+    /// Metadata calls were unmetered: `head` routes through `get_opts` with an
+    /// empty range, priced `bytes=0`, charged nothing.
+    ///
+    /// The ground truth is computable: a HEAD costs its request fee plus one
+    /// first-byte wait, a LIST twelve and a half times the fee.
+    #[test]
+    fn a_head_and_a_listing_are_charged_what_they_cost() {
+        let prices = PriceTable::default();
+        let wait = prices.wait_seconds(0, Tier::Hot, Distance::Far);
+
+        let mut m = meter(Budget::UNLIMITED);
+        m.charge_meta(Tier::Hot, Distance::Far);
+        let head = m.spent();
+        let expected = prices.request_usd + wait * prices.cpu_second_usd;
+        assert!(
+            (head.usd - expected).abs() < 1e-18,
+            "a HEAD costs {expected}, charged {}",
+            head.usd
+        );
+        assert!(head.wait_seconds > 0.0, "and it waited a round trip");
+
+        let mut m = meter(Budget::UNLIMITED);
+        m.charge_list(Tier::Hot, Distance::Far);
+        let list = m.spent();
+        let expected = prices.list_usd + wait * prices.cpu_second_usd;
+        assert!(
+            (list.usd - expected).abs() < 1e-18,
+            "a LIST costs {expected}, charged {}",
+            list.usd
+        );
+        assert!(list.usd > head.usd, "AWS bills LIST above GET");
+    }
+
+    #[test]
+    fn metadata_requests_also_overlap() {
+        // Sixteen parallel HEADs wait once per wave like anything else.
+        let prices = PriceTable::default().with_concurrent_reads(4.0);
+        let mut m = Meter::new(Budget::UNLIMITED, prices);
+        for _ in 0..16 {
+            m.charge_meta(Tier::Hot, Distance::Near);
+        }
+        let one = prices.wait_seconds(0, Tier::Hot, Distance::Near);
+        assert!((m.spent().wait_seconds - 4.0 * one).abs() < 1e-12);
     }
 
     /// The overlap model, against arithmetic done here rather than by it.
