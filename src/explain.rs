@@ -248,6 +248,7 @@ mod tests {
                 field: TENANT,
                 value: 100,
             }],
+            aggregate: None,
         }
     }
 

@@ -565,6 +565,7 @@ mod tests {
                     value: 42,
                 })
                 .collect(),
+            aggregate: None,
         }
     }
 

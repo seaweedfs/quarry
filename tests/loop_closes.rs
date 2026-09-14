@@ -1293,6 +1293,7 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         plan: None,
         projected: std::collections::BTreeSet::from([field]),
         predicates: vec![Predicate::Eq { field, value: 1 }],
+        aggregate: None,
     };
     Observation {
         fingerprint: Fingerprint::of(&query),

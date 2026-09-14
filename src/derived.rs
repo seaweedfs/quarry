@@ -92,6 +92,23 @@ impl Predicate {
 /// before handing one query the other's stored answer. So plan identity is
 /// carried separately, exactly, and is absent rather than approximate when
 /// the engine cannot render it faithfully.
+/// One filter, faithfully rendered and tagged with the field it restricts.
+///
+/// `text` is the identity — a rendering faithful enough that two different
+/// predicates never share one. `field` is what coverage needs: a cube can only
+/// serve a query whose extra restrictions sit on fields it grouped by, and
+/// that check needs the field, not the text. A filter whose field cannot be
+/// determined is `None` — and uncovered by everything.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Filter {
+    /// The field this restricts, when it is known.
+    pub field: Option<FieldId>,
+    /// The faithful rendering.
+    pub text: String,
+}
+
+/// What a query computes, exactly — or as exactly as the engine can render
+/// it. The identity a substitution is allowed to match on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Plan {
     /// Fields the query reads.
@@ -100,15 +117,100 @@ pub struct Plan {
     ///
     /// Sorted so that `a = 1 AND b = 2` and `b = 2 AND a = 1` are one plan;
     /// a conjunction has no meaningful order.
-    pub filters: Vec<String>,
+    pub filters: Vec<Filter>,
+}
+
+impl From<String> for Filter {
+    /// A filter whose field is unknown restricts nothing a cube can check, so
+    /// it is `None` — and uncovered by everything.
+    fn from(text: String) -> Self {
+        Filter { field: None, text }
+    }
+}
+
+impl From<&str> for Filter {
+    fn from(text: &str) -> Self {
+        Filter {
+            field: None,
+            text: text.to_owned(),
+        }
+    }
 }
 
 impl Plan {
     /// A plan reading `projected` under `filters`, canonicalised.
-    pub fn new(projected: BTreeSet<FieldId>, filters: impl IntoIterator<Item = String>) -> Self {
-        let mut filters: Vec<String> = filters.into_iter().collect();
+    pub fn new(
+        projected: BTreeSet<FieldId>,
+        filters: impl IntoIterator<Item = impl Into<Filter>>,
+    ) -> Self {
+        let mut filters: Vec<Filter> = filters.into_iter().map(Into::into).collect();
         filters.sort();
         Plan { projected, filters }
+    }
+}
+
+/// What a query aggregates: the group keys and the measures over them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Aggregate {
+    /// Fields the query groups by.
+    pub group_by: BTreeSet<FieldId>,
+    /// Aggregations the query computes.
+    pub measures: BTreeSet<Measure>,
+}
+
+/// One aggregation over one field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Measure {
+    /// The aggregation.
+    pub func: AggFunc,
+    /// The field aggregated. `None` only for `Count` over `*`.
+    pub field: Option<FieldId>,
+}
+
+/// The aggregations a cube can hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AggFunc {
+    /// `COUNT`.
+    Count,
+    /// `SUM`.
+    Sum,
+    /// `MIN`.
+    Min,
+    /// `MAX`.
+    Max,
+}
+
+impl Aggregate {
+    /// Whether a stored cube `cube` can answer this query by re-aggregating.
+    ///
+    /// Two conditions, each exact:
+    ///
+    /// ```text
+    /// keys       the query groups by a subset of the cube's keys, so the
+    ///            cube's rows can be rolled up to the coarser grain
+    /// measures   every measure the query wants is computable from the
+    ///            measures the cube holds
+    /// ```
+    ///
+    /// Filter coverage is the caller's: [`Plan`] comparisons happen where the
+    /// two plans are both in hand.
+    pub fn covered_by(&self, cube: &Aggregate) -> bool {
+        self.group_by.is_subset(&cube.group_by)
+            && self
+                .measures
+                .iter()
+                .all(|m| cube.measures.iter().any(|c| m.computable_from(*c)))
+    }
+}
+
+impl Measure {
+    /// Whether this measure can be computed from a stored one.
+    ///
+    /// Every function rolls up through itself — partial sums sum, partial
+    /// minima minimise. `Avg` is deliberately absent from [`AggFunc`]: a cube
+    /// that wants to answer averages stores `Sum` and `Count` and divides.
+    fn computable_from(&self, stored: Measure) -> bool {
+        self.func == stored.func && self.field == stored.field
     }
 }
 
@@ -144,6 +246,14 @@ pub struct Query {
     pub projected: BTreeSet<FieldId>,
     /// Restrictions the query places on fields.
     pub predicates: Vec<Predicate>,
+    /// What the query aggregates, if it does.
+    ///
+    /// Never present inside `TableProvider::scan` — the group-by sits above
+    /// the scan in the logical plan — so this is populated only by a caller
+    /// that can see the whole plan, like `Session::sql`. Its absence in a
+    /// scan-level query means "no aggregate was visible", which a cube treats
+    /// as not-a-match rather than as "plain scan".
+    pub aggregate: Option<Aggregate>,
 }
 
 impl Query {
@@ -569,6 +679,7 @@ mod tests {
                 field: 4,
                 value: 0xABC,
             }],
+            aggregate: None,
         }
     }
 
@@ -838,6 +949,76 @@ mod tests {
             index_at(s(812), &["a"]).may_serve(&query_at(s(777)), &g),
             Decision::Reject(Reason::UnknownSnapshot)
         );
+    }
+
+    #[test]
+    fn a_query_groups_finer_than_a_cube_cannot_rollup() {
+        let cube = Aggregate {
+            group_by: BTreeSet::from([DAY]),
+            measures: BTreeSet::from([count_star()]),
+        };
+        // A query grouping by (day, tenant) is finer than the cube's grain:
+        // the cube's rows have already collapsed tenant.
+        let finer = Aggregate {
+            group_by: BTreeSet::from([DAY, TENANT]),
+            measures: BTreeSet::from([count_star()]),
+        };
+        assert!(!finer.covered_by(&cube));
+    }
+
+    #[test]
+    fn a_query_groups_coarser_than_a_cube_rolls_up() {
+        let cube = Aggregate {
+            group_by: BTreeSet::from([DAY, TENANT]),
+            measures: BTreeSet::from([count_star(), sum_bytes()]),
+        };
+        let coarser = Aggregate {
+            group_by: BTreeSet::from([DAY]),
+            measures: BTreeSet::from([count_star(), sum_bytes()]),
+        };
+        assert!(coarser.covered_by(&cube));
+    }
+
+    #[test]
+    fn a_measure_rolls_up_only_through_itself() {
+        let cube = Aggregate {
+            group_by: BTreeSet::from([DAY]),
+            measures: BTreeSet::from([count_star()]),
+        };
+        let wants_sum = Aggregate {
+            group_by: BTreeSet::from([DAY]),
+            measures: BTreeSet::from([sum_bytes()]),
+        };
+        // COUNT is no basis for SUM.
+        assert!(!wants_sum.covered_by(&cube));
+        let wants_count_of_bytes = Aggregate {
+            group_by: BTreeSet::from([DAY]),
+            measures: BTreeSet::from([Measure {
+                func: AggFunc::Count,
+                field: Some(BYTES),
+            }]),
+        };
+        // COUNT(*) counts rows; COUNT(bytes) counts non-null bytes. A cube
+        // holding one cannot serve the other.
+        assert!(!wants_count_of_bytes.covered_by(&cube));
+    }
+
+    const DAY: FieldId = 1;
+    const TENANT: FieldId = 2;
+    const BYTES: FieldId = 3;
+
+    fn count_star() -> Measure {
+        Measure {
+            func: AggFunc::Count,
+            field: None,
+        }
+    }
+
+    fn sum_bytes() -> Measure {
+        Measure {
+            func: AggFunc::Sum,
+            field: Some(BYTES),
+        }
     }
 
     #[test]

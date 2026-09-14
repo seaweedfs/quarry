@@ -23,7 +23,7 @@ use datafusion::scalar::ScalarValue;
 
 use crate::cost::PriceTable;
 use crate::derived::{
-    Decision, DerivedId, FieldId, Plan, PolicyFingerprint, Predicate, Query, Rewrite,
+    Decision, DerivedId, FieldId, Filter, Plan, PolicyFingerprint, Predicate, Query, Rewrite,
 };
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
@@ -444,6 +444,7 @@ impl QuarryTable {
             plan: self.exact_plan(projection, filters),
             projected: self.projected_fields(projection),
             predicates: self.predicates(filters),
+            aggregate: None,
         };
         let fingerprint = Fingerprint::of(&query);
 
@@ -577,23 +578,39 @@ impl QuarryTable {
     /// `500 = status` are one plan. Failing to normalise something costs a
     /// missed match; normalising it *wrongly* would cost a wrong answer, so
     /// anything else is left exactly as written.
-    fn canonical_filter(&self, expr: &Expr) -> String {
+    fn canonical_filter(&self, expr: &Expr) -> Filter {
         if let Expr::BinaryExpr(binary) = expr {
             let symmetric = matches!(binary.op, Operator::Eq | Operator::NotEq);
+            let mut sides = vec![(binary.left.as_ref(), binary.right.as_ref())];
             if symmetric {
-                if let (Expr::Literal(value, _), Expr::Column(column)) =
-                    (binary.left.as_ref(), binary.right.as_ref())
-                {
-                    return format!("{} {} {:?}", column.name(), binary.op, value);
-                }
-                if let (Expr::Column(column), Expr::Literal(value, _)) =
-                    (binary.left.as_ref(), binary.right.as_ref())
-                {
-                    return format!("{} {} {:?}", column.name(), binary.op, value);
+                // `1 = a` and `a = 1` are the same predicate; render both as
+                // `a = 1`. Asymmetric operators keep their operand order.
+                sides.push((binary.right.as_ref(), binary.left.as_ref()));
+            }
+            for (column, value) in sides {
+                if let (Expr::Column(column), Expr::Literal(value, _)) = (column, value) {
+                    return Filter {
+                        field: self.field_ids.get(column.name()).copied(),
+                        text: format!("{} {} {:?}", column.name(), binary.op, value),
+                    };
                 }
             }
         }
-        format!("{expr:?}")
+        // Not column-against-literal: the field it restricts is the first
+        // known column it mentions, or none if it mentions none.
+        let mut field = None;
+        let _ = expr.apply(|node| {
+            if field.is_none() {
+                if let Expr::Column(c) = node {
+                    field = self.field_ids.get(c.name()).copied();
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        Filter {
+            field,
+            text: format!("{expr:?}"),
+        }
     }
 
     /// A short name for this scan's plan.

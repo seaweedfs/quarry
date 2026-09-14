@@ -100,6 +100,7 @@ fn main() {
             field: TENANT,
             value: TENANT_42,
         }],
+        aggregate: None,
     };
 
     println!("Derived state built at snapshot 810, never rebuilt.\n");

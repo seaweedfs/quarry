@@ -206,6 +206,7 @@ mod tests {
             plan: None,
             projected: BTreeSet::from([TENANT]),
             predicates,
+            aggregate: None,
         }
     }
 
