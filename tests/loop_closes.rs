@@ -308,7 +308,7 @@ async fn the_loop_builds_its_own_index_from_the_data() {
 
     let report = served.last_scan().expect("a scan happened");
     assert_eq!(
-        report.used.as_deref(),
+        report.used.first().map(String::as_str),
         Some(built_id.0.as_str()),
         "the self-built index should have served the query"
     );
@@ -367,7 +367,7 @@ async fn the_optimizer_runs_the_loop_on_its_own() {
 
         let report = served.last_scan().expect("a scan happened");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
-        assert_eq!(report.used, None, "nothing is built yet");
+        assert!(report.used.is_empty(), "nothing is built yet");
     }
 
     // Round 1: it proposes, builds, and registers, by itself.
@@ -388,7 +388,7 @@ async fn the_optimizer_runs_the_loop_on_its_own() {
 
     let report = served.last_scan().expect("a scan happened");
     assert_eq!(
-        report.used.as_deref(),
+        report.used.first().map(String::as_str),
         Some(round.built[0].0.as_str()),
         "the index the optimizer built should now be serving queries"
     );
@@ -1300,7 +1300,7 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         aggregate: None,
         bytes_read: bytes,
         bytes_if_full_scan: bytes,
-        used: None,
+        used: Vec::new(),
     }
 }
 
@@ -1372,7 +1372,10 @@ async fn another_engines_traffic_alone_justifies_an_index() {
         .sum();
     assert_eq!(rows, 500);
     let report = served.last_scan().expect("scan");
-    assert_eq!(report.used.as_deref(), Some(round.built[0].0.as_str()));
+    assert_eq!(
+        report.used.first().map(String::as_str),
+        Some(round.built[0].0.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1610,7 +1613,7 @@ async fn a_build_records_what_it_expected_so_calibration_can_judge_it() {
 
     session.sql(sql).await.expect("query");
     let report = served.last_scan().expect("scan");
-    assert_eq!(report.used.as_deref(), Some(id.0.as_str()));
+    assert_eq!(report.used.first().map(String::as_str), Some(id.0.as_str()));
     optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
 
     let calibration = optimizer.calibration();

@@ -21,7 +21,7 @@ use std::fmt;
 use crate::budget::Exceeded;
 use crate::cost::{Cost, PriceTable};
 use crate::derived::{Decision, DerivedId, Query, Reason, Rewrite};
-use crate::registry::Registry;
+use crate::registry::{Composed, Registry, compose};
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId};
 
 /// How much of the authoritative data the answer accounts for.
@@ -76,8 +76,13 @@ pub struct Refused {
 pub struct Explain {
     /// The snapshot being read.
     pub snapshot: SnapshotId,
-    /// The derived state chosen, if any. `None` means a full scan.
-    pub used: Option<Used>,
+    /// The derived state the plan uses, empty for a full scan.
+    ///
+    /// Plural because prunes compose: several indexes may intersect their
+    /// candidate file sets, and each that narrowed the plan is listed. A
+    /// substitute, when one leads, is the only entry — stored rows answer
+    /// the query alone.
+    pub used: Vec<Used>,
     /// Files that must be read alongside the derived state, because they were
     /// added after it was built.
     pub also_scan: BTreeSet<FileId>,
@@ -101,18 +106,53 @@ impl Explain {
         graph: &SnapshotGraph,
         prices: &PriceTable,
     ) -> Explain {
-        // Only admitted candidates come back from `best`, so a rejection here
-        // is impossible; it is treated as "no candidate" rather than a panic,
-        // since a full scan is always a correct answer.
-        let chosen = registry
-            .best(query, graph, prices)
-            .and_then(|c| match c.decision {
-                Decision::Use(rewrite) => Some((c.derived, rewrite, BTreeSet::new(), c.cost)),
-                Decision::UseWith { rewrite, also_scan } => {
-                    Some((c.derived, rewrite, also_scan, c.cost))
+        // Executability cannot be checked here — whether stored rows were
+        // actually supplied is a runtime fact — so a substitute is reported
+        // as the rule admits it, the same caveat `used` always carried.
+        let (used, also_scan, cost) =
+            match compose(&registry.candidates(query, graph, prices), |_| true) {
+                Composed::Substitute(candidate) => {
+                    let also_scan = match &candidate.decision {
+                        Decision::UseWith { also_scan, .. } => also_scan.clone(),
+                        _ => BTreeSet::new(),
+                    };
+                    let rewrite = match &candidate.decision {
+                        Decision::Use(rewrite) => rewrite.clone(),
+                        Decision::UseWith { rewrite, .. } => rewrite.clone(),
+                        Decision::Reject(_) => unreachable!("candidates are admitted"),
+                    };
+                    (
+                        vec![Used {
+                            id: candidate.derived.id.clone(),
+                            kind: candidate.derived.kind().name(),
+                            built_at: candidate.derived.source.snapshot,
+                            rewrite,
+                        }],
+                        also_scan,
+                        candidate.cost,
+                    )
                 }
-                Decision::Reject(_) => None,
-            });
+                Composed::Pruned {
+                    pieces, residual, ..
+                } => {
+                    let cost = pieces.iter().fold(Cost::ZERO, |acc, p| acc + p.cost);
+                    let used = pieces
+                        .iter()
+                        .map(|p| Used {
+                            id: p.derived.id.clone(),
+                            kind: p.derived.kind().name(),
+                            built_at: p.derived.source.snapshot,
+                            rewrite: match &p.decision {
+                                Decision::Use(rewrite) => rewrite.clone(),
+                                Decision::UseWith { rewrite, .. } => rewrite.clone(),
+                                Decision::Reject(_) => unreachable!("candidates are admitted"),
+                            },
+                        })
+                        .collect();
+                    (used, residual, cost)
+                }
+                Composed::Scan => (Vec::new(), BTreeSet::new(), Cost::ZERO),
+            };
 
         let refused = registry
             .assess(query, graph)
@@ -127,28 +167,13 @@ impl Explain {
             })
             .collect();
 
-        match chosen {
-            None => Explain {
-                snapshot: query.snapshot,
-                used: None,
-                also_scan: BTreeSet::new(),
-                refused,
-                cost: Cost::ZERO,
-                coverage: Coverage::Exact,
-            },
-            Some((derived, rewrite, also_scan, cost)) => Explain {
-                snapshot: query.snapshot,
-                used: Some(Used {
-                    id: derived.id.clone(),
-                    kind: derived.kind().name(),
-                    built_at: derived.source.snapshot,
-                    rewrite,
-                }),
-                also_scan,
-                refused,
-                cost,
-                coverage: Coverage::Exact,
-            },
+        Explain {
+            snapshot: query.snapshot,
+            used,
+            also_scan,
+            refused,
+            cost,
+            coverage: Coverage::Exact,
         }
     }
 
@@ -163,26 +188,26 @@ impl Explain {
 
     /// Whether the plan reads the table directly.
     pub fn is_full_scan(&self) -> bool {
-        self.used.is_none()
+        self.used.is_empty()
     }
 }
 
 impl fmt::Display for Explain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "snapshot:  {}", self.snapshot.0)?;
-        match &self.used {
-            None => writeln!(f, "used:      none (full scan)")?,
-            Some(used) => {
-                let how = match used.rewrite {
-                    Rewrite::Prune { .. } => "prunes",
-                    Rewrite::Substitute { .. } => "substitutes",
-                };
-                writeln!(
-                    f,
-                    "used:      {} ({}, {}, built at {})",
-                    used.id.0, used.kind, how, used.built_at.0
-                )?;
-            }
+        if self.used.is_empty() {
+            writeln!(f, "used:      none (full scan)")?;
+        }
+        for used in &self.used {
+            let how = match used.rewrite {
+                Rewrite::Prune { .. } => "prunes",
+                Rewrite::Substitute { .. } => "substitutes",
+            };
+            writeln!(
+                f,
+                "used:      {} ({}, {}, built at {})",
+                used.id.0, used.kind, how, used.built_at.0
+            )?;
         }
         if !self.also_scan.is_empty() {
             writeln!(f, "also scan: {} file(s) added since", self.also_scan.len())?;
@@ -312,7 +337,7 @@ mod tests {
             &graph_with_append(),
             &PriceTable::default(),
         );
-        let used = e.used.as_ref().expect("something was used");
+        let used = e.used.first().expect("something was used");
         assert_eq!(used.id, DerivedId("res".into()));
         assert_eq!(used.kind, "result");
         assert_eq!(
@@ -358,7 +383,7 @@ mod tests {
         let e = Explain::plan(&query(811), &r, &graph, &PriceTable::default());
 
         assert_eq!(
-            e.used.as_ref().map(|u| u.kind),
+            e.used.first().map(|u| u.kind),
             Some("index"),
             "the pruning kind survives the delete"
         );
@@ -439,7 +464,7 @@ mod tests {
             &graph_with_append(),
             &PriceTable::default(),
         );
-        assert_eq!(e.used.expect("used").id, DerivedId("res".into()));
+        assert_eq!(e.used.first().expect("used").id, DerivedId("res".into()));
         assert!(
             e.refused.is_empty(),
             "a candidate that lost on cost was not refused"

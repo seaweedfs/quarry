@@ -1716,3 +1716,38 @@ Three details worth recording:
 - **`list` is charged once per call, not per page.** The stream paginates
   inside the inner store, so page count is invisible: undercharged rather than
   uncharged, and `list_with_delimiter` is exact.
+
+---
+
+## Phase 24 — Composed pruning `[x]`
+
+The taxonomy landed (core-design §4): four levels of accelerator, with the
+rule that level-2 prunes compose. They did not — `Registry::candidates`
+ordered the admissible pieces and the scan used the first executable one,
+so `a = 1 AND b = 2` read whichever index was cheaper alone.
+
+`compose` (in `src/registry.rs`) turns the candidate list into a plan. The
+cheapest executable candidate still leads — a leading substitute answers
+alone, unchanged — but when a prune leads, every later admissible prune
+intersects its candidate files with the running set. Each piece's
+added-since residual is unioned into its own set *before* intersecting, so
+staleness stays safe: the intersection of two supersets is a superset of
+the conjunct. A piece is listed as used only when it strictly narrowed the
+running set; the leader is always listed, since the scan reads its set
+even when nothing further was pruned.
+
+`ScanReport.used` and `Observation.used` became `Vec` to carry it. Every
+named piece is credited with the observation — attribution of the saving
+between intersecting indexes is inherently ambiguous, and retirement only
+asks "did it help". `Explain::used` likewise lists the composed plan
+rather than a single winner.
+
+Three of the tests pin decisions, not just results:
+
+- `two_indexes_intersect_their_candidate_files` — {a,b} ∩ {a,c} = {a},
+  with one index over-claiming on purpose: postings may lie upward, the
+  engine re-checks rows.
+- `a_substitute_priced_above_a_leading_prune_is_ignored` — cost order still
+  decides the leader; composition did not smuggle in a second strategy.
+- `residuals_intersect_with_postings` — both indexes predate a file, so
+  {a,b,d} ∩ {b,d} = {b,d}: the residual unions before it intersects.

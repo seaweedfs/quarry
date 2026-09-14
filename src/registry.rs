@@ -6,11 +6,11 @@
 //! the [`Kind`](crate::derived::Kind) trait — which is what lets a new kind be
 //! added without touching this file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
-use crate::derived::{Decision, Derived, DerivedId, Query};
-use crate::snapshot::SnapshotGraph;
+use crate::derived::{Decision, Derived, DerivedId, Query, Rewrite};
+use crate::snapshot::{FileId, SnapshotGraph};
 
 /// One admissible candidate for serving a query.
 #[derive(Clone, Debug)]
@@ -21,6 +21,95 @@ pub struct Candidate<'a> {
     pub decision: Decision,
     /// What using it would cost.
     pub cost: crate::cost::Cost,
+}
+
+/// The plan the rule composes from a query's candidates.
+///
+/// The cheapest executable candidate leads. A leading substitute answers
+/// alone — stored rows replace the scan outright. When a prune leads, every
+/// later admissible prune intersects its candidate files with the running
+/// set; `a = 1 AND b = 2` reads the files both indexes name, not whichever
+/// index is cheaper alone.
+pub enum Composed<'a> {
+    /// One substitute answers the query.
+    Substitute(Candidate<'a>),
+    /// Intersected pruning: the files that may match every predicate, the
+    /// added-since files among them, and the pieces that contributed.
+    ///
+    /// A piece contributes when it strictly narrows the running set; the
+    /// leader is always listed, even when it narrows nothing, because it is
+    /// still the piece the scan reads its candidate files from.
+    Pruned {
+        /// Files to read: every contributing index's set intersected, each
+        /// already unioned with the files added since it was built.
+        files: BTreeSet<FileId>,
+        /// The added-since portion of `files`.
+        residual: BTreeSet<FileId>,
+        /// The pieces that narrowed the set, cheapest first.
+        pieces: Vec<Candidate<'a>>,
+    },
+    /// Nothing admissible: a full scan.
+    Scan,
+}
+
+/// Turn a query's candidates into a plan.
+///
+/// `can_substitute` is the caller's executability check: stored rows may not
+/// have been supplied for an otherwise admissible substitute, and one that
+/// cannot answer is skipped rather than leading. `Explain` passes `|_| true`
+/// — it reports what the rule admits, executability being a runtime fact.
+pub fn compose<'a>(
+    candidates: &'a [Candidate<'a>],
+    can_substitute: impl Fn(&Derived) -> bool,
+) -> Composed<'a> {
+    let mut files: Option<BTreeSet<FileId>> = None;
+    let mut residual = BTreeSet::new();
+    let mut pieces = Vec::new();
+    for candidate in candidates {
+        let (rewrite, also_scan) = match &candidate.decision {
+            Decision::Use(rewrite) => (rewrite, None),
+            Decision::UseWith { rewrite, also_scan } => (rewrite, Some(also_scan)),
+            Decision::Reject(_) => continue,
+        };
+        match rewrite {
+            Rewrite::Substitute { .. } => {
+                if files.is_none() && can_substitute(candidate.derived) {
+                    return Composed::Substitute(candidate.clone());
+                }
+            }
+            Rewrite::Prune { files: named } => {
+                let effective: BTreeSet<FileId> = named
+                    .iter()
+                    .chain(also_scan.into_iter().flatten())
+                    .cloned()
+                    .collect();
+                match &mut files {
+                    None => {
+                        residual.extend(also_scan.into_iter().flatten().cloned());
+                        files = Some(effective);
+                        pieces.push(candidate.clone());
+                    }
+                    Some(current) => {
+                        let narrowed: BTreeSet<FileId> =
+                            current.intersection(&effective).cloned().collect();
+                        if narrowed.len() < current.len() {
+                            residual.extend(also_scan.into_iter().flatten().cloned());
+                            *current = narrowed;
+                            pieces.push(candidate.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match files {
+        Some(files) => Composed::Pruned {
+            residual: residual.intersection(&files).cloned().collect(),
+            files,
+            pieces,
+        },
+        None => Composed::Scan,
+    }
 }
 
 /// The derived state the engine knows about.
@@ -242,6 +331,64 @@ mod tests {
         }
     }
 
+    /// Names a fixed file set whenever its field carries an equality.
+    #[derive(Debug)]
+    struct Pruner {
+        field: FieldId,
+        files: BTreeSet<FileId>,
+        usd: f64,
+    }
+
+    impl Kind for Pruner {
+        fn name(&self) -> &'static str {
+            "pruner"
+        }
+        fn matches(&self, query: &Query) -> Option<Rewrite> {
+            query
+                .equalities(self.field)
+                .first()
+                .map(|_| Rewrite::Prune {
+                    files: self.files.clone(),
+                })
+        }
+        fn cost(&self, _prices: &PriceTable) -> Cost {
+            Cost {
+                usd: self.usd,
+                ..Cost::ZERO
+            }
+        }
+        fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+            Refreshed::UpToDate
+        }
+    }
+
+    fn prune_entry(id: &str, field: u32, usd: f64, files: &[&str]) -> Derived {
+        Derived::new(
+            DerivedId(id.into()),
+            Source {
+                table: table(),
+                snapshot: SnapshotId(810),
+            },
+            POLICY,
+            files.len() as u64,
+            Box::new(Pruner {
+                field,
+                files: files.iter().map(|f| FileId(f.to_string())).collect(),
+                usd,
+            }),
+        )
+    }
+
+    fn and_query() -> Query {
+        Query {
+            predicates: vec![
+                Predicate::Eq { field: 4, value: 7 },
+                Predicate::Eq { field: 9, value: 2 },
+            ],
+            ..query()
+        }
+    }
+
     fn table() -> TableId {
         TableId("events".into())
     }
@@ -260,8 +407,11 @@ mod tests {
     }
 
     fn graph() -> SnapshotGraph {
-        SnapshotGraph::new()
-            .with(Snapshot::root(SnapshotId(810)).with_clean_file(FileId("a".into())))
+        let mut root = Snapshot::root(SnapshotId(810));
+        for f in ["a", "b", "c", "d"] {
+            root = root.with_clean_file(FileId(f.into()));
+        }
+        SnapshotGraph::new().with(root)
     }
 
     fn query() -> Query {
@@ -431,5 +581,162 @@ mod tests {
                 DerivedId("c".into())
             ]
         );
+    }
+
+    #[test]
+    fn admissible_prunes_intersect_their_candidate_files() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(prune_entry("a_idx", 4, 1.0, &["a", "b", "c"]));
+        r.register(prune_entry("b_idx", 9, 2.0, &["b", "d"]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned {
+                files,
+                residual,
+                pieces,
+            } => {
+                assert_eq!(files, BTreeSet::from([FileId("b".into())]));
+                assert!(residual.is_empty());
+                assert_eq!(
+                    pieces
+                        .iter()
+                        .map(|p| p.derived.id.clone())
+                        .collect::<Vec<_>>(),
+                    vec![DerivedId("a_idx".into()), DerivedId("b_idx".into())],
+                    "the cheaper piece leads; the second still narrowed the set"
+                );
+            }
+            _ => panic!("two admissible prunes must compose"),
+        }
+    }
+
+    #[test]
+    fn a_prune_that_narrows_nothing_is_not_listed() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(prune_entry("narrow", 4, 1.0, &["a"]));
+        r.register(prune_entry("wide", 9, 2.0, &["a", "b", "c"]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned { files, pieces, .. } => {
+                assert_eq!(files, BTreeSet::from([FileId("a".into())]));
+                assert_eq!(
+                    pieces.len(),
+                    1,
+                    "a piece whose set is a superset contributed nothing"
+                );
+                assert_eq!(pieces[0].derived.id, DerivedId("narrow".into()));
+            }
+            _ => panic!("expected a pruned plan"),
+        }
+    }
+
+    #[test]
+    fn prunes_compose_to_no_files_at_all() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(prune_entry("a_idx", 4, 1.0, &["a"]));
+        r.register(prune_entry("b_idx", 9, 2.0, &["b"]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned { files, pieces, .. } => {
+                assert!(files.is_empty(), "disjoint candidates: nothing can match");
+                assert_eq!(pieces.len(), 2);
+            }
+            _ => panic!("expected a pruned plan"),
+        }
+    }
+
+    #[test]
+    fn residuals_intersect_with_postings() {
+        let prices = PriceTable::default();
+        let graph = SnapshotGraph::new()
+            .with(
+                Snapshot::root(SnapshotId(810))
+                    .with_clean_file(FileId("a".into()))
+                    .with_clean_file(FileId("b".into())),
+            )
+            .with(
+                Snapshot::child_of(SnapshotId(811), SnapshotId(810))
+                    .with_clean_file(FileId("a".into()))
+                    .with_clean_file(FileId("b".into()))
+                    .with_clean_file(FileId("d".into())),
+            );
+        let query = Query {
+            snapshot: SnapshotId(811),
+            ..and_query()
+        };
+
+        let mut r = Registry::new();
+        r.register(prune_entry("a_idx", 4, 1.0, &["a", "b"]));
+        r.register(prune_entry("b_idx", 9, 2.0, &["b"]));
+
+        match compose(&r.candidates(&query, &graph, &prices), |_| true) {
+            Composed::Pruned {
+                files, residual, ..
+            } => {
+                // Both indexes predate file d, so each may-serve set is
+                // postings + {d}: {a,b,d} ∩ {b,d} = {b,d}.
+                assert_eq!(
+                    files,
+                    BTreeSet::from([FileId("b".into()), FileId("d".into())])
+                );
+                assert_eq!(residual, BTreeSet::from([FileId("d".into())]));
+            }
+            _ => panic!("expected a pruned plan"),
+        }
+    }
+
+    #[test]
+    fn an_executable_substitute_answers_alone() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(entry("sub", 0.5, 1, None));
+        r.register(prune_entry("p", 4, 1.0, &["a"]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Substitute(candidate) => {
+                assert_eq!(candidate.derived.id, DerivedId("sub".into()));
+            }
+            _ => panic!("the cheapest executable candidate leads"),
+        }
+    }
+
+    #[test]
+    fn a_substitute_priced_above_a_leading_prune_is_ignored() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(prune_entry("p", 4, 0.5, &["a"]));
+        r.register(entry("sub", 5.0, 1, None));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned { files, pieces, .. } => {
+                assert_eq!(files, BTreeSet::from([FileId("a".into())]));
+                assert_eq!(pieces.len(), 1);
+            }
+            _ => panic!("the cheaper prune leads; stored rows never get asked"),
+        }
+    }
+
+    #[test]
+    fn a_non_executable_substitute_falls_through_to_prunes() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(entry("no-rows", 0.5, 1, None));
+        r.register(prune_entry("p", 4, 1.0, &["a", "b"]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| false) {
+            Composed::Pruned { pieces, .. } => {
+                assert_eq!(pieces.len(), 1);
+                assert_eq!(pieces[0].derived.id, DerivedId("p".into()));
+            }
+            _ => panic!("a substitute without rows is skipped, not leading"),
+        }
+    }
+
+    #[test]
+    fn nothing_admissible_is_a_full_scan() {
+        assert!(matches!(compose(&[], |_| true), Composed::Scan));
     }
 }

@@ -306,7 +306,7 @@ async fn the_rule_prunes_a_table_loaded_over_rest() {
     assert_eq!(total_rows(&rows), 3);
 
     let report = table.last_scan().expect("a scan happened");
-    assert_eq!(report.used.as_deref(), Some("tenant_idx"));
+    assert_eq!(report.used.first().map(String::as_str), Some("tenant_idx"));
     assert_eq!(
         report.files_read,
         BTreeSet::from([FileId(object_path(&a)), FileId(object_path(&c))]),

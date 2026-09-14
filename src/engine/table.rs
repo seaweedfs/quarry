@@ -24,9 +24,9 @@ use datafusion::scalar::ScalarValue;
 use crate::cost::PriceTable;
 use crate::derived::{
     AggFunc, Aggregate, Decision, DerivedId, FieldId, Filter, Measure, Plan, PolicyFingerprint,
-    Predicate, Query, Rewrite,
+    Predicate, Query,
 };
-use crate::registry::Registry;
+use crate::registry::{Composed, Registry, compose};
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
 use crate::stable_hash::StableHasher;
 use crate::workload::{Fingerprint, Observation};
@@ -67,7 +67,11 @@ pub struct ScanReport {
     /// Files the plan reads.
     pub files_read: BTreeSet<FileId>,
     /// Which derived state was used, if any.
-    pub used: Option<String>,
+    ///
+    /// Plural because prunes compose: `a = 1 AND b = 2` can be served by two
+    /// indexes whose candidate file sets intersected, and each is named here.
+    /// A piece is named only if it actually narrowed the plan.
+    pub used: Vec<String>,
     /// Files read because they were added after that derived state was built.
     pub also_scanned: BTreeSet<FileId>,
     /// Whether stored rows were read in place of the table.
@@ -119,7 +123,7 @@ impl ScanReport {
             aggregate: self.aggregate.clone(),
             bytes_read,
             bytes_if_full_scan: self.bytes_if_full_scan,
-            used: self.used.clone().map(DerivedId),
+            used: self.used.iter().cloned().map(DerivedId).collect(),
         }
     }
 }
@@ -628,56 +632,51 @@ impl QuarryTable {
         // direction — the answer is right, merely slower.
         // A read guard, held only across planning, which does no I/O.
         let registry = self.registry.read().expect("registry lock");
-        let usable = registry
-            .candidates(&query, &self.graph, &self.prices)
-            .into_iter()
-            .find_map(|candidate| {
-                let used = candidate.derived.id.0.clone();
-                let (rewrite, also_scanned) = match candidate.decision {
-                    Decision::Use(rewrite) => (rewrite, BTreeSet::new()),
-                    Decision::UseWith { rewrite, also_scan } => (rewrite, also_scan),
-                    Decision::Reject(_) => return None,
+        let materialized = self.materialized.lock().expect("materialized");
+        let usable = match compose(
+            &registry.candidates(&query, &self.graph, &self.prices),
+            |d| materialized.contains_key(&d.id),
+        ) {
+            Composed::Substitute(candidate) => {
+                let also_scanned = match candidate.decision {
+                    Decision::UseWith { also_scan, .. } => also_scan,
+                    _ => BTreeSet::new(),
                 };
-                match rewrite {
-                    Rewrite::Prune { files } => Some(ScanReport {
-                        aggregate: None,
-                        files_read: files,
-                        used: Some(used),
-                        also_scanned,
-                        substituted: false,
-                        plan_hash,
-                        bytes_if_full_scan,
-                        fingerprint: fingerprint.clone(),
-                        plan: query.plan.clone(),
-                    }),
-                    Rewrite::Substitute { .. }
-                        if self
-                            .materialized
-                            .lock()
-                            .expect("materialized")
-                            .contains_key(&candidate.derived.id) =>
-                    {
-                        Some(ScanReport {
-                            aggregate: None,
-                            files_read: BTreeSet::new(),
-                            used: Some(used),
-                            also_scanned,
-                            substituted: true,
-                            plan_hash,
-                            bytes_if_full_scan,
-                            fingerprint: fingerprint.clone(),
-                            plan: query.plan.clone(),
-                        })
-                    }
-                    Rewrite::Substitute { .. } => None,
-                }
-            });
+                Some(ScanReport {
+                    aggregate: None,
+                    files_read: BTreeSet::new(),
+                    used: vec![candidate.derived.id.0.clone()],
+                    also_scanned,
+                    substituted: true,
+                    plan_hash,
+                    bytes_if_full_scan,
+                    fingerprint: fingerprint.clone(),
+                    plan: query.plan.clone(),
+                })
+            }
+            Composed::Pruned {
+                files,
+                residual,
+                pieces,
+            } => Some(ScanReport {
+                aggregate: None,
+                files_read: files,
+                used: pieces.iter().map(|p| p.derived.id.0.clone()).collect(),
+                also_scanned: residual,
+                substituted: false,
+                plan_hash,
+                bytes_if_full_scan,
+                fingerprint: fingerprint.clone(),
+                plan: query.plan.clone(),
+            }),
+            Composed::Scan => None,
+        };
 
         match usable {
             None => ScanReport {
                 aggregate: None,
                 files_read: live,
-                used: None,
+                used: Vec::new(),
                 also_scanned: BTreeSet::new(),
                 substituted: false,
                 plan_hash,
@@ -843,8 +842,8 @@ impl TableProvider for QuarryTable {
         if report.substituted {
             if let Some(batches) = report
                 .used
-                .as_deref()
-                .map(|id| DerivedId(id.to_owned()))
+                .first()
+                .map(|id| DerivedId(id.clone()))
                 .and_then(|id| {
                     self.materialized
                         .lock()

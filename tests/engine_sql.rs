@@ -86,8 +86,24 @@ fn tenant_index(at: i64, entries: &[(i64, &str)]) -> Derived {
     for (tenant, f) in entries {
         index.insert(tenant_hash(*tenant), file(f));
     }
+    field_index("tenant_idx", at, index)
+}
+
+/// An index over message built at `at`, under the given id.
+fn message_index(id: &str, at: i64, entries: &[(&str, &str)]) -> Derived {
+    let mut index = Index::new(7);
+    for (message, f) in entries {
+        index.insert(
+            hash_scalar(&ScalarValue::Utf8(Some(message.to_string()))),
+            file(f),
+        );
+    }
+    field_index(id, at, index)
+}
+
+fn field_index(id: &str, at: i64, index: Index) -> Derived {
     Derived::new(
-        DerivedId("tenant_idx".into()),
+        DerivedId(id.into()),
         Source {
             table: TableId("events".into()),
             snapshot: SnapshotId(at),
@@ -128,11 +144,84 @@ async fn without_derived_state_every_file_is_read() {
     assert_eq!(total_rows(&rows), 3);
 
     let report = table.last_scan().expect("a scan happened");
-    assert_eq!(report.used, None);
+    assert!(report.used.is_empty());
     assert_eq!(
         report.files_read,
         BTreeSet::from([file("a"), file("b"), file("c")])
     );
+}
+
+#[tokio::test]
+async fn two_indexes_intersect_their_candidate_files() {
+    let mut registry = Registry::new();
+    registry.register(tenant_index(810, &[(1, "a"), (1, "c"), (2, "b")]));
+    // The a1 posting names b too — postings may over-claim (the engine
+    // re-checks rows), and here it makes the message index alone insufficient.
+    registry.register(message_index(
+        "message_idx",
+        810,
+        &[
+            ("a1", "a"),
+            ("a1", "b"),
+            ("a2", "a"),
+            ("b1", "b"),
+            ("c1", "c"),
+        ],
+    ));
+
+    let table = Arc::new(
+        table_with_three_files(flat_graph(&["a", "b", "c"], 810), SnapshotId(810))
+            .with_registry(registry),
+    );
+
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT * FROM events WHERE tenant_id = 1 AND message = 'a1'",
+    )
+    .await;
+    assert_eq!(total_rows(&rows), 1, "same answer as the full scan");
+
+    let report = table.last_scan().expect("a scan happened");
+    assert_eq!(
+        report.files_read,
+        BTreeSet::from([file("a")]),
+        "message says {{a,b}}, tenant says {{a,c}}: the conjunct reads only a"
+    );
+    assert_eq!(
+        report.used.len(),
+        2,
+        "both indexes narrowed the plan and both are credited"
+    );
+}
+
+#[tokio::test]
+async fn an_index_that_narrows_nothing_is_not_credited() {
+    let mut registry = Registry::new();
+    registry.register(tenant_index(810, &[(1, "a"), (1, "c"), (2, "b")]));
+    // A conservative index naming every file still prunes correctly, but for
+    // this query it adds nothing over the tenant index.
+    // The id sorts after "tenant_idx" so the tenant index leads and this
+    // one is the candidate that fails to narrow it.
+    registry.register(message_index(
+        "wide_idx",
+        810,
+        &[("a1", "a"), ("a1", "b"), ("a1", "c")],
+    ));
+
+    let table = Arc::new(
+        table_with_three_files(flat_graph(&["a", "b", "c"], 810), SnapshotId(810))
+            .with_registry(registry),
+    );
+
+    run(
+        Arc::clone(&table),
+        "SELECT * FROM events WHERE tenant_id = 1 AND message = 'a1'",
+    )
+    .await;
+
+    let report = table.last_scan().expect("a scan happened");
+    assert_eq!(report.files_read, BTreeSet::from([file("a"), file("c")]),);
+    assert_eq!(report.used, ["tenant_idx"], "only the piece that narrowed");
 }
 
 #[tokio::test]
@@ -153,7 +242,7 @@ async fn an_index_prunes_the_files_read_without_changing_the_answer() {
     assert_eq!(total_rows(&rows), 3, "same answer as the full scan");
 
     let report = table.last_scan().expect("a scan happened");
-    assert_eq!(report.used.as_deref(), Some("tenant_idx"));
+    assert_eq!(report.used.first().map(String::as_str), Some("tenant_idx"));
     assert_eq!(
         report.files_read,
         BTreeSet::from([file("a"), file("c")]),
@@ -229,7 +318,10 @@ async fn an_index_from_an_abandoned_branch_is_not_used() {
     assert_eq!(total_rows(&rows), 3);
 
     let report = table.last_scan().expect("a scan happened");
-    assert_eq!(report.used, None, "derived state off the branch is refused");
+    assert!(
+        report.used.is_empty(),
+        "derived state off the branch is refused"
+    );
 }
 
 #[tokio::test]
@@ -297,7 +389,7 @@ async fn a_policy_mismatch_falls_back_to_a_full_scan() {
     )
     .await;
     assert_eq!(total_rows(&rows), 3);
-    assert_eq!(table.last_scan().expect("scan").used, None);
+    assert!(table.last_scan().expect("scan").used.is_empty());
 }
 
 #[tokio::test]
@@ -317,9 +409,8 @@ async fn a_predicate_the_index_cannot_probe_falls_back() {
     )
     .await;
     assert_eq!(total_rows(&rows), 1);
-    assert_eq!(
-        table.last_scan().expect("scan").used,
-        None,
+    assert!(
+        table.last_scan().expect("scan").used.is_empty(),
         "an unprobeable predicate must not prune"
     );
 }
@@ -718,8 +809,8 @@ async fn an_aggregated_result_is_refused_once_a_file_is_added() {
     );
 
     let report = table.last_scan().expect("scan");
-    assert_eq!(
-        report.used, None,
+    assert!(
+        report.used.is_empty(),
         "an aggregate cannot be concatenated with raw rows"
     );
     assert!(!report.substituted);
@@ -750,9 +841,8 @@ async fn a_substituting_candidate_without_stored_rows_is_skipped() {
 
     let rows = run(Arc::clone(&table), sql).await;
     assert_eq!(total_rows(&rows), 3);
-    assert_eq!(
-        table.last_scan().expect("scan").used,
-        None,
+    assert!(
+        table.last_scan().expect("scan").used.is_empty(),
         "skipping is the safe direction: right answer, merely slower"
     );
 }
@@ -783,7 +873,12 @@ async fn deletes_do_not_disqualify_a_pruning_index() {
     )
     .await;
     assert_eq!(
-        table.last_scan().expect("scan").used.as_deref(),
+        table
+            .last_scan()
+            .expect("scan")
+            .used
+            .first()
+            .map(String::as_str),
         Some("tenant_idx"),
         "the engine still reads the file and applies deletes, so pruning is safe"
     );

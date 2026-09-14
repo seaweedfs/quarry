@@ -246,7 +246,7 @@ async fn the_registry_is_rebuilt_by_listing_after_a_restart() {
     assert_eq!(rows, 200);
 
     let report = served.last_scan().expect("scan");
-    assert_eq!(report.used.as_deref(), Some(id.0.as_str()));
+    assert_eq!(report.used.first().map(String::as_str), Some(id.0.as_str()));
     assert_eq!(
         report.files_read,
         std::collections::BTreeSet::from([fixture.files[0].clone()]),
@@ -474,7 +474,7 @@ async fn a_restart_recovers_everything_and_destroys_nothing() {
         for _ in 0..5 {
             session.sql(sql).await.expect("query");
             let report = served.last_scan().expect("scan");
-            assert!(report.used.is_some(), "the index should be serving");
+            assert!(!report.used.is_empty(), "the index should be serving");
             optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
         }
 
@@ -551,7 +551,7 @@ async fn a_restart_recovers_everything_and_destroys_nothing() {
     // And it is genuinely in use, not merely present.
     session.sql(sql).await.expect("query");
     let report = served.last_scan().expect("scan");
-    assert_eq!(report.used.as_deref(), Some(id.0.as_str()));
+    assert_eq!(report.used.first().map(String::as_str), Some(id.0.as_str()));
 }
 
 #[tokio::test]

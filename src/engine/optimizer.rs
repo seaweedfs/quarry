@@ -324,9 +324,7 @@ impl Optimizer {
         let realized = self
             .workload
             .credited(id)
-            .map(|seen| {
-                seen.bytes_saved() as f64 * self.prices.byte_usd(Tier::Hot, Distance::Far)
-            })
+            .map(|seen| seen.bytes_saved() as f64 * self.prices.byte_usd(Tier::Hot, Distance::Far))
             .unwrap_or(0.0);
         if predicted <= 0.0 {
             return if realized > 0.0 { 1.0 } else { 0.0 };
@@ -738,7 +736,7 @@ mod tests {
             aggregate: None,
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
-            used: None,
+            used: Vec::new(),
         }
     }
 

@@ -136,8 +136,13 @@ pub struct Observation {
     /// Known exactly from the live file sizes, which is what makes the saving
     /// below a measurement rather than a guess.
     pub bytes_if_full_scan: u64,
-    /// Which piece of derived state served it, if any.
-    pub used: Option<DerivedId>,
+    /// Which pieces of derived state served it, if any.
+    ///
+    /// Plural because prunes compose: several indexes may have intersected
+    /// their candidate file sets, and each that narrowed the plan is named.
+    /// Every named piece is credited with the observation — attribution of
+    /// the saving between them is inherently ambiguous.
+    pub used: Vec<DerivedId>,
 }
 
 impl Observation {
@@ -210,7 +215,7 @@ impl ForeignScan {
             aggregate: None,
             bytes_read: self.bytes_read,
             bytes_if_full_scan,
-            used: None,
+            used: Vec::new(),
         }
     }
 }
@@ -438,14 +443,16 @@ impl Workload {
             seen.bytes_if_full_scan = seen
                 .bytes_if_full_scan
                 .saturating_add(observation.bytes_if_full_scan);
-            if observation.used.is_some() {
+            if !observation.used.is_empty() {
                 seen.helped += 1;
             }
         }
 
-        if let Some(id) = observation.used {
+        if !observation.used.is_empty() {
             shape.helped += 1;
-            let credited = self.by_derived.entry(id).or_default();
+        }
+        for id in &observation.used {
+            let credited = self.by_derived.entry(id.clone()).or_default();
             credited.queries += 1;
             credited.helped += 1;
             credited.bytes_read = credited.bytes_read.saturating_add(observation.bytes_read);
@@ -657,7 +664,7 @@ mod tests {
             aggregate: None,
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
-            used: None,
+            used: Vec::new(),
         }
     }
 
@@ -801,7 +808,7 @@ mod tests {
                 aggregate: None,
                 bytes_read: GB / 10,
                 bytes_if_full_scan: GB,
-                used: Some(DerivedId("idx".into())),
+                used: vec![DerivedId("idx".into())],
             });
         }
         assert!(workload.proposals(&PriceTable::default(), 1).is_empty());
@@ -822,7 +829,7 @@ mod tests {
                 aggregate: None,
                 bytes_read: GB,
                 bytes_if_full_scan: GB,
-                used: None,
+                used: Vec::new(),
             });
         }
         assert_eq!(workload.shapes(), 2);
@@ -851,7 +858,7 @@ mod tests {
             aggregate: None,
             bytes_read: GB / 4,
             bytes_if_full_scan: GB,
-            used: Some(DerivedId("idx".into())),
+            used: vec![DerivedId("idx".into())],
         };
         assert_eq!(observation.bytes_saved(), GB - GB / 4);
     }
@@ -863,7 +870,7 @@ mod tests {
             aggregate: None,
             bytes_read: 2 * GB,
             bytes_if_full_scan: GB,
-            used: Some(DerivedId("idx".into())),
+            used: vec![DerivedId("idx".into())],
         };
         assert_eq!(observation.bytes_saved(), 0);
     }
@@ -924,7 +931,7 @@ mod tests {
                 aggregate: None,
                 bytes_read: 0,
                 bytes_if_full_scan: GB,
-                used: Some(DerivedId("useful".into())),
+                used: vec![DerivedId("useful".into())],
             });
         }
         assert!(
@@ -944,7 +951,7 @@ mod tests {
             aggregate: None,
             bytes_read: 0,
             bytes_if_full_scan: 1_000,
-            used: Some(DerivedId("bloated".into())),
+            used: vec![DerivedId("bloated".into())],
         });
         assert_eq!(
             workload.retirements(&registry, &PriceTable::default(), 30.0),
@@ -960,7 +967,7 @@ mod tests {
             aggregate: None,
             bytes_read: 1,
             bytes_if_full_scan: GB,
-            used: Some(DerivedId("a".into())),
+            used: vec![DerivedId("a".into())],
         });
 
         let credited = workload.credited(&DerivedId("a".into())).expect("credited");

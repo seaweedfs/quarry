@@ -248,7 +248,7 @@ pub(crate) fn report(
 ) -> ScanReport {
     ScanReport {
         files_read: Default::default(),
-        used: Some(used.0.clone()),
+        used: vec![used.0.clone()],
         also_scanned: Default::default(),
         substituted: true,
         plan_hash: query.plan_hash,

@@ -185,7 +185,7 @@ async fn a_cube_serves_the_grain_it_was_built_at() {
         .await
         .expect("sql");
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
-    assert_eq!(table.last_scan().expect("report").used, Some("cube".into()));
+    assert_eq!(table.last_scan().expect("report").used, ["cube"]);
     assert!(table.last_scan().expect("report").substituted);
 }
 
@@ -204,7 +204,7 @@ async fn a_coarser_query_rolls_the_cube_up() {
         BTreeMap::from([(1, 60), (2, 150)]),
         "day 1: 10+20+30, day 2: 40+50+60"
     );
-    assert_eq!(table.last_scan().expect("report").used, Some("cube".into()));
+    assert_eq!(table.last_scan().expect("report").used, ["cube"]);
 }
 
 #[tokio::test]
@@ -218,7 +218,7 @@ async fn a_stored_count_is_summed_not_counted() {
         .await
         .expect("sql");
     assert_eq!(pairs(&rows), BTreeMap::from([(1, 3), (2, 3)]));
-    assert_eq!(table.last_scan().expect("report").used, Some("cube".into()));
+    assert_eq!(table.last_scan().expect("report").used, ["cube"]);
 }
 
 #[tokio::test]
@@ -243,7 +243,7 @@ async fn a_query_with_no_grouping_rolls_everything_up() {
         })
         .sum();
     assert_eq!(total, 6);
-    assert_eq!(table.last_scan().expect("report").used, Some("cube".into()));
+    assert_eq!(table.last_scan().expect("report").used, ["cube"]);
 }
 
 #[tokio::test]
@@ -257,7 +257,7 @@ async fn a_filter_on_a_group_key_is_applied_to_the_partials() {
         .await
         .expect("sql");
     assert_eq!(pairs(&rows), BTreeMap::from([(2, 3)]));
-    assert_eq!(table.last_scan().expect("report").used, Some("cube".into()));
+    assert_eq!(table.last_scan().expect("report").used, ["cube"]);
 }
 
 #[tokio::test]
@@ -277,7 +277,7 @@ async fn a_filter_on_a_non_key_field_cannot_be_served() {
         BTreeMap::from([(1, 30), (2, 150)]),
         "computed from raw rows: only bytes > 20 count"
     );
-    assert_eq!(table.last_scan().expect("report").used, None);
+    assert!(table.last_scan().expect("report").used.is_empty());
 }
 
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn a_measure_the_cube_does_not_hold_cannot_be_served() {
         .await
         .expect("sql");
     assert_eq!(pairs(&rows), BTreeMap::from([(1, 10), (2, 40)]));
-    assert_eq!(table.last_scan().expect("report").used, None);
+    assert!(table.last_scan().expect("report").used.is_empty());
 }
 
 #[tokio::test]
@@ -306,7 +306,7 @@ async fn a_finer_grouping_cannot_be_served() {
         .await
         .expect("sql");
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
-    assert_eq!(table.last_scan().expect("report").used, None);
+    assert!(table.last_scan().expect("report").used.is_empty());
 }
 
 #[tokio::test]
@@ -365,7 +365,7 @@ async fn a_cube_does_not_serve_across_a_snapshot_boundary() {
         })
         .sum();
     assert_eq!(total, 12, "both files' rows, not the stale cube's six");
-    assert_eq!(table.last_scan().expect("report").used, None);
+    assert!(table.last_scan().expect("report").used.is_empty());
 }
 
 #[tokio::test]
@@ -386,7 +386,7 @@ async fn repeated_asks_make_the_optimizer_build_the_cube() {
         session.sql(sql).await.expect("sql");
         let report = table.last_scan().expect("scan");
         optimizer.observe(report.observation(1024));
-        assert_eq!(report.used, None, "nothing to serve it yet");
+        assert!(report.used.is_empty(), "nothing to serve it yet");
     }
 
     let round = optimizer.round(&session, &table).await;
@@ -402,7 +402,7 @@ async fn repeated_asks_make_the_optimizer_build_the_cube() {
     assert!(
         report
             .used
-            .as_deref()
+            .first()
             .is_some_and(|id| id.starts_with("cube:")),
         "served by the cube the round built: {:?}",
         report.used

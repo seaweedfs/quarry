@@ -303,7 +303,7 @@ async fn an_index_prunes_a_real_iceberg_table() {
     assert_eq!(total_rows(&rows), 3, "same answer as a full scan");
 
     let report = table.last_scan().expect("a scan happened");
-    assert_eq!(report.used.as_deref(), Some("tenant_idx"));
+    assert_eq!(report.used.first().map(String::as_str), Some("tenant_idx"));
     assert_eq!(
         report.files_read,
         BTreeSet::from([

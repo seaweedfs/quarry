@@ -192,7 +192,7 @@ async fn an_index_prunes_which_parquet_objects_are_opened() {
     assert_eq!(total_rows(&rows), 3, "same answer as a full scan");
 
     let report = table.last_scan().expect("scan");
-    assert_eq!(report.used.as_deref(), Some("tenant_idx"));
+    assert_eq!(report.used.first().map(String::as_str), Some("tenant_idx"));
     assert_eq!(report.files_read, BTreeSet::from([a, c]));
 }
 
