@@ -209,10 +209,18 @@ impl Session {
         // An aggregate no cube could serve still reports the ask: the scan
         // itself saw only `aggregate: None`, and the optimizer can only
         // propose what it can see.
-        if let Some(ask) = super::cube::ask_of(&plan) {
+        if let Some(ask) = super::cube::first_ask(&plan) {
             if let Some(query) = super::cube::query_of(&ask) {
                 if let Some(mut report) = ask.table.last_scan() {
-                    report.aggregate = query.aggregate;
+                    report.aggregate =
+                        query.aggregate.zip(query.plan.clone()).map(|(spec, plan)| {
+                            crate::workload::AggregateAsk {
+                                table: ask.table.table_id().clone(),
+                                plan,
+                                spec,
+                                filter_sql: super::cube::filter_sql(&ask),
+                            }
+                        });
                     report.plan = query.plan;
                     ask.table.note_scan(report);
                 }

@@ -92,10 +92,34 @@ impl Fingerprint {
 /// beside shape counts.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AggregateAsk {
+    /// The table the query aggregated over.
+    pub table: TableId,
     /// The exact plan the query ran under.
     pub plan: Plan,
     /// Keys and measures.
     pub spec: Aggregate,
+    /// The query's filters rendered back to SQL, so a cube proposal can bake
+    /// them in. Canonical text identifies; this executes.
+    pub filter_sql: Vec<String>,
+}
+
+/// A cube worth building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CubeProposal {
+    /// The table it would be built on.
+    pub table: TableId,
+    /// The shape of what it answers: grain, measures, and the filters to bake.
+    pub ask: AggregateAsk,
+    /// How many unaided queries asked for this.
+    pub queries: u64,
+    /// Bytes those queries read.
+    pub bytes_scanned: u64,
+    /// The most it could possibly have saved: every byte those queries moved.
+    ///
+    /// A cube's own read is a few partial rows beside a full scan, so unlike
+    /// an index's ceiling this one is close to honest — and still only an
+    /// upper bound, since the cube's build cost is not in it.
+    pub ceiling_usd: f64,
 }
 
 /// What one query actually cost, and what it would have cost unaided.
@@ -386,6 +410,10 @@ impl Policy {
 pub struct Workload {
     by_shape: BTreeMap<Fingerprint, Seen>,
     by_derived: BTreeMap<DerivedId, Seen>,
+    /// Aggregate asks, kept whole: a cube proposal needs the spec and the
+    /// filters to bake, which a fingerprint has deliberately dropped.
+    /// In-memory only — the literals inside never reach storage.
+    by_ask: BTreeMap<AggregateAsk, Seen>,
 }
 
 impl Workload {
@@ -402,6 +430,18 @@ impl Workload {
         shape.bytes_if_full_scan = shape
             .bytes_if_full_scan
             .saturating_add(observation.bytes_if_full_scan);
+
+        if let Some(ask) = observation.aggregate {
+            let seen = self.by_ask.entry(ask).or_default();
+            seen.queries += 1;
+            seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
+            seen.bytes_if_full_scan = seen
+                .bytes_if_full_scan
+                .saturating_add(observation.bytes_if_full_scan);
+            if observation.used.is_some() {
+                seen.helped += 1;
+            }
+        }
 
         if let Some(id) = observation.used {
             shape.helped += 1;
@@ -456,6 +496,7 @@ impl Workload {
         Workload {
             by_shape: shapes.into_iter().collect(),
             by_derived: credits.into_iter().collect(),
+            by_ask: BTreeMap::new(),
         }
     }
 
@@ -514,6 +555,29 @@ impl Workload {
                 .total_cmp(&a.ceiling_usd)
                 .then_with(|| a.field.cmp(&b.field))
         });
+        proposals
+    }
+
+    /// Cubes worth building, most promising first.
+    ///
+    /// Grouped by the ask itself rather than the shape, because the filters
+    /// to bake are part of what is proposed. Only unaided asks propose: a
+    /// query a cube already served does not need a second one.
+    pub fn cube_proposals(&self, prices: &PriceTable, min_queries: u64) -> Vec<CubeProposal> {
+        let mut proposals: Vec<CubeProposal> = self
+            .by_ask
+            .iter()
+            .filter(|(_, seen)| seen.queries.saturating_sub(seen.helped) >= min_queries)
+            .map(|(ask, seen)| CubeProposal {
+                table: ask.table.clone(),
+                ask: ask.clone(),
+                queries: seen.queries,
+                bytes_scanned: seen.bytes_read,
+                ceiling_usd: seen.bytes_read as f64
+                    * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far),
+            })
+            .collect();
+        proposals.sort_by(|a, b| b.ceiling_usd.total_cmp(&a.ceiling_usd));
         proposals
     }
 

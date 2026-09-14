@@ -96,7 +96,7 @@ pub struct ScanReport {
     /// Set only when the whole plan was visible — `Session::sql` sees the
     /// `GROUP BY` that `scan` cannot — and `None` otherwise means nothing
     /// more than "no aggregate was visible".
-    pub aggregate: Option<Aggregate>,
+    pub aggregate: Option<crate::workload::AggregateAsk>,
 }
 
 impl ScanReport {
@@ -116,11 +116,7 @@ impl ScanReport {
     pub fn observation(&self, bytes_read: u64) -> Observation {
         Observation {
             fingerprint: self.fingerprint.clone(),
-            aggregate: self
-                .aggregate
-                .clone()
-                .zip(self.plan.clone())
-                .map(|(spec, plan)| crate::workload::AggregateAsk { plan, spec }),
+            aggregate: self.aggregate.clone(),
             bytes_read,
             bytes_if_full_scan: self.bytes_if_full_scan,
             used: self.used.clone().map(DerivedId),
@@ -181,7 +177,7 @@ pub struct QuarryTable {
     /// downcasting is needed: the registry decides *whether* derived state may
     /// be used, and the engine knows *how* to read it. Neither has to know the
     /// other's types.
-    materialized: BTreeMap<DerivedId, Vec<RecordBatch>>,
+    materialized: Mutex<BTreeMap<DerivedId, Vec<RecordBatch>>>,
     last_scan: Mutex<Option<ScanReport>>,
 }
 
@@ -209,7 +205,7 @@ impl QuarryTable {
             policy: PolicyFingerprint(0),
             prices: PriceTable::default(),
             field_bounds: BTreeMap::new(),
-            materialized: BTreeMap::new(),
+            materialized: Mutex::new(BTreeMap::new()),
             last_scan: Mutex::new(None),
         }
     }
@@ -262,7 +258,7 @@ impl QuarryTable {
     /// # Panics
     ///
     /// If any batch's schema is not the table's.
-    pub fn with_materialized(mut self, id: DerivedId, batches: Vec<RecordBatch>) -> Self {
+    pub fn with_materialized(self, id: DerivedId, batches: Vec<RecordBatch>) -> Self {
         for batch in &batches {
             assert_eq!(
                 batch.schema().as_ref(),
@@ -271,7 +267,10 @@ impl QuarryTable {
                  projected above the scan"
             );
         }
-        self.materialized.insert(id, batches);
+        self.materialized
+            .lock()
+            .expect("materialized")
+            .insert(id, batches);
         self
     }
 
@@ -285,7 +284,7 @@ impl QuarryTable {
     ///
     /// If any batch's column names are not `rollup`'s.
     pub fn with_cube(
-        mut self,
+        self,
         id: DerivedId,
         rollup: &super::Rollup,
         batches: Vec<RecordBatch>,
@@ -303,8 +302,16 @@ impl QuarryTable {
                 "cube rows for {id:?} must match their spec"
             );
         }
-        self.materialized.insert(id, batches);
+        self.materialized
+            .lock()
+            .expect("materialized")
+            .insert(id, batches);
         self
+    }
+
+    /// The policy this table enforces.
+    pub fn policy(&self) -> PolicyFingerprint {
+        self.policy
     }
 
     /// Use this registry of derived state.
@@ -423,8 +430,21 @@ impl QuarryTable {
     }
 
     /// The stored rows for a piece of substituting derived state.
-    pub fn stored(&self, id: &DerivedId) -> Option<&[RecordBatch]> {
-        self.materialized.get(id).map(Vec::as_slice)
+    pub fn stored(&self, id: &DerivedId) -> Option<Vec<RecordBatch>> {
+        self.materialized
+            .lock()
+            .expect("materialized")
+            .get(id)
+            .cloned()
+    }
+
+    /// Store rows for `id` after construction — how the optimizer makes what
+    /// it built visible to the table it was built on.
+    pub fn store_rows(&self, id: DerivedId, batches: Vec<RecordBatch>) {
+        self.materialized
+            .lock()
+            .expect("materialized")
+            .insert(id, batches);
     }
 
     /// Record a plan-level report: `Session::sql` can see the whole plan,
@@ -631,7 +651,11 @@ impl QuarryTable {
                         plan: query.plan.clone(),
                     }),
                     Rewrite::Substitute { .. }
-                        if self.materialized.contains_key(&candidate.derived.id) =>
+                        if self
+                            .materialized
+                            .lock()
+                            .expect("materialized")
+                            .contains_key(&candidate.derived.id) =>
                     {
                         Some(ScanReport {
                             aggregate: None,
@@ -821,9 +845,15 @@ impl TableProvider for QuarryTable {
                 .used
                 .as_deref()
                 .map(|id| DerivedId(id.to_owned()))
-                .and_then(|id| self.materialized.get(&id))
+                .and_then(|id| {
+                    self.materialized
+                        .lock()
+                        .expect("materialized")
+                        .get(&id)
+                        .cloned()
+                })
             {
-                parts.push(self.memory_plan(std::slice::from_ref(batches), projection)?);
+                parts.push(self.memory_plan(std::slice::from_ref(&batches), projection)?);
             }
         }
 

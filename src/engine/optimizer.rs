@@ -22,16 +22,17 @@
 //! for the remaining budget is discarded rather than kept and apologised for.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
 use crate::snapshot::SnapshotId;
-use crate::workload::{Observation, Policy, Proposal, Workload};
+use crate::workload::{AggregateAsk, Observation, Policy, Proposal, Workload};
 
 use super::{
-    QuarryTable, Session, SharedRegistry, build_proposed_index, estimate_overlap, index_id,
-    parquet_bounds,
+    QuarryTable, Session, SharedRegistry, build_cube, build_proposed_index, cube_id,
+    estimate_overlap, index_id, parquet_bounds,
 };
 
 /// A piece of derived state a round dropped, identified enough to delete it.
@@ -124,6 +125,8 @@ pub struct Optimizer {
     /// default — and it is lost on restart, along with the in-memory registry
     /// itself.
     built: BTreeMap<DerivedId, FieldId>,
+    /// Cubes this optimizer built, keyed the same way.
+    built_cubes: BTreeMap<DerivedId, AggregateAsk>,
     /// The snapshot at which each id's last build failed.
     ///
     /// A failed build is retried only when the table has moved, because a
@@ -153,6 +156,7 @@ impl Optimizer {
             prices: PriceTable::default(),
             reader: PolicyFingerprint(0),
             built: BTreeMap::new(),
+            built_cubes: BTreeMap::new(),
             failed_at: BTreeMap::new(),
             spreads: BTreeMap::new(),
         }
@@ -243,7 +247,7 @@ impl Optimizer {
     /// Retires first, then builds, enforcing the byte budget on what was
     /// actually produced. Reports what it declined and why, whether or not it
     /// was allowed to act.
-    pub async fn round(&mut self, session: &Session, table: &QuarryTable) -> Round {
+    pub async fn round(&mut self, session: &Session, table: &Arc<QuarryTable>) -> Round {
         let mut round = Round::default();
         let proposals = self.proposals();
 
@@ -298,13 +302,18 @@ impl Optimizer {
         // queries, so its shape counts as helped and nothing asks for it
         // again. Left alone it decays while still being credited with what it
         // once saved, which is why retirement does not catch it either.
-        for (id, field) in self.stale(table) {
+        for id in self.stale(table) {
             if self.failed_at.get(&id) == Some(&table.snapshot()) {
                 // Already failed on exactly this table state; see failed_at.
                 continue;
             }
-            let rebuilt =
-                build_proposed_index(session, table, field, id.clone(), self.reader).await;
+            let rebuilt = if let Some(&field) = self.built.get(&id) {
+                build_proposed_index(session, table, field, id.clone(), self.reader).await
+            } else if let Some(ask) = self.built_cubes.get(&id) {
+                build_cube(session, table, ask, id.clone()).await
+            } else {
+                continue;
+            };
             let Ok(derived) = rebuilt else {
                 self.failed_at.insert(id.clone(), table.snapshot());
                 round.declined.push((id, Declined::BuildFailed));
@@ -420,6 +429,48 @@ impl Optimizer {
             round.built.push(id);
         }
 
+        // 4. Cubes: an aggregate asked often enough is worth materialising.
+        for proposal in self
+            .workload
+            .cube_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = cube_id(&proposal.table, &proposal.ask);
+            if existing.contains(&id) {
+                round.declined.push((id, Declined::AlreadyBuilt));
+                continue;
+            }
+            if round.built.len() >= self.policy.max_builds_per_round {
+                round.declined.push((id, Declined::RoundFull));
+                continue;
+            }
+            if self.failed_at.get(&id) == Some(&table.snapshot()) {
+                continue;
+            }
+            let derived = match build_cube(session, table, &proposal.ask, id.clone()).await {
+                Ok(derived) => derived,
+                Err(_) => {
+                    self.failed_at.insert(id.clone(), table.snapshot());
+                    round.declined.push((id, Declined::BuildFailed));
+                    continue;
+                }
+            };
+            self.failed_at.remove(&id);
+            let held = self.registry.read().expect("registry lock").bytes();
+            if held + derived.bytes > self.policy.budget_bytes {
+                round.declined.push((id, Declined::OverBudget));
+                continue;
+            }
+            self.registry
+                .write()
+                .expect("registry lock")
+                .register(derived);
+            self.built_cubes.insert(id.clone(), proposal.ask);
+            round.built.push(id);
+        }
+
         round
     }
 
@@ -470,7 +521,7 @@ impl Optimizer {
     /// the files added since it was built, which every query must scan
     /// alongside it. Bytes rather than commits, because ten tiny appends
     /// matter less than one large one, and both are known exactly.
-    fn stale(&self, table: &QuarryTable) -> Vec<(DerivedId, FieldId)> {
+    fn stale(&self, table: &QuarryTable) -> Vec<DerivedId> {
         let live = table.live_bytes();
         if live == 0 {
             return Vec::new();
@@ -482,9 +533,10 @@ impl Optimizer {
         let registry = self.registry.read().expect("registry lock");
 
         self.built
-            .iter()
-            .filter(|(id, _)| registry.get(id).is_some())
-            .filter(|(id, _)| {
+            .keys()
+            .chain(self.built_cubes.keys())
+            .filter(|id| registry.get(id).is_some())
+            .filter(|id| {
                 let Some(derived) = registry.get(id) else {
                     return false;
                 };
@@ -503,7 +555,7 @@ impl Optimizer {
                 let residual: u64 = diff.added.iter().filter_map(|file| sizes.get(file)).sum();
                 residual as f64 / live as f64 > limit
             })
-            .map(|(id, field)| (id.clone(), *field))
+            .cloned()
             .collect()
     }
 }

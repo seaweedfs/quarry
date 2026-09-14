@@ -34,6 +34,7 @@ use datafusion::functions_aggregate::expr_fn;
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, Operator};
 
 use crate::derived::{AggFunc, Decision, DerivedId, Measure, Query, Rewrite};
+use crate::workload::AggregateAsk;
 
 use super::{QuarryTable, Rollup, ScanReport};
 
@@ -103,6 +104,17 @@ fn split_and(expr: &Expr, into: &mut Vec<Expr>) {
     into.push(expr.clone());
 }
 
+/// The first servable aggregate anywhere in `plan`, or none.
+///
+/// `ask_of` matches only a root `Aggregate`; reporting wants to find the ask
+/// whether or not a `Projection` sits on top of it.
+pub(crate) fn first_ask(plan: &LogicalPlan) -> Option<Ask<'_>> {
+    if let Some(ask) = ask_of(plan) {
+        return Some(ask);
+    }
+    plan.inputs().iter().find_map(|input| first_ask(input))
+}
+
 /// The [`Query`] an [`Ask`] reduces to — the identity a cube matches on.
 pub(crate) fn query_of(ask: &Ask) -> Option<Query> {
     ask.table.aggregate_query(ask.group, ask.aggr, &ask.filters)
@@ -155,7 +167,7 @@ fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
     };
     // Record before the borrow escapes: the report lands on the table while
     // `ask`'s references are still in scope.
-    table.note_scan(report(table, &query, &id));
+    table.note_scan(report(table, &query, &id, &filter_sql(ask)));
 
     let fields = spec.group_by.len() + spec.measures.iter().filter(|m| m.field.is_some()).count();
     let names: BTreeMap<_, _> = spec
@@ -217,9 +229,23 @@ fn reaggregate(measure: &Measure, stored: &str) -> Expr {
     }
 }
 
+/// The filters back as SQL — what a cube build would bake in.
+pub(crate) fn filter_sql(ask: &Ask) -> Vec<String> {
+    ask.filters
+        .iter()
+        .filter_map(|expr| datafusion::sql::unparser::expr_to_sql(expr).ok())
+        .map(|sql| sql.to_string())
+        .collect()
+}
+
 /// What the serving path reports: the same [`ScanReport`] a scan leaves, with
 /// no files read because none were.
-pub(crate) fn report(table: &QuarryTable, query: &Query, used: &DerivedId) -> ScanReport {
+pub(crate) fn report(
+    table: &QuarryTable,
+    query: &Query,
+    used: &DerivedId,
+    filter_sql: &[String],
+) -> ScanReport {
     ScanReport {
         files_read: Default::default(),
         used: Some(used.0.clone()),
@@ -229,6 +255,15 @@ pub(crate) fn report(table: &QuarryTable, query: &Query, used: &DerivedId) -> Sc
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),
         plan: query.plan.clone(),
-        aggregate: query.aggregate.clone(),
+        aggregate: query
+            .aggregate
+            .clone()
+            .zip(query.plan.clone())
+            .map(|(spec, plan)| AggregateAsk {
+                table: table.table_id().clone(),
+                plan,
+                spec,
+                filter_sql: filter_sql.to_vec(),
+            }),
     }
 }

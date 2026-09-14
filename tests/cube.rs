@@ -367,3 +367,44 @@ async fn a_cube_does_not_serve_across_a_snapshot_boundary() {
     assert_eq!(total, 12, "both files' rows, not the stale cube's six");
     assert_eq!(table.last_scan().expect("report").used, None);
 }
+
+#[tokio::test]
+async fn repeated_asks_make_the_optimizer_build_the_cube() {
+    let mut registry = Registry::new();
+    let shared = quarry::engine::shared(std::mem::take(&mut registry));
+    let table = Arc::new(table(SnapshotId(810)).with_shared_registry(shared.clone()));
+    let session = session();
+    session.register("events", Arc::clone(&table)).expect("reg");
+
+    let mut optimizer = quarry::engine::Optimizer::new(
+        shared,
+        quarry::workload::Policy::automatic(1_000_000_000).with_min_queries(2),
+    );
+
+    let sql = "SELECT day, sum(bytes) FROM events GROUP BY day";
+    for _ in 0..2 {
+        session.sql(sql).await.expect("sql");
+        let report = table.last_scan().expect("scan");
+        optimizer.observe(report.observation(1024));
+        assert_eq!(report.used, None, "nothing to serve it yet");
+    }
+
+    let round = optimizer.round(&session, &table).await;
+    assert_eq!(round.built.len(), 1, "the ask earned a cube");
+
+    let rows = session
+        .sql("SELECT day, sum(bytes) FROM events GROUP BY day")
+        .await
+        .expect("sql");
+    assert_eq!(pairs(&rows), BTreeMap::from([(1, 60), (2, 150)]));
+    let report = table.last_scan().expect("report");
+    assert!(report.substituted);
+    assert!(
+        report
+            .used
+            .as_deref()
+            .is_some_and(|id| id.starts_with("cube:")),
+        "served by the cube the round built: {:?}",
+        report.used
+    );
+}

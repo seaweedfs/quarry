@@ -31,8 +31,9 @@ use object_store::path::Path as ObjectPath;
 use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
 use crate::kinds::Index;
 use crate::snapshot::FileId;
+use crate::workload::AggregateAsk;
 
-use super::{QuarryTable, Session, hash_scalar};
+use super::{MaterializedResult, QuarryTable, Rollup, Session, hash_scalar};
 
 /// How many *positions* in the file list to sample around.
 ///
@@ -340,6 +341,103 @@ async fn read_column(
 /// snapshot moves replaces the old entry rather than accumulating beside it.
 pub fn index_id(table: &crate::snapshot::TableId, field: FieldId) -> DerivedId {
     DerivedId(format!("idx:{}:{field}", table.0))
+}
+
+/// A cube's id names what it answers, so the same ask rebuilds onto the same
+/// id rather than accumulating beside it.
+pub fn cube_id(table: &crate::snapshot::TableId, ask: &AggregateAsk) -> DerivedId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = crate::stable_hash::StableHasher::new();
+    (table.clone(), ask.clone()).hash(&mut hasher);
+    DerivedId(format!("cube:{}:{:016x}", table.0, hasher.finish()))
+}
+
+/// Build the cube `ask` proposes: group keys plus measure partials, computed
+/// by running the aggregation against the table itself.
+///
+/// The build goes through the session's context rather than `Session::sql`
+/// deliberately — the point is to compute from the table, not to be answered
+/// by a cube that already exists.
+pub async fn build_cube(
+    session: &Session,
+    table: &Arc<QuarryTable>,
+    ask: &AggregateAsk,
+    id: DerivedId,
+) -> DfResult<Derived> {
+    let names: BTreeMap<FieldId, String> = ask
+        .spec
+        .group_by
+        .iter()
+        .copied()
+        .chain(ask.spec.measures.iter().filter_map(|m| m.field))
+        .filter_map(|field| Some((field, table.column_of(field)?.to_owned())))
+        .collect();
+    let rollup = Rollup::new(ask.spec.clone(), names);
+
+    let source = format!("__quarry_cube_{}", id.0.replace(':', "_"));
+    session
+        .context()
+        .register_table(
+            source.as_str(),
+            Arc::clone(table) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+    let keys: Vec<&str> = ask
+        .spec
+        .group_by
+        .iter()
+        .filter_map(|field| rollup.key_name(*field))
+        .collect();
+    let measures: Vec<String> = ask
+        .spec
+        .measures
+        .iter()
+        .filter_map(|m| rollup.measure_name(m))
+        .map(|name| {
+            let (func, arg) = name.split_once('(').expect("measure name");
+            format!(
+                "{func}({arg}) AS \"{name}\"",
+                arg = arg.trim_end_matches(')')
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT {}, {} FROM {source}{} GROUP BY {}",
+        keys.join(", "),
+        measures.join(", "),
+        ask.filter_sql
+            .iter()
+            .map(|f| format!(" WHERE {f}"))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        keys.join(", "),
+    );
+    let batches = session.context().sql(&sql).await?.collect().await?;
+    session
+        .context()
+        .deregister_table(source.as_str())
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+    let bytes = batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    table.store_rows(id.clone(), batches.clone());
+    Ok(Derived::new(
+        id,
+        Source {
+            table: table.table_id().clone(),
+            snapshot: table.snapshot(),
+        },
+        table.policy(),
+        bytes,
+        Box::new(MaterializedResult::aggregate_of(
+            ask.plan.clone(),
+            rollup,
+            batches,
+        )),
+    ))
 }
 
 /// Column name to field id for every column of a table, for convenience.
