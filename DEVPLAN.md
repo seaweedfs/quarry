@@ -744,13 +744,17 @@ harmless. Backend-neutral on purpose: whoever hears the commit notes it.
 Carried over from the design, with the condition for revisiting:
 
 ```text
-aggregate/cube kind          after Phase 10 has real GROUP BY telemetry
-subsumption matching         after the result cache shows a hit rate worth
-                             extending; time-range narrowing first
-future-reuse optimization    after Phase 10 can measure predicted vs realized
+aggregate/cube kind          DONE — rollup grain, coverage matching, telemetry
+subsumption matching         DONE — for exact aggregate cases; time-range
+                             narrowing remains
+future-reuse optimization    PARTIAL — predicted-vs-realized is measured and
+                             fed back (`proven`, `NotWorthIt`); speculative
+                             builds inside a query still need a who-pays
+                             policy answer
 distributed execution        when one large machine is provably exhausted
 execution domains            on demand; it is a cut in the Place path
-cross-principal sharing      after a policy-fingerprint audit
+cross-principal sharing      PARTIAL — the fingerprint now has a stable
+                             constructor; sharing still needs its audit
 writes (INSERT/MERGE/DELETE) read-only; iceberg-rust lacks row-level writes
 natural-language queries     belongs in the client, not the engine
 ```
