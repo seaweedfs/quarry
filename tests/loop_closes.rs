@@ -1297,6 +1297,7 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
     };
     Observation {
         fingerprint: Fingerprint::of(&query),
+        aggregate: None,
         bytes_read: bytes,
         bytes_if_full_scan: bytes,
         used: None,

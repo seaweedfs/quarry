@@ -19,7 +19,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
 use quarry::derived::{Derived, DerivedId, Plan, PolicyFingerprint, Source};
-use quarry::engine::{MaterializedResult, QuarryTable, hash_scalar};
+use quarry::engine::{MaterializedResult, QuarryTable, Rollup, hash_scalar};
 use quarry::kinds::{Index, ResultCache};
 use quarry::registry::Registry;
 use quarry::snapshot::{DeleteState, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -690,6 +690,16 @@ async fn an_aggregated_result_is_refused_once_a_file_is_added() {
         // The same rows, declared aggregated rather than table-shaped.
         Box::new(MaterializedResult::aggregate_of(
             plan.clone(),
+            Rollup::new(
+                quarry::derived::Aggregate {
+                    group_by: BTreeSet::from([TENANT_FIELD]),
+                    measures: BTreeSet::from([quarry::derived::Measure {
+                        func: quarry::derived::AggFunc::Count,
+                        field: None,
+                    }]),
+                },
+                BTreeMap::from([(TENANT_FIELD, "tenant_id".to_owned())]),
+            ),
             stored.clone(),
         )),
     ));

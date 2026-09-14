@@ -180,6 +180,19 @@ pub enum AggFunc {
     Max,
 }
 
+impl AggFunc {
+    /// The function that combines this one's partials.
+    ///
+    /// Stored counts roll up by summing; everything else combines through
+    /// itself.
+    pub fn rollup(self) -> AggFunc {
+        match self {
+            AggFunc::Count => AggFunc::Sum,
+            other => other,
+        }
+    }
+}
+
 impl Aggregate {
     /// Whether a stored cube `cube` can answer this query by re-aggregating.
     ///

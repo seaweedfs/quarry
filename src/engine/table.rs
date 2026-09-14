@@ -23,7 +23,8 @@ use datafusion::scalar::ScalarValue;
 
 use crate::cost::PriceTable;
 use crate::derived::{
-    Decision, DerivedId, FieldId, Filter, Plan, PolicyFingerprint, Predicate, Query, Rewrite,
+    AggFunc, Aggregate, Decision, DerivedId, FieldId, Filter, Measure, Plan, PolicyFingerprint,
+    Predicate, Query, Rewrite,
 };
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotGraph, SnapshotId, TableId};
@@ -90,6 +91,12 @@ pub struct ScanReport {
     /// A caller storing this query's result needs it: a stored result is
     /// matched by plan, not by name.
     pub plan: Option<Plan>,
+    /// What the query aggregated, if it did.
+    ///
+    /// Set only when the whole plan was visible — `Session::sql` sees the
+    /// `GROUP BY` that `scan` cannot — and `None` otherwise means nothing
+    /// more than "no aggregate was visible".
+    pub aggregate: Option<Aggregate>,
 }
 
 impl ScanReport {
@@ -109,6 +116,11 @@ impl ScanReport {
     pub fn observation(&self, bytes_read: u64) -> Observation {
         Observation {
             fingerprint: self.fingerprint.clone(),
+            aggregate: self
+                .aggregate
+                .clone()
+                .zip(self.plan.clone())
+                .map(|(spec, plan)| crate::workload::AggregateAsk { plan, spec }),
             bytes_read,
             bytes_if_full_scan: self.bytes_if_full_scan,
             used: self.used.clone().map(DerivedId),
@@ -263,6 +275,38 @@ impl QuarryTable {
         self
     }
 
+    /// Supply a cube's stored rows: partial aggregates at `rollup`'s grain.
+    ///
+    /// The stored schema must be exactly the rollup's columns, in order — a
+    /// row that does not match its own spec fails here, where the mistake was
+    /// made, rather than inside the re-aggregation mid-query.
+    ///
+    /// # Panics
+    ///
+    /// If any batch's column names are not `rollup`'s.
+    pub fn with_cube(
+        mut self,
+        id: DerivedId,
+        rollup: &super::Rollup,
+        batches: Vec<RecordBatch>,
+    ) -> Self {
+        for batch in &batches {
+            let names: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(
+                names,
+                rollup.columns(),
+                "cube rows for {id:?} must match their spec"
+            );
+        }
+        self.materialized.insert(id, batches);
+        self
+    }
+
     /// Use this registry of derived state.
     pub fn with_registry(mut self, registry: Registry) -> Self {
         self.registry = shared(registry);
@@ -373,6 +417,107 @@ impl QuarryTable {
         &self.table
     }
 
+    /// What this table pays for reads.
+    pub fn prices(&self) -> &PriceTable {
+        &self.prices
+    }
+
+    /// The stored rows for a piece of substituting derived state.
+    pub fn stored(&self, id: &DerivedId) -> Option<&[RecordBatch]> {
+        self.materialized.get(id).map(Vec::as_slice)
+    }
+
+    /// Record a plan-level report: `Session::sql` can see the whole plan,
+    /// including the aggregate a scan cannot, and reports through the same
+    /// channel a scan does.
+    pub fn note_scan(&self, report: ScanReport) {
+        *self.last_scan.lock().expect("last_scan") = Some(report);
+    }
+
+    /// The aggregate query `group`/`aggr` over `filters` asks of this table,
+    /// if it can be described exactly enough for a cube to match it.
+    ///
+    /// `None` means the shape is outside what a cube can be checked against
+    /// — a group key that is an expression, a `DISTINCT` or `FILTER`ed
+    /// measure, an unsupported function — and the caller runs the plan as
+    /// written. Returning `Some` for anything else would be a wrong answer.
+    pub fn aggregate_query(
+        &self,
+        group: &[Expr],
+        aggr: &[Expr],
+        filters: &[Expr],
+    ) -> Option<Query> {
+        let group_by = group
+            .iter()
+            .map(|expr| match expr {
+                Expr::Column(column) => self.field_ids.get(column.name()).copied(),
+                _ => None,
+            })
+            .collect::<Option<BTreeSet<FieldId>>>()?;
+        let measures = aggr
+            .iter()
+            .map(|expr| self.measure(expr))
+            .collect::<Option<BTreeSet<Measure>>>()?;
+        let aggregate = Aggregate { group_by, measures };
+        let projected: BTreeSet<FieldId> = aggregate
+            .group_by
+            .iter()
+            .copied()
+            .chain(aggregate.measures.iter().filter_map(|m| m.field))
+            .collect();
+        let plan = Plan::new(
+            projected.clone(),
+            filters.iter().map(|expr| self.canonical_filter(expr)),
+        );
+        let plan_hash = {
+            let mut hasher = StableHasher::new();
+            (plan.clone(), aggregate.clone()).hash(&mut hasher);
+            hasher.finish()
+        };
+        Some(Query {
+            table: self.table.clone(),
+            snapshot: self.snapshot,
+            policy: self.policy,
+            plan_hash,
+            plan: Some(plan),
+            projected,
+            predicates: self.predicates(filters),
+            aggregate: Some(aggregate),
+        })
+    }
+
+    /// One measure expression, or `None` if it is not one a cube can hold.
+    ///
+    /// Only a plain `func(column)` or `count(*)` qualifies: a `DISTINCT`, a
+    /// `FILTER`, or an expression argument each computes something a stored
+    /// partial cannot reproduce.
+    pub(crate) fn measure(&self, expr: &Expr) -> Option<Measure> {
+        let Expr::AggregateFunction(aggregate) = expr else {
+            return None;
+        };
+        if aggregate.params.distinct
+            || aggregate.params.filter.is_some()
+            || aggregate.params.order_by.is_some()
+        {
+            return None;
+        }
+        let func = match aggregate.func.name() {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            _ => return None,
+        };
+        let field = match aggregate.params.args.as_slice() {
+            // `count(*)` lands as `count(1)` after analysis: a literal arg is
+            // a row count, not a field count.
+            [Expr::Literal(..)] | [] if func == AggFunc::Count => None,
+            [Expr::Column(column)] => Some(*self.field_ids.get(column.name())?),
+            _ => return None,
+        };
+        Some(Measure { func, field })
+    }
+
     /// Translate DataFusion filters into the predicates the rule understands.
     ///
     /// A comparison of a known column against a literal becomes
@@ -475,6 +620,7 @@ impl QuarryTable {
                 };
                 match rewrite {
                     Rewrite::Prune { files } => Some(ScanReport {
+                        aggregate: None,
                         files_read: files,
                         used: Some(used),
                         also_scanned,
@@ -488,6 +634,7 @@ impl QuarryTable {
                         if self.materialized.contains_key(&candidate.derived.id) =>
                     {
                         Some(ScanReport {
+                            aggregate: None,
                             files_read: BTreeSet::new(),
                             used: Some(used),
                             also_scanned,
@@ -504,6 +651,7 @@ impl QuarryTable {
 
         match usable {
             None => ScanReport {
+                aggregate: None,
                 files_read: live,
                 used: None,
                 also_scanned: BTreeSet::new(),

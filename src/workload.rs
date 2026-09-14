@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
-use crate::derived::{DerivedId, FieldId, Predicate, Query};
+use crate::derived::{Aggregate, DerivedId, FieldId, Plan, Predicate, Query};
 use crate::layout::Spread;
 use crate::registry::Registry;
 use crate::snapshot::{SnapshotId, TableId};
@@ -83,11 +83,28 @@ impl Fingerprint {
     }
 }
 
+/// What an aggregate query asked, kept whole enough to propose a cube.
+///
+/// Unlike a [`Fingerprint`], this keeps the plan — literal filter text
+/// included — because a cube proposal must name exactly which filters to bake
+/// in. It is observed, grouped, and proposed from, but deliberately **not**
+/// persisted: literals are a principal's own data and do not belong on disk
+/// beside shape counts.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AggregateAsk {
+    /// The exact plan the query ran under.
+    pub plan: Plan,
+    /// Keys and measures.
+    pub spec: Aggregate,
+}
+
 /// What one query actually cost, and what it would have cost unaided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
     /// The query's shape.
     pub fingerprint: Fingerprint,
+    /// What the query aggregated, if it did.
+    pub aggregate: Option<AggregateAsk>,
     /// Bytes the query read.
     pub bytes_read: u64,
     /// Bytes a full scan of the queried snapshot would have read.
@@ -166,6 +183,7 @@ impl ForeignScan {
                 opaque: self.restrictions.clone(),
                 projected: self.projected.clone(),
             },
+            aggregate: None,
             bytes_read: self.bytes_read,
             bytes_if_full_scan,
             used: None,
@@ -572,6 +590,7 @@ mod tests {
     fn unaided(fields: &[FieldId], bytes: u64) -> Observation {
         Observation {
             fingerprint: Fingerprint::of(&query_on(fields)),
+            aggregate: None,
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: None,
@@ -715,6 +734,7 @@ mod tests {
         for _ in 0..10 {
             workload.observe(Observation {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
+                aggregate: None,
                 bytes_read: GB / 10,
                 bytes_if_full_scan: GB,
                 used: Some(DerivedId("idx".into())),
@@ -735,6 +755,7 @@ mod tests {
         for _ in 0..5 {
             workload.observe(Observation {
                 fingerprint: Fingerprint::of(&other),
+                aggregate: None,
                 bytes_read: GB,
                 bytes_if_full_scan: GB,
                 used: None,
@@ -763,6 +784,7 @@ mod tests {
     fn saving_is_measured_not_estimated() {
         let observation = Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
+            aggregate: None,
             bytes_read: GB / 4,
             bytes_if_full_scan: GB,
             used: Some(DerivedId("idx".into())),
@@ -774,6 +796,7 @@ mod tests {
     fn reading_more_than_a_full_scan_saves_nothing_rather_than_less() {
         let observation = Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
+            aggregate: None,
             bytes_read: 2 * GB,
             bytes_if_full_scan: GB,
             used: Some(DerivedId("idx".into())),
@@ -834,6 +857,7 @@ mod tests {
         for _ in 0..1_000 {
             workload.observe(Observation {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
+                aggregate: None,
                 bytes_read: 0,
                 bytes_if_full_scan: GB,
                 used: Some(DerivedId("useful".into())),
@@ -853,6 +877,7 @@ mod tests {
         let mut workload = Workload::new();
         workload.observe(Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
+            aggregate: None,
             bytes_read: 0,
             bytes_if_full_scan: 1_000,
             used: Some(DerivedId("bloated".into())),
@@ -868,6 +893,7 @@ mod tests {
         let mut workload = Workload::new();
         workload.observe(Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
+            aggregate: None,
             bytes_read: 1,
             bytes_if_full_scan: GB,
             used: Some(DerivedId("a".into())),

@@ -10,12 +10,13 @@
 //! records that a result exists and how big it is, which is enough to plan
 //! with but not to answer from. This one can answer.
 
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use datafusion::arrow::array::RecordBatch;
 
 use crate::cost::{Cost, PriceTable};
-use crate::derived::{Kind, Plan, Query, Refreshed, Rewrite};
+use crate::derived::{AggFunc, Aggregate, FieldId, Kind, Measure, Plan, Query, Refreshed, Rewrite};
 use crate::snapshot::Diff;
 
 /// A stored answer to one canonical plan, with the rows.
@@ -25,6 +26,68 @@ pub struct MaterializedResult {
     batches: Vec<RecordBatch>,
     bytes: u64,
     unionable: bool,
+    /// The grain the rows are aggregated at, if they are.
+    rollup: Option<Rollup>,
+}
+
+/// What a cube is aggregated at, and what its columns are called.
+///
+/// `spec` is the coverage decision; `names` is the serving detail — the
+/// stored rows are only useful if the re-aggregation can name its columns.
+#[derive(Clone, Debug)]
+pub struct Rollup {
+    spec: Aggregate,
+    names: BTreeMap<FieldId, String>,
+}
+
+impl Rollup {
+    /// A cube's grain and measures, with the table's column name per field.
+    pub fn new(spec: Aggregate, names: BTreeMap<FieldId, String>) -> Self {
+        Rollup { spec, names }
+    }
+
+    /// The grain the stored rows sit at.
+    pub fn spec(&self) -> &Aggregate {
+        &self.spec
+    }
+
+    /// The column a group key is stored under.
+    pub fn key_name(&self, field: FieldId) -> Option<&str> {
+        self.names.get(&field).map(String::as_str)
+    }
+
+    /// The column a measure's partials are stored under, if the cube holds
+    /// the measure.
+    pub fn measure_name(&self, measure: &Measure) -> Option<String> {
+        let inner = match measure.field {
+            Some(field) => self.names.get(&field)?.clone(),
+            None => "*".to_owned(),
+        };
+        Some(format!(
+            "{}({inner})",
+            match measure.func {
+                AggFunc::Count => "count",
+                AggFunc::Sum => "sum",
+                AggFunc::Min => "min",
+                AggFunc::Max => "max",
+            }
+        ))
+    }
+
+    /// Every column the stored schema should carry.
+    pub fn columns(&self) -> Vec<String> {
+        self.spec
+            .group_by
+            .iter()
+            .filter_map(|field| self.key_name(*field).map(str::to_owned))
+            .chain(
+                self.spec
+                    .measures
+                    .iter()
+                    .filter_map(|m| self.measure_name(m)),
+            )
+            .collect()
+    }
 }
 
 impl MaterializedResult {
@@ -44,21 +107,29 @@ impl MaterializedResult {
             batches,
             bytes,
             unionable: true,
+            rollup: None,
         }
     }
 
-    /// Store an aggregated answer.
+    /// Store an aggregated answer: `plan`'s filters applied at build, its
+    /// rows rolled up to `rollup`'s grain.
     ///
     /// Usable only while the table has not moved, since merging is not
     /// concatenating.
-    pub fn aggregate_of(plan: Plan, batches: Vec<RecordBatch>) -> Self {
+    pub fn aggregate_of(plan: Plan, rollup: Rollup, batches: Vec<RecordBatch>) -> Self {
         let bytes = batches.iter().map(batch_bytes).sum();
         MaterializedResult {
             plan,
             batches,
             bytes,
             unionable: false,
+            rollup: Some(rollup),
         }
+    }
+
+    /// The grain the stored rows sit at, if this is a cube.
+    pub fn rollup(&self) -> Option<&Rollup> {
+        self.rollup.as_ref()
     }
 
     /// The stored rows.
@@ -69,6 +140,33 @@ impl MaterializedResult {
     /// The plan this answers.
     pub fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    /// Whether a cube answers `query` exactly.
+    ///
+    /// Three exact conditions — grain, then both directions of the filter
+    /// set:
+    ///
+    /// ```text
+    /// grain      the query's keys and measures roll up from the cube's
+    /// build     every filter baked into the cube is one the query shares
+    /// query      every remaining query filter sits on a stored group key,
+    ///            so it can be applied to the partials before re-aggregating
+    /// ```
+    ///
+    /// The second direction is what makes this subsumption rather than a
+    /// hash: the query may restrict a key field the cube never filtered on.
+    fn covers(&self, query: &Query, rollup: &Rollup) -> bool {
+        let (Some(want), Some(plan)) = (&query.aggregate, &query.plan) else {
+            return false;
+        };
+        want.covered_by(&rollup.spec)
+            && self.plan.filters.iter().all(|f| plan.filters.contains(f))
+            && plan.filters.iter().all(|f| {
+                self.plan.filters.contains(f)
+                    || f.field
+                        .is_some_and(|field| rollup.spec.group_by.contains(&field))
+            })
     }
 }
 
@@ -100,10 +198,16 @@ impl Kind for MaterializedResult {
     }
 
     fn matches(&self, query: &Query) -> Option<Rewrite> {
-        (query.plan.as_ref() == Some(&self.plan)).then_some(Rewrite::Substitute {
-            unionable: self.unionable,
-            rollup: None,
-        })
+        match &self.rollup {
+            None => (query.plan.as_ref() == Some(&self.plan)).then_some(Rewrite::Substitute {
+                unionable: self.unionable,
+                rollup: None,
+            }),
+            Some(rollup) => self.covers(query, rollup).then_some(Rewrite::Substitute {
+                unionable: false,
+                rollup: Some(rollup.spec.clone()),
+            }),
+        }
     }
 
     fn cost(&self, prices: &PriceTable) -> Cost {

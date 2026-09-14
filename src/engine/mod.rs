@@ -19,6 +19,7 @@
 
 mod build;
 mod cache;
+mod cube;
 #[cfg(feature = "iceberg")]
 mod iceberg_table;
 mod materialized;
@@ -35,7 +36,7 @@ pub use build::{
 pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
 pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};
-pub use materialized::{MaterializedResult, hash_plan};
+pub use materialized::{MaterializedResult, Rollup, hash_plan};
 pub use optimizer::{Declined, Optimizer, Retired, Round};
 #[cfg(feature = "iceberg")]
 pub use persist::{

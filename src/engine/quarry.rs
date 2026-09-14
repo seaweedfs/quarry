@@ -190,8 +190,35 @@ impl Session {
     }
 
     /// Run a query to completion.
+    ///
+    /// Before handing the plan to DataFusion, aggregate subtrees over a
+    /// registered table are offered to the registry: a cube that the rule
+    /// admits rewrites the subtree to read stored partials, and the answer
+    /// comes back re-aggregated at the query's grain. Everything else runs as
+    /// written — `scan` still applies indexes and result caches below.
     pub async fn sql(&self, sql: &str) -> DfResult<Vec<RecordBatch>> {
-        self.ctx.sql(sql).await?.collect().await
+        let df = self.ctx.sql(sql).await?;
+        let plan = df.logical_plan().clone();
+        let (rewritten, served) = super::cube::rewrite(&plan)?;
+        if served.is_some() {
+            return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
+                .collect()
+                .await;
+        }
+        let rows = df.collect().await?;
+        // An aggregate no cube could serve still reports the ask: the scan
+        // itself saw only `aggregate: None`, and the optimizer can only
+        // propose what it can see.
+        if let Some(ask) = super::cube::ask_of(&plan) {
+            if let Some(query) = super::cube::query_of(&ask) {
+                if let Some(mut report) = ask.table.last_scan() {
+                    report.aggregate = query.aggregate;
+                    report.plan = query.plan;
+                    ask.table.note_scan(report);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     /// What this session has read, priced.
