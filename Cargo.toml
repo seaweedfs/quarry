@@ -2,9 +2,20 @@
 name = "quarry"
 version = "0.1.0"
 edition = "2024"
+# The floor for the *default* build, which is the dependency-free decision
+# core — the same claim the feature split makes. `engine` needs a newer
+# compiler; see `[package.metadata.msrv]`, and CI checks both.
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "Self-optimizing query engine over Iceberg tables on object storage"
+
+# Cargo has one `rust-version` per package, but this crate has two real
+# floors, because the point of the feature split is that the core needs no
+# query engine. Recorded here so CI can check the second rather than
+# hardcode it, and so the number is wrong in one place if it drifts.
+[package.metadata.msrv]
+# DataFusion pulls `comfy-table`, which uses `let` chains — stable in 1.88.
+engine = "1.88"
 
 [features]
 # The decision core has no dependencies, so `cargo test` stays fast and the

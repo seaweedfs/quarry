@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The feature split is a claim: the decision core has no dependencies and is
+  # testable without a query engine. A matrix is what keeps that true — a
+  # `use datafusion::` that creeps into the core fails here and only here.
+  test:
+    name: test (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-latest
+    # A warning that reaches the default branch is a warning nobody will fix.
+    # Registry dependencies are unaffected: Cargo caps their lints already.
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: ""
+          - features: "engine"
+          - features: "iceberg"
+          - features: "engine,iceberg"
+          # Enables everything, including the REST catalog tests that run
+          # against a mock server over a real socket.
+          - features: "rest-catalog"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: test
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --verbose
+          else
+            cargo test --features "${{ matrix.features }}" --verbose
+          fi
+
+  lint:
+    name: fmt, clippy, doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # All targets, so tests and examples are linted too — they are where
+      # the sloppiness usually is.
+      - run: cargo clippy --features rest-catalog --all-targets
+      - name: doc
+        run: cargo doc --no-deps --features engine,iceberg
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Both floors Cargo.toml declares, checked rather than asserted.
+  #
+  # Two of them, because the feature split is a real claim: the decision core
+  # builds on an older compiler than the engine does, and the only way that
+  # stays true is to compile it there. `rust-version` covers the core; the
+  # engine's floor is in `[package.metadata.msrv]`.
+  #
+  # No `-D warnings` here, deliberately. An old compiler's lints are not what
+  # this job is asking about, and denying them makes it fail for the wrong
+  # reason.
+  msrv:
+    name: msrv (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            key: rust-version
+            args: ""
+          - name: engine
+            key: engine
+            args: "--features rest-catalog"
+    steps:
+      - uses: actions/checkout@v4
+      - name: read the declared floor
+        id: msrv
+        run: |
+          # Anchored, and requiring a quoted value, so the `engine` key of
+          # `[package.metadata.msrv]` cannot be confused with the `engine`
+          # entry in `[features]`, which is a list.
+          version=$(sed -nE 's/^${{ matrix.key }} = "([0-9]+(\.[0-9]+)*)".*/\1/p' \
+            Cargo.toml | head -1)
+          if [ -z "$version" ]; then
+            echo "no quoted ${{ matrix.key }} version in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "found ${{ matrix.key }} = $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ matrix.name }}
+      - run: cargo check ${{ matrix.args }} --all-targets
