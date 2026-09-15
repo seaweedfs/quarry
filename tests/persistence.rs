@@ -1091,7 +1091,7 @@ async fn a_filter_set_survives_being_written_and_read_back() {
     let (file_io, store) = stacks(&fixture_dir);
 
     let session = quarry().session();
-    let built = build_filter_set(&session, &table, "tenant_id = 1")
+    let (built, _) = build_filter_set(&session, &table, "tenant_id = 1")
         .await
         .expect("build");
 

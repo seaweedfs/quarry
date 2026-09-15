@@ -1945,3 +1945,44 @@ async fn the_loop_builds_a_filter_set_for_an_unindexable_filter() {
         report.scopes
     );
 }
+
+/// A filter that admits every row earns no set — storing the whole table's
+/// positions saves nothing, and the build's own evidence says so.
+#[tokio::test]
+async fn a_filter_that_passes_everything_is_declined() {
+    let fixture = fixture("loop_selective");
+    let sql = "SELECT * FROM events WHERE tenant_id > 0";
+
+    let table_bytes: u64 = fixture.sizes.values().sum();
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        mechanism_policy(Policy::automatic_pct(table_bytes, 50.0).with_min_queries(3)),
+    )
+    .for_reader(POLICY);
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    for _ in 0..5 {
+        session.sql(sql).await.expect("query");
+        let report = served.last_scan().expect("a scan happened");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty(), "nothing worth building: {round:?}");
+    assert!(
+        round
+            .declined
+            .iter()
+            .any(|(id, why)| id.0.starts_with("fset:")
+                && matches!(why, quarry::engine::Declined::NoAdvantage)),
+        "declined by the build's own evidence: {round:?}"
+    );
+}

@@ -160,11 +160,13 @@ pub async fn build_bitmap(
 ///
 /// The read is per group and projected to the columns the clause
 /// mentions — the build pays for the filter's evidence, not the file's.
+/// The set, plus the rows the build examined — the second number is what
+/// makes "admits everything" detectable rather than assumed.
 pub async fn build_filter_set(
     session: &Session,
     table: &QuarryTable,
     filter_sql: &str,
-) -> DfResult<FilterSet> {
+) -> DfResult<(FilterSet, u64)> {
     let Some((url, files)) = table.parquet_files() else {
         return exec_err!("an in-memory table has no objects to scan");
     };
@@ -195,6 +197,7 @@ pub async fn build_filter_set(
     )?;
 
     let mut set = FilterSet::of(filter.clone());
+    let mut scanned = 0u64;
     for (file, size) in files {
         let mut reader =
             ParquetObjectReader::new(Arc::clone(&store), ObjectPath::from(file.0.as_str()))
@@ -226,6 +229,7 @@ pub async fn build_filter_set(
 
             let mut row = 0u64;
             for batch in batches {
+                scanned += batch.num_rows() as u64;
                 let mask = physical.evaluate(&batch)?.into_array(batch.num_rows())?;
                 let mask = mask
                     .as_any()
@@ -241,21 +245,34 @@ pub async fn build_filter_set(
         }
     }
     let bytes = set.encoded_len();
-    Ok(set.with_bytes(bytes))
+    Ok((set.with_bytes(bytes), scanned))
 }
 
 /// Build the filter set a proposal asked for, ready to register —
 /// [`build_filter_set`] plus the `Derived` wrapper the registry stores.
+///
+/// `None` when the filter admits every row: the set then records the whole
+/// table's positions to save nothing but filter evaluation — overhead in
+/// both directions.
 pub async fn build_proposed_filter_set(
     session: &Session,
     table: &QuarryTable,
     ask: &crate::workload::FilterAsk,
     id: DerivedId,
     policy: PolicyFingerprint,
-) -> DfResult<Derived> {
-    let set = build_filter_set(session, table, &ask.sql).await?;
+) -> DfResult<Option<Derived>> {
+    let (set, scanned) = build_filter_set(session, table, &ask.sql).await?;
+    let admitted: u64 = set
+        .postings()
+        .values()
+        .flat_map(|groups| groups.values())
+        .map(|rows| rows.len() as u64)
+        .sum();
+    if admitted == scanned && scanned > 0 {
+        return Ok(None);
+    }
     let bytes = set.bytes_estimate();
-    Ok(Derived::new(
+    Ok(Some(Derived::new(
         id,
         Source {
             table: table.table_id().clone(),
@@ -264,7 +281,7 @@ pub async fn build_proposed_filter_set(
         policy,
         bytes,
         Box::new(set),
-    ))
+    )))
 }
 
 /// Build the index a proposal asked for, ready to register.

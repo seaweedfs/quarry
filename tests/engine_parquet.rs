@@ -857,9 +857,10 @@ async fn a_built_filter_set_serves_the_next_identical_filter() {
     );
     let session = quarry.session();
     let bare = table(None);
-    let set = build_filter_set(&session, &bare, "message = 'needle'")
+    let (set, scanned) = build_filter_set(&session, &bare, "message = 'needle'")
         .await
         .expect("build the filter set");
+    assert_eq!(scanned, 201, "every row was examined");
     assert_eq!(set.filter().field, Some(7), "the clause named message");
 
     let mut registry = Registry::new();

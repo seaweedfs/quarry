@@ -745,8 +745,9 @@ Carried over from the design, with the condition for revisiting:
 
 ```text
 aggregate/cube kind          DONE — rollup grain, coverage matching, telemetry
-subsumption matching         DONE — for exact aggregate cases; time-range
-                             narrowing remains
+subsumption matching         DONE — range bounds imply wider baked ones
+                             (`Filter::implies`); exactness holds because
+                             the query's own filters still execute
 future-reuse optimization    PARTIAL — predicted-vs-realized is measured and
                              fed back (`proven`, `NotWorthIt`); speculative
                              builds inside a query still need a who-pays
@@ -1935,3 +1936,12 @@ implying whatever bound its value satisfies.
   implication only admits the cube to try.
 - **Deferred item closed**: "time-range narrowing for exact aggregate
   subsumption."
+
+## Phase 32 — A useless filter set declines itself `[x]`
+
+`tenant_id > 0` passes every row: the set would store the whole table's
+positions to save nothing but filter evaluation. The build now counts
+what it scanned, and `build_proposed_filter_set` returns `None` when the
+filter admits all of it — `Declined::NoAdvantage`, the same verdict an
+index the format makes redundant gets. On refresh, an admits-everything
+rebuild leaves the stale piece for retirement to collect.

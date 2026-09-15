@@ -425,7 +425,12 @@ impl Optimizer {
             } else if let Some(ask) = self.built_cubes.get(&id) {
                 build_cube(session, table, ask, id.clone()).await
             } else if let Some(ask) = self.built_filters.get(&id) {
-                build_proposed_filter_set(session, table, ask, id.clone(), self.reader).await
+                match build_proposed_filter_set(session, table, ask, id.clone(), self.reader).await
+                {
+                    Ok(None) => datafusion::common::exec_err!("the filter admits every row"),
+                    Ok(Some(derived)) => Ok(derived),
+                    Err(e) => Err(e),
+                }
             } else {
                 continue;
             };
@@ -661,7 +666,14 @@ impl Optimizer {
             )
             .await
             {
-                Ok(derived) => derived,
+                Ok(Some(derived)) => derived,
+                Ok(None) => {
+                    // Admits every row — the set would store the table to
+                    // save nothing. Not a failure to retry: the evidence
+                    // itself says no.
+                    round.declined.push((id, Declined::NoAdvantage));
+                    continue;
+                }
                 Err(_) => {
                     self.failed_at.insert(id.clone(), head);
                     round.declined.push((id, Declined::BuildFailed));
