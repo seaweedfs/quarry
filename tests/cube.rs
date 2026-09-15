@@ -4,6 +4,12 @@
 //! the aggregate is recognised in the logical plan, the registry decides
 //! whether a cube may serve it, and the stored partials are re-aggregated at
 //! the query's grain.
+//!
+//! ```sh
+//! cargo test --features engine --test cube
+//! ```
+
+#![cfg(feature = "engine")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
