@@ -24,6 +24,7 @@ mod cube;
 mod iceberg_table;
 mod materialized;
 mod optimizer;
+mod options;
 #[cfg(feature = "iceberg")]
 mod persist;
 mod quarry;
@@ -40,6 +41,7 @@ pub use cache::{CacheStats, RangeCache};
 pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};
 pub use materialized::{MaterializedResult, Rollup, hash_plan};
 pub use optimizer::{Declined, Optimizer, Retired, Round};
+pub use options::QuarryOptions;
 #[cfg(feature = "iceberg")]
 pub use persist::{
     Advertised, Layout, QUARRY_BITMAP_V1, QUARRY_EQ_INDEX_V2, QUARRY_FILTER_SET_V1,

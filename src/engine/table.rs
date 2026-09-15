@@ -556,6 +556,7 @@ impl QuarryTable {
         group: &[Expr],
         aggr: &[Expr],
         filters: &[Expr],
+        approximate: bool,
     ) -> Option<Query> {
         let group_by = group
             .iter()
@@ -593,6 +594,7 @@ impl QuarryTable {
             projected,
             predicates: self.predicates(filters),
             aggregate: Some(aggregate),
+            approximate,
         })
     }
 
@@ -683,7 +685,12 @@ impl QuarryTable {
     /// Consults the rule, and falls back to every live file when no derived
     /// state applies. A full scan is always a correct answer, so every
     /// failure path here leads to one.
-    fn plan_files(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> ScanReport {
+    fn plan_files(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        approximate: bool,
+    ) -> ScanReport {
         let live: BTreeSet<FileId> = self
             .graph
             .get(self.snapshot)
@@ -700,6 +707,7 @@ impl QuarryTable {
             projected: self.projected_fields(projection),
             predicates: self.predicates(filters),
             aggregate: None,
+            approximate,
         };
         let fingerprint = Fingerprint::of(&query);
 
@@ -936,12 +944,12 @@ impl TableProvider for QuarryTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let report = self.plan_files(projection, filters);
+        let report = self.plan_files(projection, filters, super::options::approximate(state));
 
         // Stored rows first when substituting, then whatever files the rule
         // says must still be read. Concatenating the two is only valid
@@ -968,7 +976,7 @@ impl TableProvider for QuarryTable {
 
         if !report.files_read.is_empty() {
             parts.push(
-                self.file_plan(&report.files_read, &report.scopes, projection, _state)
+                self.file_plan(&report.files_read, &report.scopes, projection, state)
                     .await?,
             );
         }

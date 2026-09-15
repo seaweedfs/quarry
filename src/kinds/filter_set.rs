@@ -163,6 +163,7 @@ mod tests {
             projected: BTreeSet::from([STATUS]),
             predicates: Vec::new(),
             aggregate: None,
+            approximate: false,
         }
     }
 

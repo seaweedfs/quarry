@@ -812,6 +812,7 @@ mod tests {
             projected: BTreeSet::from([field]),
             predicates: vec![Predicate::Eq { field, value: 1 }],
             aggregate: None,
+            approximate: false,
         };
         Observation {
             fingerprint: Fingerprint::of(&query),

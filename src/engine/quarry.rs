@@ -142,7 +142,12 @@ impl Quarry {
     /// fails rather than returning fewer rows, because a truncated answer
     /// looks complete.
     pub fn session_with_budget(&self, budget: Budget) -> Session {
-        let ctx = SessionContext::new();
+        let mut config = datafusion::execution::context::SessionConfig::default();
+        config
+            .options_mut()
+            .extensions
+            .insert(super::options::QuarryOptions::default());
+        let ctx = SessionContext::new_with_config(config);
         // Take the parallelism from DataFusion rather than assuming it. Reads
         // that overlap wait once, not once each, and on a sixteen-core machine
         // the difference is sixteenfold on what is often the largest part of a
@@ -199,7 +204,8 @@ impl Session {
     pub async fn sql(&self, sql: &str) -> DfResult<Vec<RecordBatch>> {
         let df = self.ctx.sql(sql).await?;
         let plan = df.logical_plan().clone();
-        let (rewritten, served) = super::cube::rewrite(&plan)?;
+        let approximate = super::options::approximate_of(self.ctx.state().config().options());
+        let (rewritten, served) = super::cube::rewrite(&plan, approximate)?;
         if served.is_some() {
             return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
                 .collect()
@@ -209,7 +215,7 @@ impl Session {
         // An aggregate no cube could serve still reports the ask: the scan
         // itself saw only `aggregate: None`, and the optimizer can only
         // propose what it can see.
-        if let Some(ask) = super::cube::first_ask(&plan) {
+        if let Some(ask) = super::cube::first_ask(&plan, approximate) {
             if let Some(query) = super::cube::query_of(&ask) {
                 if let Some(mut report) = ask.table.last_scan() {
                     report.aggregate =

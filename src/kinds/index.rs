@@ -207,6 +207,7 @@ mod tests {
             projected: BTreeSet::from([TENANT]),
             predicates,
             aggregate: None,
+            approximate: false,
         }
     }
 

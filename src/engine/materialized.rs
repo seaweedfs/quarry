@@ -162,7 +162,7 @@ impl MaterializedResult {
         let (Some(want), Some(plan)) = (&query.aggregate, &query.plan) else {
             return false;
         };
-        want.covered_by(&rollup.spec)
+        want.covered_by(&rollup.spec, query.approximate)
             && self
                 .plan
                 .filters

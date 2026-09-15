@@ -926,3 +926,35 @@ async fn a_volatile_filter_refuses_to_become_a_set() {
     let result = build_filter_set(&session, &table, "random() > 0.5").await;
     assert!(result.is_err(), "volatile filters cannot be cached");
 }
+
+#[tokio::test]
+async fn a_session_opts_in_to_approximate_answers() {
+    let session = Quarry::new(
+        Url::parse("file://").expect("url"),
+        Arc::new(LocalFileSystem::new()),
+    )
+    .session();
+    let approximate = |session: &quarry::engine::Session| {
+        session
+            .context()
+            .state()
+            .config()
+            .options()
+            .extensions
+            .get::<quarry::engine::QuarryOptions>()
+            .is_some_and(|options| options.approximate)
+    };
+    assert!(!approximate(&session), "the default is exact-only");
+
+    session
+        .sql("SET quarry.approximate = true")
+        .await
+        .expect("set");
+    assert!(approximate(&session), "the opt-in persists on the session");
+
+    session
+        .sql("SET quarry.approximate = false")
+        .await
+        .expect("unset");
+    assert!(!approximate(&session));
+}

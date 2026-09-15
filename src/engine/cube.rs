@@ -47,6 +47,8 @@ pub(crate) struct Ask<'a> {
     pub group: &'a [Expr],
     pub aggr: &'a [Expr],
     pub filters: Vec<Expr>,
+    /// The session's opt-in: approximate state may serve exact asks.
+    pub approximate: bool,
 }
 
 /// The aggregate over a [`QuarryTable`] in `plan`, if it is shaped like one a
@@ -55,7 +57,7 @@ pub(crate) struct Ask<'a> {
 /// Recognised: `Aggregate` over any number of `Filter`s over `TableScan`.
 /// Anything in between — a join, a projection, a second table — means `None`,
 /// and the plan runs as written.
-pub(crate) fn ask_of(plan: &LogicalPlan) -> Option<Ask<'_>> {
+pub(crate) fn ask_of(plan: &LogicalPlan, approximate: bool) -> Option<Ask<'_>> {
     let LogicalPlan::Aggregate(aggregate) = plan else {
         return None;
     };
@@ -84,6 +86,7 @@ pub(crate) fn ask_of(plan: &LogicalPlan) -> Option<Ask<'_>> {
                     group: &aggregate.group_expr,
                     aggr: &aggregate.aggr_expr,
                     filters,
+                    approximate,
                 });
             }
             _ => return None,
@@ -108,16 +111,19 @@ fn split_and(expr: &Expr, into: &mut Vec<Expr>) {
 ///
 /// `ask_of` matches only a root `Aggregate`; reporting wants to find the ask
 /// whether or not a `Projection` sits on top of it.
-pub(crate) fn first_ask(plan: &LogicalPlan) -> Option<Ask<'_>> {
-    if let Some(ask) = ask_of(plan) {
+pub(crate) fn first_ask(plan: &LogicalPlan, approximate: bool) -> Option<Ask<'_>> {
+    if let Some(ask) = ask_of(plan, approximate) {
         return Some(ask);
     }
-    plan.inputs().iter().find_map(|input| first_ask(input))
+    plan.inputs()
+        .iter()
+        .find_map(|input| first_ask(input, approximate))
 }
 
 /// The [`Query`] an [`Ask`] reduces to — the identity a cube matches on.
 pub(crate) fn query_of(ask: &Ask) -> Option<Query> {
-    ask.table.aggregate_query(ask.group, ask.aggr, &ask.filters)
+    ask.table
+        .aggregate_query(ask.group, ask.aggr, &ask.filters, ask.approximate)
 }
 
 /// Rewrite `plan` to read a cube wherever one is admissible.
@@ -125,7 +131,10 @@ pub(crate) fn query_of(ask: &Ask) -> Option<Query> {
 /// Returns the rewritten plan and the id of what served it, for reporting.
 /// `None` means no aggregate in the plan matched a cube, for any of the
 /// reasons [`ask_of`] or the rule can produce.
-pub(crate) fn rewrite(plan: &LogicalPlan) -> DfResult<(LogicalPlan, Option<DerivedId>)> {
+pub(crate) fn rewrite(
+    plan: &LogicalPlan,
+    approximate: bool,
+) -> DfResult<(LogicalPlan, Option<DerivedId>)> {
     let mut served = None;
     let rewritten = plan
         .clone()
@@ -133,7 +142,7 @@ pub(crate) fn rewrite(plan: &LogicalPlan) -> DfResult<(LogicalPlan, Option<Deriv
             if served.is_some() {
                 return Ok(Transformed::no(node));
             }
-            let Some(ask) = ask_of(&node) else {
+            let Some(ask) = ask_of(&node, approximate) else {
                 return Ok(Transformed::no(node));
             };
             match substitute(&ask) {

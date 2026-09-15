@@ -146,6 +146,7 @@ mod tests {
             projected: BTreeSet::from([4]),
             predicates: vec![Predicate::Eq { field: 4, value: 9 }],
             aggregate: None,
+            approximate: false,
         }
     }
 

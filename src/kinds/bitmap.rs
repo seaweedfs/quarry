@@ -202,6 +202,7 @@ mod tests {
             projected: BTreeSet::from([STATUS]),
             predicates,
             aggregate: None,
+            approximate: false,
         }
     }
 

@@ -361,12 +361,16 @@ impl Aggregate {
     ///
     /// Filter coverage is the caller's: [`Plan`] comparisons happen where the
     /// two plans are both in hand.
-    pub fn covered_by(&self, cube: &Aggregate) -> bool {
+    ///
+    /// `approximate` is the session's opt-in: with it, a stored estimate may
+    /// answer an exact ask ([`Measure::computable_from`]).
+    pub fn covered_by(&self, cube: &Aggregate, approximate: bool) -> bool {
         self.group_by.is_subset(&cube.group_by)
-            && self
-                .measures
-                .iter()
-                .all(|m| cube.measures.iter().any(|c| m.computable_from(*c)))
+            && self.measures.iter().all(|m| {
+                cube.measures
+                    .iter()
+                    .any(|c| m.computable_from(*c, approximate))
+            })
     }
 }
 
@@ -376,7 +380,10 @@ impl Measure {
     /// Every function rolls up through itself — partial sums sum, partial
     /// minima minimise. `Avg` is deliberately absent from [`AggFunc`]: a cube
     /// that wants to answer averages stores `Sum` and `Count` and divides.
-    fn computable_from(&self, stored: Measure) -> bool {
+    ///
+    /// `approximate` admits the asymmetric cases: an exact ask answered by a
+    /// stored estimate, which only an opted-in session may ask.
+    fn computable_from(&self, stored: Measure, _approximate: bool) -> bool {
         self.func == stored.func && self.field == stored.field
     }
 }
@@ -421,6 +428,12 @@ pub struct Query {
     /// scan-level query means "no aggregate was visible", which a cube treats
     /// as not-a-match rather than as "plain scan".
     pub aggregate: Option<Aggregate>,
+    /// Whether the session accepts an approximate answer to an exact ask.
+    ///
+    /// `false` means a stored estimate may serve only a query that asked for
+    /// one. `true` — `SET quarry.approximate` — lets stored approximate
+    /// state answer exact expressions too, like `count(distinct)`.
+    pub approximate: bool,
 }
 
 impl Query {
@@ -1040,6 +1053,7 @@ mod tests {
                 value: 0xABC,
             }],
             aggregate: None,
+            approximate: false,
         }
     }
 
@@ -1342,7 +1356,7 @@ mod tests {
             group_by: BTreeSet::from([DAY, TENANT]),
             measures: BTreeSet::from([count_star()]),
         };
-        assert!(!finer.covered_by(&cube));
+        assert!(!finer.covered_by(&cube, false));
     }
 
     #[test]
@@ -1355,7 +1369,7 @@ mod tests {
             group_by: BTreeSet::from([DAY]),
             measures: BTreeSet::from([count_star(), sum_bytes()]),
         };
-        assert!(coarser.covered_by(&cube));
+        assert!(coarser.covered_by(&cube, false));
     }
 
     #[test]
@@ -1369,7 +1383,7 @@ mod tests {
             measures: BTreeSet::from([sum_bytes()]),
         };
         // COUNT is no basis for SUM.
-        assert!(!wants_sum.covered_by(&cube));
+        assert!(!wants_sum.covered_by(&cube, false));
         let wants_count_of_bytes = Aggregate {
             group_by: BTreeSet::from([DAY]),
             measures: BTreeSet::from([Measure {
@@ -1379,7 +1393,7 @@ mod tests {
         };
         // COUNT(*) counts rows; COUNT(bytes) counts non-null bytes. A cube
         // holding one cannot serve the other.
-        assert!(!wants_count_of_bytes.covered_by(&cube));
+        assert!(!wants_count_of_bytes.covered_by(&cube, false));
     }
 
     const DAY: FieldId = 1;

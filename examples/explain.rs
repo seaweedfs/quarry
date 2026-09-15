@@ -101,6 +101,7 @@ fn main() {
             value: TENANT_42,
         }],
         aggregate: None,
+        approximate: false,
     };
 
     println!("Derived state built at snapshot 810, never rebuilt.\n");
