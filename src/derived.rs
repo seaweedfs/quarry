@@ -371,7 +371,7 @@ impl Aggregate {
     /// two plans are both in hand.
     ///
     /// `approximate` is the session's opt-in: with it, a stored estimate may
-    /// answer an exact ask ([`Measure::computable_from`]).
+    /// answer an exact ask — see `Measure::computable_from`.
     pub fn covered_by(&self, cube: &Aggregate, approximate: bool) -> bool {
         self.group_by.is_subset(&cube.group_by)
             && self.measures.iter().all(|m| {

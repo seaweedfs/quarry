@@ -79,7 +79,8 @@ impl Bitmap {
 
     /// Exactly how many bytes this bitmap occupies when written down.
     ///
-    /// The same discipline [`Index::encoded_len`] keeps: computed because a
+    /// The same discipline [`Index::encoded_len`](super::Index::encoded_len)
+    /// keeps: computed because a
     /// storage budget is enforced against it, and agreeing with what a
     /// recovered bitmap reports so the same piece is not sized differently
     /// either side of a restart.
@@ -120,7 +121,7 @@ impl Kind for Bitmap {
     }
 
     /// Prunes to the rows that can hold any of the queried values, with the
-    /// same contract [`Index::matches`] keeps: only equality predicates on
+    /// same contract [`Index`](super::Index) keeps: only equality predicates on
     /// the indexed field are probed, alternatives on one field union, and a
     /// value with no postings prunes to nothing rather than failing.
     fn matches(&self, query: &Query) -> Option<Rewrite> {
@@ -157,7 +158,7 @@ impl Kind for Bitmap {
 
     /// Row positions cannot be extended without reading the new files, so
     /// any change reports [`Refreshed::NeedsRebuild`] — the same posture
-    /// [`Index::refresh`] takes, and as little a problem: a stale bitmap
+    /// [`Index`](super::Index) takes, and as little a problem: a stale bitmap
     /// stays usable because the rule reads the added files anyway.
     fn refresh(&mut self, diff: &Diff) -> Refreshed {
         if diff.is_empty() {

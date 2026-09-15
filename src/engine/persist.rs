@@ -202,7 +202,8 @@ impl Layout {
         Some((TableId(table.to_owned()), field, SnapshotId(snapshot)))
     }
 
-    /// Recover `(table, filter hash, snapshot)` from a [`filter_set_path`].
+    /// Recover `(table, filter hash, snapshot)` from a
+    /// [`Layout::filter_set_path`].
     ///
     /// The hash is not the identity itself — the filter text inside the
     /// blob is — so the caller must read the blob before trusting it. The

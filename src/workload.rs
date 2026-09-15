@@ -278,7 +278,8 @@ impl ForeignScan {
 pub struct FilterAsk {
     /// The table the filter ran on.
     pub table: TableId,
-    /// The canonical filter — the identity a [`FilterSet`] matches on.
+    /// The canonical filter — the identity a
+    /// [`FilterSet`](crate::kinds::FilterSet) matches on.
     pub filter: Filter,
     /// The clause as SQL, so building one can evaluate it.
     pub sql: String,
