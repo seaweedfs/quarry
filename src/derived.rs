@@ -52,10 +52,10 @@ pub type FieldId = u32;
 
 /// A restriction a query places on a field.
 ///
-/// Only equality is modelled, because only equality is currently *probed* by
-/// an index. Everything else is [`Predicate::Opaque`], which still marks the
-/// field as filtered but cannot be used to prune. Adding ranges later means
-/// adding a variant, not changing any signature.
+/// Only the forms something can actually *probe* are modelled. Everything
+/// else is [`Predicate::Opaque`], which still marks the field as filtered but
+/// cannot be used to prune. Adding a probeable form later means adding a
+/// variant, not changing any signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     /// `field = value`, where `value` is a hash of the literal.
@@ -68,6 +68,23 @@ pub enum Predicate {
         /// Hash of the literal compared against.
         value: u64,
     },
+    /// `field` contains every one of these terms, each a hash of a token.
+    ///
+    /// What a full-text index probes. Hashes for the same reason
+    /// [`Predicate::Eq`] uses them, and *tokens* rather than the raw string
+    /// because an inverted index answers "which files hold this word", not
+    /// "which files hold this substring" — the engine's tokenizer defines
+    /// what a word is, and build and probe share it.
+    ///
+    /// Conjunctive: a query for `error timeout` wants documents holding
+    /// both, so a candidate must hold both. That makes an index probe an
+    /// intersection, and an absent term prune to nothing.
+    Matches {
+        /// The field restricted.
+        field: FieldId,
+        /// Hashes of the tokens sought, all of which must be present.
+        terms: Vec<u64>,
+    },
     /// A restriction on `field` whose form is not modelled.
     Opaque {
         /// The field restricted.
@@ -79,7 +96,9 @@ impl Predicate {
     /// The field this restricts.
     pub fn field(&self) -> FieldId {
         match self {
-            Predicate::Eq { field, .. } | Predicate::Opaque { field } => *field,
+            Predicate::Eq { field, .. }
+            | Predicate::Matches { field, .. }
+            | Predicate::Opaque { field } => *field,
         }
     }
 }
@@ -505,6 +524,28 @@ impl Query {
                 Predicate::Eq { field: f, value } if *f == field => Some(*value),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Every term this query requires `field` to contain.
+    ///
+    /// Flattened across predicates, because both levels conjoin: the terms
+    /// within one [`Predicate::Matches`] must all be present, and two match
+    /// predicates on one field are two conjuncts. So a candidate must hold
+    /// every term returned, and an index probe is one intersection.
+    ///
+    /// Unlike [`Query::equalities`], whose several values are *alternatives*
+    /// — `a = 1 OR a = 2` — and are therefore unioned.
+    pub fn match_terms(&self, field: FieldId) -> Vec<u64> {
+        self.predicates
+            .iter()
+            .filter_map(|p| match p {
+                Predicate::Matches { field: f, terms } if *f == field => {
+                    Some(terms.iter().copied())
+                }
+                _ => None,
+            })
+            .flatten()
             .collect()
     }
 }

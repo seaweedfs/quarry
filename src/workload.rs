@@ -57,7 +57,14 @@ pub struct Fingerprint {
     pub table: TableId,
     /// Fields an index could probe, because they were compared for equality.
     pub probeable: BTreeSet<FieldId>,
-    /// Fields restricted in a way nothing can currently probe.
+    /// Fields restricted in a way an *equality* index cannot probe.
+    ///
+    /// Includes a full-text match, which something can genuinely probe — a
+    /// [`TextIndex`](crate::kinds::TextIndex) — but not the scalar index this
+    /// set's absence proposes. Keeping matches out of `probeable` is what
+    /// stops a repeated `quarry_matches` from earning an equality index that
+    /// could never serve it; they are proposed for separately, from
+    /// [`Workload::text_proposals`].
     pub opaque: BTreeSet<FieldId>,
     /// Fields read.
     pub projected: BTreeSet<FieldId>,
@@ -71,6 +78,9 @@ impl Fingerprint {
         for predicate in &query.predicates {
             match predicate {
                 Predicate::Eq { field, .. } => probeable.insert(*field),
+                // A text index can probe this; an equality index cannot, and
+                // `probeable` is what proposes one. See `opaque`.
+                Predicate::Matches { field, .. } => opaque.insert(*field),
                 Predicate::Opaque { field } => opaque.insert(*field),
             };
         }

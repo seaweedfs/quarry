@@ -150,6 +150,7 @@ impl Quarry {
         let ctx = SessionContext::new_with_config(config);
         super::hll::register(&ctx);
         super::distance::register(&ctx);
+        super::text::register(&ctx);
         // Take the parallelism from DataFusion rather than assuming it. Reads
         // that overlap wait once, not once each, and on a sixteen-core machine
         // the difference is sixteenfold on what is often the largest part of a

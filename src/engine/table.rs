@@ -703,6 +703,24 @@ impl QuarryTable {
     }
 
     fn predicate(&self, expr: &Expr) -> Option<Predicate> {
+        // `quarry_matches(column, 'terms')`, which a text index probes.
+        // Anything about it that cannot be read exactly — a computed column,
+        // a non-literal argument, a term list that tokenizes to nothing —
+        // falls through to `Opaque` below, which claims no pruning.
+        if let Expr::ScalarFunction(function) = expr {
+            if super::text::is_matches(function.func.name()) {
+                if let [Expr::Column(column), Expr::Literal(value, _)] = function.args.as_slice() {
+                    let field = self.field_ids.get(column.name()).copied();
+                    let terms = string_of(value).map(super::text::terms).unwrap_or_default();
+                    // Zero terms is vacuously true of every row, so an index
+                    // would prune nothing; saying so as `Matches` would make
+                    // it claim an empty intersection instead.
+                    if let (Some(field), false) = (field, terms.is_empty()) {
+                        return Some(Predicate::Matches { field, terms });
+                    }
+                }
+            }
+        }
         if let Expr::BinaryExpr(binary) = expr {
             let flipped = match (binary.left.as_ref(), binary.right.as_ref()) {
                 (Expr::Column(c), Expr::Literal(v, _)) => Some((c, v)),
@@ -1254,6 +1272,16 @@ fn row_selection(rows: &BTreeSet<u64>, total: i64) -> RowSelection {
         }
     }
     RowSelection::from_consecutive_ranges(ranges.into_iter(), total as usize)
+}
+
+/// The string a literal holds, whichever string type it is.
+fn string_of(value: &ScalarValue) -> Option<&str> {
+    match value {
+        ScalarValue::Utf8(Some(text))
+        | ScalarValue::LargeUtf8(Some(text))
+        | ScalarValue::Utf8View(Some(text)) => Some(text),
+        _ => None,
+    }
 }
 
 /// `batch` restricted to the named rows, or `None` if it holds none of them.

@@ -33,6 +33,7 @@ mod persist;
 mod quarry;
 mod store;
 mod table;
+mod text;
 
 pub use build::{
     build_bitmap, build_cube, build_filter_set, build_index, build_proposed_filter_set,
@@ -55,3 +56,4 @@ pub use persist::{
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
 pub use table::{QuarryTable, ScanReport, SharedRegistry, hash_scalar, shared};
+pub use text::terms;
