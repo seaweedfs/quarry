@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::Result as DfResult;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -328,6 +328,64 @@ impl QuarryTable {
             .lock()
             .expect("materialized")
             .insert(id, batches);
+        self
+    }
+
+    /// Supply a projection's stored rows: a subset of the table's columns.
+    ///
+    /// Each batch is canonicalised before storing — reordered to the
+    /// table's column order and rebuilt under the table's own fields — so a
+    /// union with scanned files sees one schema, metadata included. A
+    /// column the table does not have, or one with a different type, is
+    /// rejected here rather than left to fail mid-query.
+    ///
+    /// # Panics
+    ///
+    /// If any batch holds a column that is not a table column.
+    pub fn with_projection(self, id: DerivedId, batches: Vec<RecordBatch>) -> Self {
+        let canonical = batches
+            .iter()
+            .map(|batch| {
+                // (table index, stored index) pairs, sorted by table order.
+                let mut order: Vec<(usize, usize)> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(stored, field)| {
+                        let table = self.schema.index_of(field.name()).unwrap_or_else(|_| {
+                            panic!("stored column {:?} is not a table column", field.name())
+                        });
+                        assert_eq!(
+                            field.data_type(),
+                            self.schema.field(table).data_type(),
+                            "stored column {:?} has a different type than the table's",
+                            field.name()
+                        );
+                        (table, stored)
+                    })
+                    .collect();
+                order.sort();
+                order.dedup();
+                let schema = Arc::new(
+                    self.schema
+                        .project(&order.iter().map(|(table, _)| *table).collect::<Vec<_>>())
+                        .expect("stored columns are table columns"),
+                );
+                RecordBatch::try_new(
+                    schema,
+                    order
+                        .iter()
+                        .map(|(_, stored)| batch.column(*stored).clone())
+                        .collect(),
+                )
+                .expect("canonicalised batch")
+            })
+            .collect();
+        self.materialized
+            .lock()
+            .expect("materialized")
+            .insert(id, canonical);
         self
     }
 
@@ -862,8 +920,9 @@ impl TableProvider for QuarryTable {
         let report = self.plan_files(projection, filters);
 
         // Stored rows first when substituting, then whatever files the rule
-        // says must still be read. Concatenating the two is only valid because
-        // the rule refused any derived state whose rows are not table-shaped.
+        // says must still be read. Concatenating the two is only valid
+        // because the rule refused any derived state that cannot supply
+        // exactly the projected columns.
         let mut parts: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
 
         if report.substituted {
@@ -879,7 +938,7 @@ impl TableProvider for QuarryTable {
                         .cloned()
                 })
             {
-                parts.push(self.memory_plan(std::slice::from_ref(&batches), projection)?);
+                parts.push(self.derived_plan(&batches, projection)?);
             }
         }
 
@@ -912,6 +971,57 @@ impl QuarryTable {
             Arc::clone(&self.schema),
             projection.cloned(),
         )?;
+        Ok(exec)
+    }
+
+    /// A plan over stored rows, whose schema may be narrower than the
+    /// table's — a projection's stored columns.
+    ///
+    /// `projection` is expressed in table-schema indices; when the stored
+    /// schema is narrower it is remapped to stored positions by name, which
+    /// is safe because the rule only let the state serve a query whose
+    /// columns it covers. `with_projection` canonicalised the batches under
+    /// the table's own fields, so the output schema is byte-identical to
+    /// what a full scan would project.
+    fn derived_plan(
+        &self,
+        batches: &[RecordBatch],
+        projection: Option<&Vec<usize>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let Some(stored) = batches.first().map(|batch| batch.schema()) else {
+            return self.memory_plan(std::slice::from_ref(&batches.to_vec()), projection);
+        };
+        if stored == self.schema {
+            return self.memory_plan(std::slice::from_ref(&batches.to_vec()), projection);
+        }
+
+        let positions: Vec<usize> = stored
+            .fields()
+            .iter()
+            .map(|field| self.schema.index_of(field.name()))
+            .collect::<Result<_, _>>()?;
+        let remapped = match projection {
+            Some(indices) => indices
+                .iter()
+                .map(|index| {
+                    positions
+                        .iter()
+                        .position(|position| position == index)
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "stored projection does not hold column {:?}",
+                                self.schema.field(*index).name()
+                            ))
+                        })
+                })
+                .collect::<DfResult<Vec<_>>>()?,
+            None => {
+                return Err(DataFusionError::Plan(
+                    "a stored projection cannot serve a whole-table scan".to_owned(),
+                ));
+            }
+        };
+        let exec = MemorySourceConfig::try_new_exec(&[batches.to_vec()], stored, Some(remapped))?;
         Ok(exec)
     }
 

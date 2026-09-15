@@ -12,9 +12,11 @@ use crate::cost::{Cost, PriceTable, Tier};
 use crate::place::Distance;
 
 pub mod index;
+pub mod projection;
 pub mod result_cache;
 
 pub use index::Index;
+pub use projection::Projection;
 pub use result_cache::ResultCache;
 
 /// Price reading `bytes` of derived state.

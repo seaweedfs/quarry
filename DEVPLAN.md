@@ -1784,3 +1784,33 @@ read whole. The tests:
 - `a_scoped_prune_reads_only_the_named_row_groups` — the honest version:
   group 1's messages span 'a'..'z' so the file's own statistics cannot
   skip it; only the scope does, and the metered bytes prove it.
+
+---
+
+## Phase 26 — The projection kind `[x]`
+
+The first level-4 promoted accelerator of the taxonomy: `Projection`
+(`src/kinds/projection.rs`) stores a subset of the table's columns as
+rows and matches on shape rather than plan identity — any query whose
+fields it covers may substitute it. Coverage is total: scan columns,
+filter fields, and an aggregate's keys and measures all must be held,
+because everything above the scan can only read what the scan supplies.
+
+Serving narrows the schema honestly. `with_projection` canonicalises
+stored batches — table column order, the table's own fields — so a union
+with scanned files sees one schema, and `derived_plan` remaps the
+requested projection from table indices to stored positions by name.
+Residual files added since the build are read whole and unioned, the
+same `unionable` rule `MaterializedResult` already obeys.
+
+The tests pin the boundary, not just the result:
+
+- `a_projection_serves_a_query_touching_only_its_columns` — stored
+  messages answer a filtered `SELECT message` with no file read.
+- `a_projection_cannot_serve_a_column_it_does_not_hold` — asking for
+  `tenant_id` against a `message`-only projection is a full scan.
+- `a_stale_projection_unions_with_the_file_added_since` — stored rows
+  plus the new file, and the report shows both.
+- `a_projection_stored_out_of_order_is_served_in_table_order` —
+  canonicalisation is load-bearing: reversed storage serves `SELECT *`
+  in table order.

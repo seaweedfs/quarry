@@ -24,7 +24,7 @@ use quarry::derived::{
     Source,
 };
 use quarry::engine::{MaterializedResult, QuarryTable, Rollup, hash_scalar};
-use quarry::kinds::{Index, ResultCache};
+use quarry::kinds::{Index, Projection, ResultCache};
 use quarry::registry::Registry;
 use quarry::snapshot::{DeleteState, Diff, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 
@@ -977,4 +977,169 @@ async fn deletes_do_not_disqualify_a_pruning_index() {
         Some("tenant_idx"),
         "the engine still reads the file and applies deletes, so pruning is safe"
     );
+}
+
+/// A stored column subset: `message` alone, narrower than the table.
+fn message_batch(rows: &[&str]) -> RecordBatch {
+    let messages: StringArray = rows.iter().map(|m| Some(*m)).collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "message",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(messages)],
+    )
+    .expect("batch")
+}
+
+fn message_projection(at: i64) -> Derived {
+    Derived::new(
+        DerivedId("message_proj".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(at),
+        },
+        POLICY,
+        1,
+        Box::new(Projection::covering([7], 1)),
+    )
+}
+
+#[tokio::test]
+async fn a_projection_serves_a_query_touching_only_its_columns() {
+    // The projection holds every row's `message`; the filter still applies
+    // above the scan, so the answer is unchanged.
+    let mut registry = Registry::new();
+    registry.register(message_projection(810));
+    let table = Arc::new(
+        table_with_three_files(flat_graph(&["a", "b", "c"], 810), SnapshotId(810))
+            .with_registry(registry)
+            .with_projection(
+                DerivedId("message_proj".into()),
+                vec![message_batch(&["a1", "a2", "b1", "c1"])],
+            ),
+    );
+
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT message FROM events WHERE message = 'a1'",
+    )
+    .await;
+    assert_eq!(total_rows(&rows), 1, "only a1 matches");
+
+    let report = table.last_scan().expect("scan");
+    assert!(report.files_read.is_empty(), "no file was read");
+    assert_eq!(report.used, vec!["message_proj".to_string()]);
+}
+
+#[tokio::test]
+async fn a_projection_cannot_serve_a_column_it_does_not_hold() {
+    let mut registry = Registry::new();
+    registry.register(message_projection(810));
+    let table = Arc::new(
+        table_with_three_files(flat_graph(&["a", "b", "c"], 810), SnapshotId(810))
+            .with_registry(registry)
+            .with_projection(
+                DerivedId("message_proj".into()),
+                vec![message_batch(&["a1", "a2", "b1", "c1"])],
+            ),
+    );
+
+    // tenant_id is not stored, so nothing may substitute.
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT * FROM events WHERE tenant_id = 1",
+    )
+    .await;
+    assert_eq!(total_rows(&rows), 3);
+    assert_eq!(
+        table.last_scan().expect("scan").files_read,
+        ["a", "b", "c"].iter().map(|f| file(f)).collect(),
+        "every file was read"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_projection_unions_with_the_file_added_since() {
+    // Built at 810 holding the messages of a and b; c arrives at 811 and is
+    // read whole — the union is the answer.
+    let graph = SnapshotGraph::new()
+        .with(
+            Snapshot::root(SnapshotId(810))
+                .with_clean_file(file("a"))
+                .with_clean_file(file("b")),
+        )
+        .with(
+            Snapshot::child_of(SnapshotId(811), SnapshotId(810))
+                .with_clean_file(file("a"))
+                .with_clean_file(file("b"))
+                .with_clean_file(file("c")),
+        );
+
+    let mut registry = Registry::new();
+    registry.register(message_projection(810));
+    let table = Arc::new(
+        table_with_three_files(graph, SnapshotId(811))
+            .with_registry(registry)
+            .with_projection(
+                DerivedId("message_proj".into()),
+                vec![message_batch(&["a1", "a2", "b1"])],
+            ),
+    );
+
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT message FROM events WHERE message = 'c1'",
+    )
+    .await;
+    assert_eq!(total_rows(&rows), 1, "only c holds it");
+
+    let report = table.last_scan().expect("scan");
+    assert_eq!(report.files_read, BTreeSet::from([file("c")]));
+    assert_eq!(report.used, vec!["message_proj".to_string()]);
+    assert_eq!(report.also_scanned, BTreeSet::from([file("c")]));
+}
+
+#[tokio::test]
+async fn a_projection_stored_out_of_order_is_served_in_table_order() {
+    // Every column, stored in the opposite order — canonicalised on the way
+    // in, so serving is the full-schema path.
+    let tenants: Int64Array = vec![1, 2].into_iter().map(Some).collect();
+    let messages: StringArray = vec!["a1", "b1"].into_iter().map(Some).collect();
+    let reordered = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("message", DataType::Utf8, false),
+            Field::new("tenant_id", DataType::Int64, false),
+        ])),
+        vec![Arc::new(messages), Arc::new(tenants)],
+    )
+    .expect("batch");
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        DerivedId("all_proj".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        1,
+        Box::new(Projection::covering([TENANT_FIELD, 7], 1)),
+    ));
+    let table = Arc::new(
+        table_with_three_files(flat_graph(&["a", "b", "c"], 810), SnapshotId(810))
+            .with_registry(registry)
+            .with_projection(DerivedId("all_proj".into()), vec![reordered]),
+    );
+
+    let rows = run(Arc::clone(&table), "SELECT * FROM events").await;
+    assert_eq!(total_rows(&rows), 2, "the two stored rows");
+    let names: Vec<String> = rows[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, vec!["tenant_id", "message"], "table order restored");
 }
