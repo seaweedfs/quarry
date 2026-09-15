@@ -1032,7 +1032,7 @@ async fn a_bitmap_survives_being_written_and_read_back() {
             value: hash_scalar(&ScalarValue::Int64(Some(1))),
         }],
         aggregate: None,
-            nearest: None,
+        nearest: None,
         approximate: false,
     };
     match derived.may_serve(&query, &fixture_dir.graph) {
@@ -1133,7 +1133,7 @@ async fn a_filter_set_survives_being_written_and_read_back() {
         projected: BTreeSet::from([TENANT_FIELD]),
         predicates: Vec::new(),
         aggregate: None,
-            nearest: None,
+        nearest: None,
         approximate: false,
     };
     match derived.may_serve(&query, &fixture_dir.graph) {

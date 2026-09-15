@@ -118,6 +118,11 @@ pub struct ScanReport {
     /// `GROUP BY` that `scan` cannot — and `None` otherwise means nothing
     /// more than "no aggregate was visible".
     pub aggregate: Option<crate::workload::AggregateAsk>,
+    /// What the query searched for, if it was a top-k nearest ask.
+    ///
+    /// Set only where the whole plan was visible, for the same reason
+    /// `aggregate` is: the `ORDER BY` and `LIMIT` sit above the scan.
+    pub nearest: Option<crate::workload::NearestAsk>,
     /// The filters this scan ran, kept for the optimizer's proposals.
     ///
     /// Each is a [`FilterAsk`](crate::workload::FilterAsk): the canonical
@@ -145,6 +150,7 @@ impl ScanReport {
         Observation {
             fingerprint: self.fingerprint.clone(),
             aggregate: self.aggregate.clone(),
+            nearest: self.nearest.clone(),
             filters: self.filters.clone(),
             bytes_read,
             bytes_if_full_scan: self.bytes_if_full_scan,
@@ -605,6 +611,49 @@ impl QuarryTable {
         })
     }
 
+    /// The top-k query `nearest` over `filters` asks of this table.
+    ///
+    /// The counterpart of [`QuarryTable::aggregate_query`] for the vector
+    /// shape. `nearest` was already validated against this table's schema by
+    /// the recogniser, so the only thing that can fail is the plan — and a
+    /// plan is required, because substitution matches on identity.
+    pub fn nearest_query(
+        &self,
+        nearest: &crate::derived::Nearest,
+        filters: &[Expr],
+        approximate: bool,
+    ) -> Option<Query> {
+        // Every column: a substituted top-k returns rows, and the projection
+        // above the limit may ask for any of them.
+        let projected: BTreeSet<FieldId> = self
+            .schema
+            .fields()
+            .iter()
+            .filter_map(|f| self.field_ids.get(f.name()).copied())
+            .collect();
+        let plan = Plan::new(
+            projected.clone(),
+            filters.iter().map(|expr| self.canonical_filter(expr)),
+        );
+        let plan_hash = {
+            let mut hasher = StableHasher::new();
+            (plan.clone(), nearest.clone()).hash(&mut hasher);
+            hasher.finish()
+        };
+        Some(Query {
+            table: self.table.clone(),
+            snapshot: self.snapshot,
+            policy: self.policy,
+            plan_hash,
+            plan: Some(plan),
+            projected,
+            predicates: self.predicates(filters),
+            aggregate: None,
+            nearest: Some(nearest.clone()),
+            approximate,
+        })
+    }
+
     /// One measure expression, or `None` if it is not one a cube can hold.
     ///
     /// Only a plain `func(column)` or `count(*)` qualifies: a `FILTER` or an
@@ -764,6 +813,7 @@ impl QuarryTable {
                 };
                 Some(ScanReport {
                     aggregate: None,
+                    nearest: None,
                     filters: asks.clone(),
                     files_read: BTreeSet::new(),
                     scopes: BTreeMap::new(),
@@ -783,6 +833,7 @@ impl QuarryTable {
                 pieces,
             } => Some(ScanReport {
                 aggregate: None,
+                nearest: None,
                 filters: asks.clone(),
                 scopes: files.clone(),
                 files_read: files.into_keys().collect(),
@@ -801,6 +852,7 @@ impl QuarryTable {
         match usable {
             None => ScanReport {
                 aggregate: None,
+                nearest: None,
                 filters: asks,
                 files_read: live,
                 scopes: BTreeMap::new(),

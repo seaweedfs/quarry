@@ -1319,12 +1319,13 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         projected: std::collections::BTreeSet::from([field]),
         predicates: vec![Predicate::Eq { field, value: 1 }],
         aggregate: None,
-            nearest: None,
+        nearest: None,
         approximate: false,
     };
     Observation {
         fingerprint: Fingerprint::of(&query),
         aggregate: None,
+        nearest: None,
         bytes_read: bytes,
         bytes_if_full_scan: bytes,
         used: Vec::new(),
@@ -1802,7 +1803,7 @@ async fn a_low_cardinality_field_earns_a_row_level_bitmap() {
             value: hash_scalar(&ScalarValue::Int64(Some(1))),
         }],
         aggregate: None,
-            nearest: None,
+        nearest: None,
         approximate: false,
     };
     match derived.may_serve(&query, &graph) {
@@ -1860,7 +1861,7 @@ async fn a_high_cardinality_field_earns_a_file_level_index() {
             value: hash_scalar(&ScalarValue::Int64(Some(5))),
         }],
         aggregate: None,
-            nearest: None,
+        nearest: None,
         approximate: false,
     };
     match derived.may_serve(&query, &graph) {

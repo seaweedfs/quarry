@@ -96,7 +96,7 @@ pub(crate) fn ask_of(plan: &LogicalPlan, approximate: bool) -> Option<Ask<'_>> {
 
 /// `a AND b AND c` is three restrictions, not one; a cube answers for each
 /// conjunct separately.
-fn split_and(expr: &Expr, into: &mut Vec<Expr>) {
+pub(crate) fn split_and(expr: &Expr, into: &mut Vec<Expr>) {
     if let Expr::BinaryExpr(binary) = expr {
         if binary.op == Operator::And {
             split_and(&binary.left, into);
@@ -313,5 +313,6 @@ pub(crate) fn report(
                 spec,
                 filter_sql: filter_sql.clone(),
             }),
+        nearest: None,
     }
 }

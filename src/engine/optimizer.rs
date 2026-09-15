@@ -818,6 +818,7 @@ mod tests {
         Observation {
             fingerprint: Fingerprint::of(&query),
             aggregate: None,
+            nearest: None,
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: Vec::new(),

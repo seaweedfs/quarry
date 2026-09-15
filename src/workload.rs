@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
-use crate::derived::{Aggregate, DerivedId, FieldId, Filter, Plan, Predicate, Query};
+use crate::derived::{Aggregate, DerivedId, FieldId, Filter, Nearest, Plan, Predicate, Query};
 use crate::layout::Spread;
 use crate::registry::Registry;
 use crate::snapshot::{SnapshotId, TableId};
@@ -103,6 +103,41 @@ pub struct AggregateAsk {
     pub filter_sql: Vec<String>,
 }
 
+/// What a top-k nearest-neighbour query asked, kept whole enough to propose
+/// a vector index.
+///
+/// Unlike [`AggregateAsk`] and [`FilterAsk`] this carries **no literals**: a
+/// [`Nearest`] holds the field, metric, dimension, and k, never the query
+/// vector. One index over `(field, metric, dimension)` serves every vector,
+/// so the vector is not part of what is proposed — which also means this is
+/// safe to persist, though nothing does yet.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NearestAsk {
+    /// The table searched.
+    pub table: TableId,
+    /// The ask, minus the query vector.
+    pub nearest: Nearest,
+}
+
+/// A vector index worth building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorProposal {
+    /// The table it would be built on.
+    pub table: TableId,
+    /// What it would cover.
+    pub ask: NearestAsk,
+    /// How many unaided queries asked for this.
+    pub queries: u64,
+    /// Bytes those queries read.
+    pub bytes_scanned: u64,
+    /// The most it could possibly have saved: every byte those queries moved.
+    ///
+    /// A flat vector index replaces the whole scan, so this is as close to
+    /// honest as a cube's ceiling — and still an upper bound, since the
+    /// index's own storage and build are not in it.
+    pub ceiling_usd: f64,
+}
+
 /// A cube worth building.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CubeProposal {
@@ -129,6 +164,8 @@ pub struct Observation {
     pub fingerprint: Fingerprint,
     /// What the query aggregated, if it did.
     pub aggregate: Option<AggregateAsk>,
+    /// What the query searched for, if it was a top-k nearest ask.
+    pub nearest: Option<NearestAsk>,
     /// Bytes the query read.
     pub bytes_read: u64,
     /// Bytes a full scan of the queried snapshot would have read.
@@ -218,6 +255,9 @@ impl ForeignScan {
                 projected: self.projected.clone(),
             },
             aggregate: None,
+            // A foreign engine's sort expression is in its dialect, not
+            // this one's distance functions — nothing to key an index by.
+            nearest: None,
             bytes_read: self.bytes_read,
             bytes_if_full_scan,
             used: Vec::new(),
@@ -464,6 +504,10 @@ pub struct Workload {
     by_ask: BTreeMap<AggregateAsk, Seen>,
     /// In-memory only, for the same reason.
     by_filter: BTreeMap<FilterAsk, Seen>,
+    /// Top-k asks. Unlike the two above this carries no literals — a
+    /// [`NearestAsk`] holds no query vector — so nothing keeps it in memory
+    /// except that nothing persists it yet.
+    by_nearest: BTreeMap<NearestAsk, Seen>,
 }
 
 impl Workload {
@@ -486,6 +530,41 @@ impl Workload {
 
         if let Some(ask) = observation.aggregate {
             let seen = self.by_ask.entry(ask).or_default();
+            seen.queries += 1;
+            seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
+            seen.bytes_if_full_scan = seen
+                .bytes_if_full_scan
+                .saturating_add(observation.bytes_if_full_scan);
+            if !observation.used.is_empty() {
+                seen.helped += 1;
+            }
+        }
+
+        // Grouped ignoring k: one index answers any k, so a query for the
+        // nearest 10 and one for the nearest 100 are the same proposal. The
+        // largest k seen is kept, since it bounds what the index must return.
+        if let Some(ask) = observation.nearest {
+            let key = self
+                .by_nearest
+                .keys()
+                .find(|seen| {
+                    seen.table == ask.table
+                        && seen.nearest.field == ask.nearest.field
+                        && seen.nearest.metric == ask.nearest.metric
+                        && seen.nearest.dimension == ask.nearest.dimension
+                })
+                .cloned();
+            let key = match key {
+                Some(existing) if existing.nearest.k >= ask.nearest.k => existing,
+                Some(existing) => {
+                    // A larger k arrived: re-key the accumulated counts.
+                    let seen = self.by_nearest.remove(&existing).unwrap_or_default();
+                    self.by_nearest.insert(ask.clone(), seen);
+                    ask
+                }
+                None => ask,
+            };
+            let seen = self.by_nearest.entry(key).or_default();
             seen.queries += 1;
             seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
             seen.bytes_if_full_scan = seen
@@ -574,6 +653,7 @@ impl Workload {
             by_derived: credits.into_iter().collect(),
             by_ask: BTreeMap::new(),
             by_filter: BTreeMap::new(),
+            by_nearest: BTreeMap::new(),
         }
     }
 
@@ -681,6 +761,30 @@ impl Workload {
         proposals
     }
 
+    /// Vector indexes worth building, most promising first.
+    ///
+    /// Same rule as cubes: only unaided asks propose, grouped by what an
+    /// index would cover rather than by query shape — the query vector is
+    /// not part of the identity, so every search of one column under one
+    /// metric counts toward the same proposal.
+    pub fn vector_proposals(&self, prices: &PriceTable, min_queries: u64) -> Vec<VectorProposal> {
+        let mut proposals: Vec<VectorProposal> = self
+            .by_nearest
+            .iter()
+            .filter(|(_, seen)| seen.queries.saturating_sub(seen.helped) >= min_queries)
+            .map(|(ask, seen)| VectorProposal {
+                table: ask.table.clone(),
+                ask: ask.clone(),
+                queries: seen.queries,
+                bytes_scanned: seen.bytes_read,
+                ceiling_usd: seen.bytes_read as f64
+                    * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far),
+            })
+            .collect();
+        proposals.sort_by(|a, b| b.ceiling_usd.total_cmp(&a.ceiling_usd));
+        proposals
+    }
+
     /// Derived state that has not paid for itself over `horizon_days`.
     ///
     /// Compares what a piece has *measurably* saved against what keeping it
@@ -757,6 +861,7 @@ mod tests {
         Observation {
             fingerprint: Fingerprint::of(&query_on(fields)),
             aggregate: None,
+            nearest: None,
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: Vec::new(),
@@ -902,6 +1007,7 @@ mod tests {
             workload.observe(Observation {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
                 aggregate: None,
+                nearest: None,
                 bytes_read: GB / 10,
                 bytes_if_full_scan: GB,
                 used: vec![DerivedId("idx".into())],
@@ -924,6 +1030,7 @@ mod tests {
             workload.observe(Observation {
                 fingerprint: Fingerprint::of(&other),
                 aggregate: None,
+                nearest: None,
                 bytes_read: GB,
                 bytes_if_full_scan: GB,
                 used: Vec::new(),
@@ -947,6 +1054,7 @@ mod tests {
                 projected: BTreeSet::from([7]),
             },
             aggregate: None,
+            nearest: None,
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used,
@@ -1027,6 +1135,7 @@ mod tests {
         let observation = Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
+            nearest: None,
             bytes_read: GB / 4,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("idx".into())],
@@ -1040,6 +1149,7 @@ mod tests {
         let observation = Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
+            nearest: None,
             bytes_read: 2 * GB,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("idx".into())],
@@ -1102,6 +1212,7 @@ mod tests {
             workload.observe(Observation {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
                 aggregate: None,
+                nearest: None,
                 bytes_read: 0,
                 bytes_if_full_scan: GB,
                 used: vec![DerivedId("useful".into())],
@@ -1123,6 +1234,7 @@ mod tests {
         workload.observe(Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
+            nearest: None,
             bytes_read: 0,
             bytes_if_full_scan: 1_000,
             used: vec![DerivedId("bloated".into())],
@@ -1140,6 +1252,7 @@ mod tests {
         workload.observe(Observation {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
+            nearest: None,
             bytes_read: 1,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("a".into())],
