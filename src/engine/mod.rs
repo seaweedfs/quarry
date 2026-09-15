@@ -20,6 +20,7 @@
 mod build;
 mod cache;
 mod cube;
+mod hll;
 #[cfg(feature = "iceberg")]
 mod iceberg_table;
 mod materialized;

@@ -174,9 +174,19 @@ fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
     else {
         return None;
     };
+    // The answer is approximate when a sketch's partials serve any measure —
+    // asked as `approx_distinct`, or as `count(distinct)` under the opt-in.
+    let approximate = ask.aggr.iter().any(|expr| {
+        table.measure(expr).is_some_and(|measure| {
+            spec.measures.iter().any(|stored| {
+                stored.func == AggFunc::ApproxDistinct
+                    && measure.computable_from(*stored, ask.approximate)
+            })
+        })
+    });
     // Record before the borrow escapes: the report lands on the table while
     // `ask`'s references are still in scope.
-    table.note_scan(report(table, &query, &id, ask));
+    table.note_scan(report(table, &query, &id, ask, approximate));
 
     let fields = spec.group_by.len() + spec.measures.iter().filter(|m| m.field.is_some()).count();
     let names: BTreeMap<_, _> = spec
@@ -189,7 +199,7 @@ fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
     if names.len() != fields {
         return None;
     }
-    let rollup = Rollup::new(spec, names);
+    let rollup = Rollup::new(spec.clone(), names);
     let stored = table.stored(&id)?.to_vec();
     if stored.is_empty() {
         return None;
@@ -199,17 +209,21 @@ fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
         Err(e) => return Some(Err(e)),
     };
 
-    // Only measures change. Each asked measure becomes the rollup of its
-    // stored partials, aliased to the name the original expression carried so
-    // the plan above resolves the same field it asked for.
+    // Only measures change. Each asked measure becomes the rollup of the
+    // stored partial covering it — usually itself, but `count(distinct)`
+    // under the opt-in merges a stored sketch — aliased to the name the
+    // original expression carried so the plan above resolves the same field.
     let measures = ask
         .aggr
         .iter()
         .map(|expr| {
             let measure = table.measure(expr)?;
-            let stored = rollup.measure_name(&measure)?;
+            let stored = spec
+                .measures
+                .iter()
+                .find(|c| measure.computable_from(**c, ask.approximate))?;
             let name = expr.name_for_alias().ok()?;
-            Some(reaggregate(&measure, &stored).alias(name))
+            Some(reaggregate(stored, &rollup.measure_name(stored)?).alias(name))
         })
         .collect::<Option<Vec<_>>>()?;
 
@@ -226,15 +240,20 @@ fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
 }
 
 /// The re-aggregation of a stored partial: a stored `count` is summed,
-/// everything else combines through its own function.
-fn reaggregate(measure: &Measure, stored: &str) -> Expr {
-    let column = Expr::Column(datafusion::common::Column::new_unqualified(stored));
-    match measure.func.rollup() {
+/// everything else combines through its own function, and a sketch's states
+/// merge through `quarry_hll_merge`.
+fn reaggregate(stored: &Measure, name: &str) -> Expr {
+    let column = Expr::Column(datafusion::common::Column::new_unqualified(name));
+    match stored.func.rollup() {
         AggFunc::Sum => expr_fn::sum(column),
         AggFunc::Min => expr_fn::min(column),
         AggFunc::Max => expr_fn::max(column),
-        // `AggFunc::rollup` never yields Count: a count combines by summing.
-        AggFunc::Count => unreachable!("a count's rollup is a sum"),
+        AggFunc::ApproxDistinct => super::hll::merge_expr(column),
+        // `rollup` never yields Count — a count combines by summing — and a
+        // `CountDistinct` ask never stores: it merges stored sketch states.
+        AggFunc::Count | AggFunc::CountDistinct => {
+            unreachable!("the stored side is never a plain or distinct count")
+        }
     }
 }
 
@@ -254,6 +273,7 @@ pub(crate) fn report(
     query: &Query,
     used: &DerivedId,
     ask: &Ask<'_>,
+    approximate: bool,
 ) -> ScanReport {
     let filter_sql = filter_sql(ask);
     ScanReport {
@@ -278,6 +298,7 @@ pub(crate) fn report(
         used: vec![used.0.clone()],
         also_scanned: Default::default(),
         substituted: true,
+        approximate,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),

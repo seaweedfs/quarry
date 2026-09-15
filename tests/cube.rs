@@ -490,3 +490,164 @@ async fn a_wider_range_is_not_served_by_a_narrower_cube() {
         "the narrower cube must not serve the wider query"
     );
 }
+
+/// A sketch cube over the same fixture: `approx_distinct(tenant_id)`
+/// partials grouped by day, built through `build_cube`'s real SQL path —
+/// the `quarry_hll_state` function a session registers.
+async fn with_sketch_cube(asked: AggFunc) -> (Session, Arc<QuarryTable>) {
+    let registry = quarry::engine::shared(Registry::new());
+    let table = Arc::new(table(SnapshotId(810)).with_shared_registry(Arc::clone(&registry)));
+    let session = session();
+    let ask = quarry::workload::AggregateAsk {
+        table: TableId("events".into()),
+        plan: build_plan(),
+        spec: Aggregate {
+            group_by: BTreeSet::from([DAY]),
+            measures: BTreeSet::from([Measure {
+                func: asked,
+                field: Some(TENANT),
+            }]),
+        },
+        filter_sql: vec![],
+    };
+    let derived = quarry::engine::build_cube(&session, &table, &ask, DerivedId("sketch".into()))
+        .await
+        .expect("build the sketch cube");
+    registry.write().expect("registry").register(derived);
+    session
+        .register("events", Arc::clone(&table))
+        .expect("register");
+    (session, table)
+}
+
+/// (day, count) pairs out of an aggregate result. The exact path returns
+/// `Int64`; the sketch's merge returns `UInt64` — both are counts.
+fn day_counts(rows: &[RecordBatch]) -> BTreeMap<i64, u64> {
+    let mut out = BTreeMap::new();
+    for batch in rows {
+        let days = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("day");
+        let column = batch.column(1);
+        for i in 0..batch.num_rows() {
+            let count = match column.data_type() {
+                DataType::Int64 => column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count")
+                    .value(i) as u64,
+                DataType::UInt64 => column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                    .expect("count")
+                    .value(i),
+                other => panic!("a count, not {other:?}"),
+            };
+            out.insert(days.value(i), count);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn an_approx_distinct_ask_serves_from_a_sketch() {
+    let (session, table) = with_sketch_cube(AggFunc::ApproxDistinct).await;
+    let rows = session
+        .sql("SELECT day, approx_distinct(tenant_id) FROM events GROUP BY day")
+        .await
+        .expect("sql");
+    assert_eq!(
+        day_counts(&rows),
+        BTreeMap::from([(1, 2), (2, 2)]),
+        "two tenants each day, estimated exactly at this cardinality"
+    );
+    let report = table.last_scan().expect("report");
+    assert!(report.substituted && report.approximate);
+}
+
+#[tokio::test]
+async fn count_distinct_refuses_a_sketch_until_the_session_opts_in() {
+    let (session, table) = with_sketch_cube(AggFunc::ApproxDistinct).await;
+    let sql = "SELECT day, count(distinct tenant_id) FROM events GROUP BY day";
+
+    // Exact ask, exact answer — the sketch is not admitted.
+    let rows = session.sql(sql).await.expect("sql");
+    assert_eq!(day_counts(&rows), BTreeMap::from([(1, 2), (2, 2)]));
+    let report = table.last_scan().expect("report");
+    assert!(
+        !report.substituted,
+        "no opt-in means the exact path ran: {report:?}"
+    );
+
+    session
+        .sql("SET quarry.approximate = true")
+        .await
+        .expect("opt in");
+    let rows = session.sql(sql).await.expect("sql");
+    assert_eq!(day_counts(&rows), BTreeMap::from([(1, 2), (2, 2)]));
+    let report = table.last_scan().expect("report");
+    assert!(
+        report.substituted && report.approximate,
+        "the sketch served, and the report says the answer is an estimate: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_count_distinct_ask_builds_a_sketch_cube() {
+    // What the optimizer sees is the ask; what it can store is the sketch —
+    // the build normalises count(distinct) to approx_distinct partials.
+    let (session, table) = with_sketch_cube(AggFunc::CountDistinct).await;
+    session
+        .sql("SET quarry.approximate = true")
+        .await
+        .expect("opt in");
+    let rows = session
+        .sql("SELECT day, count(distinct tenant_id) FROM events GROUP BY day")
+        .await
+        .expect("sql");
+    assert_eq!(day_counts(&rows), BTreeMap::from([(1, 2), (2, 2)]));
+    let report = table.last_scan().expect("report");
+    assert!(report.substituted && report.approximate);
+}
+
+#[tokio::test]
+async fn count_distinct_asks_make_the_optimizer_build_a_sketch() {
+    let shared = quarry::engine::shared(Registry::new());
+    let table = Arc::new(table(SnapshotId(810)).with_shared_registry(Arc::clone(&shared)));
+    let session = session();
+    session.register("events", Arc::clone(&table)).expect("reg");
+
+    let mut optimizer = quarry::engine::Optimizer::new(
+        shared,
+        quarry::workload::Policy::automatic(1_000_000_000).with_min_queries(2),
+    );
+
+    // `count(distinct)` observed repeatedly — the only mergeable thing the
+    // workload can become is a sketch.
+    let sql = "SELECT day, count(distinct tenant_id) FROM events GROUP BY day";
+    for _ in 0..2 {
+        session.sql(sql).await.expect("sql");
+        let report = table.last_scan().expect("scan");
+        optimizer.observe(report.observation(1024));
+    }
+
+    let round = optimizer.round(&session, &table).await;
+    assert_eq!(round.built.len(), 1, "the ask earned a cube: {round:?}");
+
+    // Still exact by default: the built cube holds estimates, and the
+    // session never opted in.
+    let rows = session.sql(sql).await.expect("sql");
+    assert_eq!(day_counts(&rows), BTreeMap::from([(1, 2), (2, 2)]));
+    assert!(!table.last_scan().expect("report").substituted);
+
+    session
+        .sql("SET quarry.approximate = true")
+        .await
+        .expect("opt in");
+    let rows = session.sql(sql).await.expect("sql");
+    assert_eq!(day_counts(&rows), BTreeMap::from([(1, 2), (2, 2)]));
+    let report = table.last_scan().expect("report");
+    assert!(report.substituted && report.approximate);
+}

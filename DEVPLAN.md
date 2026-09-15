@@ -771,8 +771,11 @@ L3 reusable computation      PARTIAL — `FilterSet` reuses a filter's
                              by ComputeID) — revisit when telemetry
                              demands it
 FTS / vector / spatial       FTS needs a MATCH predicate variant; vector
-                             and sketch aggregates are approximate and need
-                             the approximate-answer marker decided first
+                             indexes remain gated on a distance-predicate
+                             shape. Sketch aggregates landed: HLL states
+                             serve `approx_distinct` unconditionally and
+                             `count(distinct)` under the session's
+                             `quarry.approximate` opt-in
 join accelerators            need a repeated-join workload to justify
 SegmentDirectory             pays only once the registry is observed
                              probing hundreds of pieces per query
@@ -1945,3 +1948,30 @@ what it scanned, and `build_proposed_filter_set` returns `None` when the
 filter admits all of it — `Declined::NoAdvantage`, the same verdict an
 index the format makes redundant gets. On refresh, an admits-everything
 rebuild leaves the stale piece for retirement to collect.
+
+## Phase 33 — Approximate answers, gated `[x]`
+
+The taxonomy's load-bearing decision landed as a session opt-in rather
+than a marker on every answer: `SET quarry.approximate = true` (a
+`ConfigExtension` registered at session build) lets stored estimates
+serve exact asks. Without it, exact-only holds — a query that wrote
+`approx_distinct` opted itself in; a query that wrote `count(distinct)`
+gets the exact scan.
+
+- **`count(distinct)` is an ask, never a store.** `AggFunc::CountDistinct`
+  describes the query; a cube that wants to answer it stores
+  `ApproxDistinct` partials, because distinct sets cannot merge. The
+  build normalises; coverage admits the sketch only when the session
+  opted in (`Measure::computable_from`'s one asymmetric case).
+- **The sketch is an Ertl HyperLogLog** — 2^14 register bytes, hashed
+  through `StableHasher` so stored states stay valid across releases.
+  `quarry_hll_state` builds registers per group at cube build;
+  `quarry_hll_merge` combines them back into the estimate at serve.
+- **The report says so.** `ScanReport.approximate` is set whenever a
+  sketch answered a measure — by `approx_distinct`'s own ask or by the
+  opt-in — so callers can tell an estimate from an exact answer.
+
+The loop test is the point: `count(distinct tenant_id)` observed twice,
+the round builds the cube (normalising to sketch partials), and the
+served path stays exact until `SET quarry.approximate = true` — then the
+sketch answers, flagged approximate.

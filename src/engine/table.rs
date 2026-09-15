@@ -87,6 +87,12 @@ pub struct ScanReport {
     pub also_scanned: BTreeSet<FileId>,
     /// Whether stored rows were read in place of the table.
     pub substituted: bool,
+    /// Whether the served answer is an estimate rather than exact.
+    ///
+    /// `true` when stored sketch partials answered a measure — the query
+    /// asked `approx_distinct`, or asked `count(distinct)` with the
+    /// session's `quarry.approximate` opt-in. Never set by omission.
+    pub approximate: bool,
     /// Identity of the plan that was looked up.
     ///
     /// A caller wanting to *store* this query's result needs the same key the
@@ -600,24 +606,25 @@ impl QuarryTable {
 
     /// One measure expression, or `None` if it is not one a cube can hold.
     ///
-    /// Only a plain `func(column)` or `count(*)` qualifies: a `DISTINCT`, a
-    /// `FILTER`, or an expression argument each computes something a stored
-    /// partial cannot reproduce.
+    /// Only a plain `func(column)` or `count(*)` qualifies: a `FILTER` or an
+    /// expression argument computes something a stored partial cannot
+    /// reproduce. `DISTINCT` qualifies for `count` alone — it asks for the
+    /// estimate a sketch cube stores — and `approx_distinct` is that
+    /// sketch's own name.
     pub(crate) fn measure(&self, expr: &Expr) -> Option<Measure> {
         let Expr::AggregateFunction(aggregate) = expr else {
             return None;
         };
-        if aggregate.params.distinct
-            || aggregate.params.filter.is_some()
-            || aggregate.params.order_by.is_some()
-        {
+        if aggregate.params.filter.is_some() || aggregate.params.order_by.is_some() {
             return None;
         }
-        let func = match aggregate.func.name() {
-            "count" => AggFunc::Count,
-            "sum" => AggFunc::Sum,
-            "min" => AggFunc::Min,
-            "max" => AggFunc::Max,
+        let func = match (aggregate.func.name(), aggregate.params.distinct) {
+            ("count", true) => AggFunc::CountDistinct,
+            ("count", false) => AggFunc::Count,
+            ("sum", false) => AggFunc::Sum,
+            ("min", false) => AggFunc::Min,
+            ("max", false) => AggFunc::Max,
+            ("approx_distinct" | "approx_count_distinct", false) => AggFunc::ApproxDistinct,
             _ => return None,
         };
         let field = match aggregate.params.args.as_slice() {
@@ -761,6 +768,7 @@ impl QuarryTable {
                     used: vec![candidate.derived.id.0.clone()],
                     also_scanned,
                     substituted: true,
+                    approximate: false,
                     plan_hash,
                     bytes_if_full_scan,
                     fingerprint: fingerprint.clone(),
@@ -779,6 +787,7 @@ impl QuarryTable {
                 used: pieces.iter().map(|p| p.derived.id.0.clone()).collect(),
                 also_scanned: residual,
                 substituted: false,
+                approximate: false,
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint: fingerprint.clone(),
@@ -796,6 +805,7 @@ impl QuarryTable {
                 used: Vec::new(),
                 also_scanned: BTreeSet::new(),
                 substituted: false,
+                approximate: false,
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint,

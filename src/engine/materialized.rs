@@ -70,6 +70,8 @@ impl Rollup {
                 AggFunc::Sum => "sum",
                 AggFunc::Min => "min",
                 AggFunc::Max => "max",
+                AggFunc::CountDistinct => "count_distinct",
+                AggFunc::ApproxDistinct => "approx_distinct",
             }
         ))
     }

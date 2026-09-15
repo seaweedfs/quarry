@@ -332,13 +332,21 @@ pub enum AggFunc {
     Min,
     /// `MAX`.
     Max,
+    /// `COUNT(DISTINCT x)` — exact, and not roll-up-able: distinct sets do
+    /// not merge by adding, so a cube never stores it. It exists as an ask
+    /// a stored [`AggFunc::ApproxDistinct`] may answer for opted-in sessions.
+    CountDistinct,
+    /// `approx_distinct(x)` — stored as mergeable sketch partials.
+    ApproxDistinct,
 }
 
 impl AggFunc {
     /// The function that combines this one's partials.
     ///
     /// Stored counts roll up by summing; everything else combines through
-    /// itself.
+    /// itself. A stored sketch merges with itself — `ApproxDistinct`
+    /// partials are `HyperLogLog` states, and merging is the same operation
+    /// the function name denotes.
     pub fn rollup(self) -> AggFunc {
         match self {
             AggFunc::Count => AggFunc::Sum,
@@ -381,10 +389,17 @@ impl Measure {
     /// minima minimise. `Avg` is deliberately absent from [`AggFunc`]: a cube
     /// that wants to answer averages stores `Sum` and `Count` and divides.
     ///
-    /// `approximate` admits the asymmetric cases: an exact ask answered by a
-    /// stored estimate, which only an opted-in session may ask.
-    fn computable_from(&self, stored: Measure, _approximate: bool) -> bool {
-        self.func == stored.func && self.field == stored.field
+    /// `approximate` admits the one asymmetric case: an exact `CountDistinct`
+    /// answered by a stored estimate, which only an opted-in session may ask.
+    /// Nothing else crosses: a count cannot be un-sketched into a sketch.
+    pub(crate) fn computable_from(&self, stored: Measure, approximate: bool) -> bool {
+        if self.func == stored.func && self.field == stored.field {
+            return true;
+        }
+        approximate
+            && self.func == AggFunc::CountDistinct
+            && stored.func == AggFunc::ApproxDistinct
+            && self.field == stored.field
     }
 }
 

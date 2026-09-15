@@ -31,7 +31,9 @@ use datafusion::physical_plan::collect;
 use datafusion::scalar::ScalarValue;
 use object_store::path::Path as ObjectPath;
 
-use crate::derived::{Derived, DerivedId, FieldId, Filter, PolicyFingerprint, Source};
+use crate::derived::{
+    AggFunc, Aggregate, Derived, DerivedId, FieldId, Filter, Measure, PolicyFingerprint, Source,
+};
 use crate::kinds::{Bitmap, FilterSet, Index};
 use crate::snapshot::FileId;
 use crate::workload::AggregateAsk;
@@ -633,15 +635,34 @@ pub async fn build_cube(
     ask: &AggregateAsk,
     id: DerivedId,
 ) -> DfResult<Derived> {
-    let names: BTreeMap<FieldId, String> = ask
-        .spec
+    // A `count(distinct)` ask stores sketch partials — exact distinct sets
+    // cannot merge — so the stored spec records what was actually stored.
+    let spec = Aggregate {
+        group_by: ask.spec.group_by.clone(),
+        measures: ask
+            .spec
+            .measures
+            .iter()
+            .map(|m| {
+                if m.func == AggFunc::CountDistinct {
+                    Measure {
+                        func: AggFunc::ApproxDistinct,
+                        field: m.field,
+                    }
+                } else {
+                    *m
+                }
+            })
+            .collect(),
+    };
+    let names: BTreeMap<FieldId, String> = spec
         .group_by
         .iter()
         .copied()
-        .chain(ask.spec.measures.iter().filter_map(|m| m.field))
+        .chain(spec.measures.iter().filter_map(|m| m.field))
         .filter_map(|field| Some((field, table.column_of(field)?.to_owned())))
         .collect();
-    let rollup = Rollup::new(ask.spec.clone(), names);
+    let rollup = Rollup::new(spec.clone(), names);
 
     let source = format!("__quarry_cube_{}", id.0.replace(':', "_"));
     session
@@ -652,23 +673,33 @@ pub async fn build_cube(
         )
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
-    let keys: Vec<&str> = ask
-        .spec
+    let keys: Vec<&str> = spec
         .group_by
         .iter()
         .filter_map(|field| rollup.key_name(*field))
         .collect();
-    let measures: Vec<String> = ask
-        .spec
+    let measures: Vec<String> = spec
         .measures
         .iter()
-        .filter_map(|m| rollup.measure_name(m))
-        .map(|name| {
-            let (func, arg) = name.split_once('(').expect("measure name");
-            format!(
-                "{func}({arg}) AS \"{name}\"",
-                arg = arg.trim_end_matches(')')
-            )
+        .filter_map(|m| {
+            let name = rollup.measure_name(m)?;
+            let (_, arg) = name.split_once('(').expect("measure name");
+            let func = match m.func {
+                // The stored column is `approx_distinct(field)`; the build
+                // function emits the sketch's bytes, not the count.
+                AggFunc::ApproxDistinct => "quarry_hll_state",
+                AggFunc::Count => "count",
+                AggFunc::Sum => "sum",
+                AggFunc::Min => "min",
+                AggFunc::Max => "max",
+                AggFunc::CountDistinct => {
+                    unreachable!("the stored spec holds no distinct count")
+                }
+            };
+            Some(format!(
+                "{func}({}) AS \"{name}\"",
+                arg.trim_end_matches(')')
+            ))
         })
         .collect();
     let sql = format!(
