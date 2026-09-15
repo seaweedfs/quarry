@@ -84,6 +84,31 @@ fn write_parquet(dir: &Path, name: &str, tenant: i64, rows: usize) -> (FileId, u
     (FileId(path.to_string_lossy().into_owned()), size)
 }
 
+/// A data file with one row group per entry — each group's rows all share
+/// that group's tenant.
+fn write_parquet_grouped(dir: &Path, name: &str, groups: &[Vec<i64>]) -> (FileId, u64) {
+    let path = dir.join(name);
+    let file = fs::File::create(&path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema(), None).expect("writer");
+
+    for tenants in groups {
+        let tenants_col: Int64Array = tenants.iter().map(|t| Some(*t)).collect();
+        let messages: StringArray = tenants
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Some(format!("message {i} with some padding to take up room")))
+            .collect();
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(tenants_col), Arc::new(messages)])
+            .expect("batch");
+        writer.write(&batch).expect("write");
+        writer.flush().expect("close row group");
+    }
+    writer.close().expect("close");
+
+    let size = fs::metadata(&path).expect("stat").len();
+    (FileId(path.to_string_lossy().into_owned()), size)
+}
+
 struct Fixture {
     dir: PathBuf,
     sizes: BTreeMap<FileId, u64>,
@@ -1728,4 +1753,117 @@ async fn a_commit_notification_retries_a_build_the_unchanged_table_suppressed() 
             .any(|(_, why)| *why == Declined::BuildFailed),
         "a pushed commit lifts the suppression: {round:?}"
     );
+}
+
+#[tokio::test]
+async fn a_low_cardinality_field_earns_a_row_level_bitmap() {
+    use quarry::derived::{Decision, Predicate, Query, Rewrite, Scope};
+
+    // One file, two row groups, two tenants — the read shows 2 distinct
+    // values in a file with interior structure, so the build picks the
+    // row-level postings.
+    let dir = scratch("bitmap_choice");
+    let (a, a_size) = write_parquet_grouped(&dir, "a.parquet", &[vec![1; 100], vec![2; 100]]);
+    let graph = SnapshotGraph::new().with(Snapshot::root(SnapshotId(1)).with_clean_file(a.clone()));
+    let table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(1),
+        graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .on_object_store(ObjectStoreUrl::local_filesystem())
+    .with_parquet_file(a.clone(), a_size);
+
+    let quarry = quarry();
+    let derived = build_proposed_index(
+        &quarry.session(),
+        &table,
+        TENANT_FIELD,
+        index_id(&TableId("events".into()), TENANT_FIELD),
+        POLICY,
+    )
+    .await
+    .expect("build");
+
+    let query = Query {
+        table: TableId("events".into()),
+        snapshot: SnapshotId(1),
+        policy: POLICY,
+        plan_hash: 0,
+        plan: None,
+        projected: BTreeSet::from([TENANT_FIELD]),
+        predicates: vec![Predicate::Eq {
+            field: TENANT_FIELD,
+            value: hash_scalar(&ScalarValue::Int64(Some(1))),
+        }],
+        aggregate: None,
+    };
+    match derived.may_serve(&query, &graph) {
+        Decision::Use(Rewrite::Prune { files }) => {
+            assert!(
+                matches!(files.get(&a), Some(Scope::Rows(_))),
+                "a bitmap's postings name rows: {files:?}"
+            );
+        }
+        other => panic!("expected the bitmap to serve, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_high_cardinality_field_earns_a_file_level_index() {
+    use quarry::derived::{Decision, Predicate, Query, Rewrite, Scope};
+
+    // A hundred distinct tenants — the row-level postings would just be a
+    // dearer file index, so the build keeps the coarser kind.
+    let dir = scratch("index_choice");
+    let (a, a_size) =
+        write_parquet_grouped(&dir, "a.parquet", &[(0..70).collect(), (70..100).collect()]);
+    let graph = SnapshotGraph::new().with(Snapshot::root(SnapshotId(1)).with_clean_file(a.clone()));
+    let table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(1),
+        graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .on_object_store(ObjectStoreUrl::local_filesystem())
+    .with_parquet_file(a.clone(), a_size);
+
+    let quarry = quarry();
+    let derived = build_proposed_index(
+        &quarry.session(),
+        &table,
+        TENANT_FIELD,
+        index_id(&TableId("events".into()), TENANT_FIELD),
+        POLICY,
+    )
+    .await
+    .expect("build");
+
+    let query = Query {
+        table: TableId("events".into()),
+        snapshot: SnapshotId(1),
+        policy: POLICY,
+        plan_hash: 0,
+        plan: None,
+        projected: BTreeSet::from([TENANT_FIELD]),
+        predicates: vec![Predicate::Eq {
+            field: TENANT_FIELD,
+            value: hash_scalar(&ScalarValue::Int64(Some(5))),
+        }],
+        aggregate: None,
+    };
+    match derived.may_serve(&query, &graph) {
+        Decision::Use(Rewrite::Prune { files }) => {
+            assert_eq!(
+                files.get(&a),
+                Some(&Scope::Whole),
+                "an index's postings name files, not rows"
+            );
+        }
+        other => panic!("expected the index to serve, got {other:?}"),
+    }
 }

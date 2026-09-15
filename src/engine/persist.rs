@@ -70,7 +70,7 @@ use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
 use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
-use crate::kinds::Index;
+use crate::kinds::{Bitmap, Index};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
 use crate::stable_hash::HASH_VERSION;
@@ -81,6 +81,9 @@ use crate::workload::{Fingerprint, Seen, Workload};
 /// Versioned in the name: a change to the layout below becomes a different
 /// type, which an older reader skips rather than misreads.
 pub const QUARRY_EQ_INDEX_V2: &str = "quarry-eq-index-v2";
+
+/// The blob type for a row-level [`Bitmap`] index.
+pub const QUARRY_BITMAP_V1: &str = "quarry-bitmap-v1";
 
 /// Property carrying the hash version the postings were built with.
 const HASH_VERSION_PROPERTY: &str = "quarry.hash-version";
@@ -259,6 +262,86 @@ fn decode(field: FieldId, bytes: &[u8]) -> Option<Index> {
     Some(index)
 }
 
+fn encode_bitmap(bitmap: &Bitmap) -> Vec<u8> {
+    let paths: Vec<&FileId> = bitmap
+        .postings()
+        .flat_map(|(_, files)| files.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let number_of: BTreeMap<&FileId, u32> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (*file, index as u32))
+        .collect();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for file in &paths {
+        let bytes = file.0.as_bytes();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    let values = bitmap.postings().count() as u64;
+    out.extend_from_slice(&values.to_le_bytes());
+    for (value, files) in bitmap.postings() {
+        out.extend_from_slice(&value.to_le_bytes());
+        out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (file, groups) in files {
+            out.extend_from_slice(&number_of[file].to_le_bytes());
+            out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+            for (group, rows) in groups {
+                out.extend_from_slice(&group.to_le_bytes());
+                out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for row in rows {
+                    out.extend_from_slice(&row.to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read row-level postings back, or `None` if the bytes are not a
+/// well-formed bitmap.
+///
+/// Same discipline [`decode`] keeps: any inconsistency is a `None`, because
+/// a partial bitmap under-selects rows and that is the wrong direction.
+fn decode_bitmap(field: FieldId, bytes: &[u8]) -> Option<Bitmap> {
+    let mut cursor = Cursor { bytes, at: 0 };
+
+    let path_count = cursor.u32()?;
+    let mut paths = Vec::with_capacity(path_count.min(1 << 16) as usize);
+    for _ in 0..path_count {
+        let len = cursor.u32()? as usize;
+        paths.push(FileId(String::from_utf8(cursor.take(len)?.to_vec()).ok()?));
+    }
+
+    let values = cursor.u64()?;
+    let mut bitmap = Bitmap::new(field);
+    for _ in 0..values {
+        let value = cursor.u64()?;
+        let files = cursor.u32()?;
+        for _ in 0..files {
+            let file = paths.get(cursor.u32()? as usize)?.clone();
+            let groups = cursor.u32()?;
+            for _ in 0..groups {
+                let group = cursor.u32()?;
+                let rows = cursor.u32()?;
+                for _ in 0..rows {
+                    bitmap.insert(value, file.clone(), group, cursor.u64()?);
+                }
+            }
+        }
+    }
+
+    if cursor.at != bytes.len() {
+        return None;
+    }
+    Some(bitmap)
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -393,6 +476,80 @@ pub async fn read_index(
         if let Some(index) = decode(field, blob.data()) {
             let bytes = blob.data().len() as u64;
             return Ok(Some((index.with_bytes(bytes), policy)));
+        }
+    }
+    Ok(None)
+}
+
+/// Write a bitmap to storage as a Puffin blob — [`write_index`]'s contract
+/// verbatim, only the blob type and postings differ.
+pub async fn write_bitmap(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    policy: PolicyFingerprint,
+    bitmap: &Bitmap,
+) -> iceberg::Result<String> {
+    let path = layout.index_path(table, bitmap.field(), at);
+    let output = file_io.new_output(&path)?;
+
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_BITMAP_V1.to_owned())
+                .fields(vec![bitmap.field() as i32])
+                .snapshot_id(at.0)
+                .sequence_number(0)
+                .data(encode_bitmap(bitmap))
+                .properties(HashMap::from([
+                    (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
+                    (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                ]))
+                .build(),
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(path)
+}
+
+/// Read one bitmap back, with [`read_index`]'s refusals: wrong type, wrong
+/// hash version, or bytes that do not decode exactly are all `None`.
+pub async fn read_bitmap(
+    file_io: &FileIO,
+    path: &str,
+    field: FieldId,
+) -> iceberg::Result<Option<(Bitmap, PolicyFingerprint)>> {
+    if !is_plausible_puffin(file_io, path).await? {
+        return Ok(None);
+    }
+    let reader = PuffinReader::new(file_io.new_input(path)?);
+    let metadata = reader.file_metadata().await?;
+
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_BITMAP_V1 {
+            continue;
+        }
+        let properties = blob_metadata.properties();
+        if properties.get(HASH_VERSION_PROPERTY).map(String::as_str)
+            != Some(&HASH_VERSION.to_string())
+        {
+            continue;
+        }
+        let policy = properties
+            .get(POLICY_PROPERTY)
+            .and_then(|raw| raw.parse().ok())
+            .map(PolicyFingerprint);
+        let Some(policy) = policy else {
+            continue;
+        };
+
+        let blob = reader.blob(blob_metadata).await?;
+        if let Some(bitmap) = decode_bitmap(field, blob.data()) {
+            let bytes = blob.data().len() as u64;
+            return Ok(Some((bitmap.with_bytes(bytes), policy)));
         }
     }
     Ok(None)
@@ -649,10 +806,30 @@ pub async fn recover(
             recovered.discarded.push(readable);
             continue;
         }
-        match read_index(file_io, &readable, field).await? {
+        let read = match read_index(file_io, &readable, field).await? {
             Some((index, policy)) => {
-                let id = super::index_id(table, field);
                 let bytes = index.bytes_estimate();
+                Some((
+                    Box::new(index) as Box<dyn crate::derived::Kind>,
+                    bytes,
+                    policy,
+                ))
+            }
+            None => match read_bitmap(file_io, &readable, field).await? {
+                Some((bitmap, policy)) => {
+                    let bytes = bitmap.bytes_estimate();
+                    Some((
+                        Box::new(bitmap) as Box<dyn crate::derived::Kind>,
+                        bytes,
+                        policy,
+                    ))
+                }
+                None => None,
+            },
+        };
+        match read {
+            Some((kind, bytes, policy)) => {
+                let id = super::index_id(table, field);
                 recovered.fields.insert(id.clone(), field);
                 recovered.registry.register(Derived::new(
                     id,
@@ -662,7 +839,7 @@ pub async fn recover(
                     },
                     policy,
                     bytes,
-                    Box::new(index),
+                    kind,
                 ));
             }
             None => recovered.discarded.push(readable),
@@ -866,6 +1043,19 @@ impl Store {
         write_index(&self.file_io, &self.layout, table, at, policy, index).await
     }
 
+    /// Write a bitmap and report where it went — [`Store::write`]'s contract
+    /// for the row-level kind. Both share the `(table, field, snapshot)`
+    /// path: one field gets one accelerator, whichever shape it took.
+    pub async fn write_bitmap(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        policy: PolicyFingerprint,
+        bitmap: &Bitmap,
+    ) -> iceberg::Result<String> {
+        write_bitmap(&self.file_io, &self.layout, table, at, policy, bitmap).await
+    }
+
     /// Rebuild a table's registry from storage.
     pub async fn recover(
         &self,
@@ -946,7 +1136,7 @@ impl Store {
             return Ok(recovered);
         }
         for entry in advertised(stats) {
-            if entry.kind != QUARRY_EQ_INDEX_V2 {
+            if !matches!(entry.kind.as_str(), QUARRY_EQ_INDEX_V2 | QUARRY_BITMAP_V1) {
                 continue;
             }
             let Some(&field) = entry.fields.first() else {
@@ -955,10 +1145,30 @@ impl Store {
             let Ok(field) = u32::try_from(field) else {
                 continue;
             };
-            match read_index(&self.file_io, &entry.path, field).await? {
+            let read = match read_index(&self.file_io, &entry.path, field).await? {
                 Some((index, policy)) => {
-                    let id = super::index_id(table, field);
                     let bytes = index.bytes_estimate();
+                    Some((
+                        Box::new(index) as Box<dyn crate::derived::Kind>,
+                        bytes,
+                        policy,
+                    ))
+                }
+                None => match read_bitmap(&self.file_io, &entry.path, field).await? {
+                    Some((bitmap, policy)) => {
+                        let bytes = bitmap.bytes_estimate();
+                        Some((
+                            Box::new(bitmap) as Box<dyn crate::derived::Kind>,
+                            bytes,
+                            policy,
+                        ))
+                    }
+                    None => None,
+                },
+            };
+            match read {
+                Some((kind, bytes, policy)) => {
+                    let id = super::index_id(table, field);
                     recovered.fields.insert(id.clone(), field);
                     recovered.registry.register(Derived::new(
                         id,
@@ -968,7 +1178,7 @@ impl Store {
                         },
                         policy,
                         bytes,
-                        Box::new(index),
+                        kind,
                     ));
                 }
                 None => recovered.discarded.push(entry.path),

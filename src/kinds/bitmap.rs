@@ -67,6 +67,51 @@ impl Bitmap {
     pub fn field(&self) -> FieldId {
         self.field
     }
+
+    /// Every hashed value and its `file → group → rows` postings, in a
+    /// fixed order — written to storage, so the bytes are a function of the
+    /// contents alone.
+    pub fn postings(
+        &self,
+    ) -> impl Iterator<Item = (u64, &BTreeMap<FileId, BTreeMap<u32, BTreeSet<u64>>>)> {
+        self.postings.iter().map(|(value, files)| (*value, files))
+    }
+
+    /// Exactly how many bytes this bitmap occupies when written down.
+    ///
+    /// The same discipline [`Index::encoded_len`] keeps: computed because a
+    /// storage budget is enforced against it, and agreeing with what a
+    /// recovered bitmap reports so the same piece is not sized differently
+    /// either side of a restart.
+    pub fn encoded_len(&self) -> u64 {
+        let paths: BTreeSet<&FileId> = self
+            .postings
+            .values()
+            .flat_map(|files| files.keys())
+            .collect();
+
+        let mut total = 4u64;
+        for file in &paths {
+            total += 4 + file.0.len() as u64;
+        }
+
+        total += 8; // the number of values
+        for files in self.postings.values() {
+            total += 8 + 4; // the hashed value, and how many files hold it
+            for groups in files.values() {
+                total += 4 + 4; // the file, and how many groups hold it
+                for rows in groups.values() {
+                    total += 4 + 4 + 8 * rows.len() as u64; // group, count, rows
+                }
+            }
+        }
+        total
+    }
+
+    /// How many bytes this bitmap was declared to occupy.
+    pub fn bytes_estimate(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Kind for Bitmap {

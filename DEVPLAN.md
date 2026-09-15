@@ -1841,3 +1841,29 @@ The telling test is the negative one:
 `a_bitmap_that_names_the_wrong_row_loses_it` admits only a non-matching
 row and the answer shrinks — the mask executes, and the contract's
 "complete postings" precondition is shown, not just stated.
+
+---
+
+## Phase 28 — Bitmaps the loop can build `[x]`
+
+A kind that cannot be built is a fixture, not an accelerator. `Bitmap`
+now has the full lifecycle:
+
+- **`build_bitmap`** — the same single column read `build_index` makes,
+  positions preserved through nulls, plus the footer's per-group row
+  counts to turn each value's ordinal into its (group, row) posting.
+- **Granularity chosen at build, not proposal.** The proposal names a
+  field; `build_proposed_index` reads it once and picks: at most 64
+  distinct values *and* files with interior structure earns the bitmap,
+  anything else the cheaper file-level index. The decision runs on the
+  data just read — cardinality is free at build time and unknowable
+  cheaply before it.
+- **Persistence** — `quarry-bitmap-v1`, the same shape as the index
+  blob (path table, then postings) with one more level. Both kinds
+  share the `(table, field, snapshot)` path and the `idx:{t}:{f}` id:
+  one field gets one accelerator, and a kind change replaces rather
+  than accumulates. Recovery tries the index decode first and falls to
+  the bitmap, so a restarted engine finds whichever shape was written.
+
+The choice tests pin the boundary: two tenants across two row groups
+earns `Scope::Rows`; a hundred earns `Scope::Whole`.

@@ -11,7 +11,7 @@
 
 #![cfg(all(feature = "engine", feature = "iceberg"))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,9 +27,10 @@ use url::Url;
 
 use iceberg::puffin::{Blob, CompressionCodec, PuffinWriter};
 use quarry::derived::PolicyFingerprint;
+use quarry::derived::{Decision, Predicate, Query, Rewrite, Scope};
 use quarry::engine::{
-    Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_index,
-    hash_scalar, index_id, read_index, shared, write_index,
+    Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_bitmap,
+    build_index, hash_scalar, index_id, read_bitmap, read_index, shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -69,6 +70,30 @@ fn write_parquet(dir: &Path, name: &str, tenant: i64, rows: usize) -> (FileId, u
     let batch =
         RecordBatch::try_new(schema(), vec![Arc::new(tenants), Arc::new(messages)]).expect("batch");
     writer.write(&batch).expect("write");
+    writer.close().expect("close");
+
+    let size = fs::metadata(&path).expect("stat").len();
+    (FileId(path.to_string_lossy().into_owned()), size)
+}
+
+/// A data file with one row group per entry — the shape a bitmap posts.
+fn write_parquet_grouped(dir: &Path, name: &str, groups: &[Vec<i64>]) -> (FileId, u64) {
+    let path = dir.join(name);
+    let file = fs::File::create(&path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema(), None).expect("writer");
+
+    for tenants in groups {
+        let tenants_col: Int64Array = tenants.iter().map(|t| Some(*t)).collect();
+        let messages: StringArray = tenants
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Some(format!("row {i}")))
+            .collect();
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(tenants_col), Arc::new(messages)])
+            .expect("batch");
+        writer.write(&batch).expect("write");
+        writer.flush().expect("close row group");
+    }
     writer.close().expect("close");
 
     let size = fs::metadata(&path).expect("stat").len();
@@ -923,4 +948,97 @@ async fn a_manifest_for_a_forgotten_snapshot_is_discarded() {
         vec![stats.statistics_path.clone()],
         "a manifest for a snapshot the table forgot is disposable"
     );
+}
+
+#[tokio::test]
+async fn a_bitmap_survives_being_written_and_read_back() {
+    let dir = scratch("persist_bitmap");
+
+    // Two files, two groups each — postings with real rows to name.
+    let mut sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    for (index, tenants) in [
+        vec![vec![1; 100], vec![2; 100]],
+        vec![vec![3; 100], vec![1; 100]],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (file, size) = write_parquet_grouped(&dir, &format!("{index}.parquet"), &tenants);
+        sizes.insert(file.clone(), size);
+        files.push(file);
+    }
+    let mut snapshot = Snapshot::root(SnapshotId(1));
+    for file in &files {
+        snapshot = snapshot.with_clean_file(file.clone());
+    }
+    let graph = SnapshotGraph::new().with(snapshot);
+
+    let mut table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(1),
+        graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .on_object_store(ObjectStoreUrl::local_filesystem());
+    for (file, size) in &sizes {
+        table = table.with_parquet_file(file.clone(), *size);
+    }
+
+    let fixture_dir = Fixture {
+        dir: dir.clone(),
+        sizes,
+        graph,
+        files,
+    };
+    let (file_io, store) = stacks(&fixture_dir);
+
+    let session = quarry().session();
+    let built = build_bitmap(&session, &table, TENANT_FIELD)
+        .await
+        .expect("build");
+
+    let path = store
+        .write_bitmap(&events(), SnapshotId(1), POLICY, &built)
+        .await
+        .expect("write");
+    let (read, policy) = read_bitmap(&file_io, &path, TENANT_FIELD)
+        .await
+        .expect("read")
+        .expect("a usable bitmap");
+    assert_eq!(policy, POLICY);
+    assert_eq!(read, built, "postings round-trip exactly");
+
+    // And a restart finds it, serving at row granularity.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = index_id(&events(), TENANT_FIELD);
+    let derived = recovered.registry.get(&id).expect("registered");
+
+    let query = Query {
+        table: events(),
+        snapshot: SnapshotId(1),
+        policy: POLICY,
+        plan_hash: 0,
+        plan: None,
+        projected: BTreeSet::from([TENANT_FIELD]),
+        predicates: vec![Predicate::Eq {
+            field: TENANT_FIELD,
+            value: hash_scalar(&ScalarValue::Int64(Some(1))),
+        }],
+        aggregate: None,
+    };
+    match derived.may_serve(&query, &fixture_dir.graph) {
+        Decision::Use(Rewrite::Prune { files }) => {
+            assert!(
+                files.values().all(|scope| matches!(scope, Scope::Rows(_))),
+                "the recovered piece posts rows: {files:?}"
+            );
+        }
+        other => panic!("expected the recovered bitmap to serve, got {other:?}"),
+    }
 }

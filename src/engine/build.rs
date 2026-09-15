@@ -29,11 +29,15 @@ use datafusion::scalar::ScalarValue;
 use object_store::path::Path as ObjectPath;
 
 use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
-use crate::kinds::Index;
+use crate::kinds::{Bitmap, Index};
 use crate::snapshot::FileId;
 use crate::workload::AggregateAsk;
 
 use super::{MaterializedResult, QuarryTable, Rollup, Session, hash_scalar};
+
+/// The most distinct values a field may hold for a bitmap to be the right
+/// instrument — past it, per-row postings are just a dearer file index.
+const MAX_BITMAP_CARDINALITY: usize = 64;
 
 /// How many *positions* in the file list to sample around.
 ///
@@ -55,36 +59,93 @@ pub async fn build_index(
     table: &QuarryTable,
     field: FieldId,
 ) -> DfResult<Index> {
+    let reads = column_reads(session, table, field).await?;
+    let index = populate_index(field, &reads);
+    // The exact encoded size, not an estimate: this is what the storage
+    // budget is enforced against, and it must match what a recovered index
+    // reports or the two disagree across a restart.
+    let bytes = index.encoded_len();
+    Ok(index.with_bytes(bytes))
+}
+
+/// Every file's column read, positions preserved and footer facts attached.
+async fn column_reads(
+    session: &Session,
+    table: &QuarryTable,
+    field: FieldId,
+) -> DfResult<Vec<(FileId, ColumnRead)>> {
     let Some(column) = table.column_of(field) else {
         return exec_err!("field {field} is not a column of this table");
     };
     let Some((url, files)) = table.parquet_files() else {
         return exec_err!("an in-memory table has no objects to index");
     };
+    let store = session.context().runtime_env().object_store(url)?;
 
     let schema = datafusion::catalog::TableProvider::schema(table);
     let Some((position, _)) = schema.column_with_name(column) else {
         return exec_err!("column {column} is not in the table's schema");
     };
 
-    let mut index = Index::new(field);
-
+    let mut reads = Vec::with_capacity(files.len());
     for (file, size) in files {
+        let read =
+            read_column_grouped(session, url, &store, &schema, position, file, *size).await?;
+        reads.push((file.clone(), read));
+    }
+    Ok(reads)
+}
+
+/// The file-level index the reads support.
+fn populate_index(field: FieldId, reads: &[(FileId, ColumnRead)]) -> Index {
+    let mut index = Index::new(field);
+    for (file, read) in reads {
         // One value may appear in many row groups; recording it once per file
         // is all the index holds.
         let mut seen = HashSet::new();
-        for value in read_column(session, url, &schema, position, file, *size).await? {
-            if seen.insert(value) {
-                index.insert(value, file.clone());
+        for value in read.values.iter().flatten() {
+            if seen.insert(*value) {
+                index.insert(*value, file.clone());
             }
         }
     }
+    index
+}
 
-    // The exact encoded size, not an estimate: this is what the storage
-    // budget is enforced against, and it must match what a recovered index
-    // reports or the two disagree across a restart.
-    let bytes = index.encoded_len();
-    Ok(index.with_bytes(bytes))
+/// The row-level bitmap the reads support.
+fn populate_bitmap(field: FieldId, reads: &[(FileId, ColumnRead)]) -> Bitmap {
+    let mut bitmap = Bitmap::new(field);
+    for (file, read) in reads {
+        for (row, value) in read.values.iter().enumerate() {
+            let row = row as u64;
+            let group = read.group_ends.partition_point(|end| row >= *end) as u32;
+            let start = if group == 0 {
+                0
+            } else {
+                read.group_ends[group as usize - 1]
+            };
+            if let Some(value) = value {
+                bitmap.insert(*value, file.clone(), group, row - start);
+            }
+        }
+    }
+    bitmap
+}
+
+/// Build a bitmap over `field`: postings down to the row inside its group.
+///
+/// The same read [`build_index`] makes, plus the footer's per-group row
+/// counts — they turn each value's ordinal in the file into the
+/// (group, row-in-group) pair the postings address by.
+pub async fn build_bitmap(
+    session: &Session,
+    table: &QuarryTable,
+    field: FieldId,
+) -> DfResult<Bitmap> {
+    let reads = column_reads(session, table, field).await?;
+    let bitmap = populate_bitmap(field, &reads);
+    let bytes = bitmap.encoded_len();
+    Ok(bitmap.with_bytes(bytes))
 }
 
 /// Build the index a proposal asked for, ready to register.
@@ -98,8 +159,31 @@ pub async fn build_proposed_index(
     id: DerivedId,
     policy: PolicyFingerprint,
 ) -> DfResult<Derived> {
-    let index = build_index(session, table, field).await?;
-    let bytes = index.bytes_estimate();
+    let reads = column_reads(session, table, field).await?;
+
+    // The proposal names a field, not a shape — the build picks the
+    // granularity from what the read showed. A field of few distinct
+    // values earns the row-level bitmap, whose postings stay small and
+    // which prunes inside files; but only where files actually have
+    // interior structure — against single-group files the finer postings
+    // cost more to store and skip nothing the coarser ones would not.
+    let distinct: HashSet<u64> = reads
+        .iter()
+        .flat_map(|(_, read)| read.values.iter().flatten().copied())
+        .collect();
+    let multi_group = reads.iter().any(|(_, read)| read.group_ends.len() > 1);
+
+    let (kind, bytes): (Box<dyn crate::derived::Kind>, u64) =
+        if distinct.len() <= MAX_BITMAP_CARDINALITY && multi_group {
+            let bitmap = populate_bitmap(field, &reads);
+            let bytes = bitmap.encoded_len();
+            (Box::new(bitmap.with_bytes(bytes)), bytes)
+        } else {
+            let index = populate_index(field, &reads);
+            let bytes = index.encoded_len();
+            (Box::new(index.with_bytes(bytes)), bytes)
+        };
+
     Ok(Derived::new(
         id,
         Source {
@@ -108,7 +192,7 @@ pub async fn build_proposed_index(
         },
         policy,
         bytes,
-        Box::new(index),
+        kind,
     ))
 }
 
@@ -195,6 +279,7 @@ pub async fn estimate_overlap(
         let values: HashSet<u64> = read_column(session, url, &schema, position, file, *size)
             .await?
             .into_iter()
+            .flatten()
             .collect();
         if !values.is_empty() {
             samples.push(values);
@@ -297,7 +382,43 @@ fn numeric_range(statistics: &Statistics) -> Option<(f64, f64)> {
     }
 }
 
-/// Every non-null value of one column of one object, hashed.
+/// One file's column read and the footer facts a row-level build needs.
+struct ColumnRead {
+    /// Every row's value, hashed — `None` where null, so the row's ordinal
+    /// in the file survives in the vector's.
+    values: Vec<Option<u64>>,
+    /// Cumulative row counts: group `g` holds ordinals `ends[g-1]..ends[g]`.
+    group_ends: Vec<u64>,
+}
+
+async fn read_column_grouped(
+    session: &Session,
+    url: &ObjectStoreUrl,
+    store: &Arc<dyn object_store::ObjectStore>,
+    schema: &datafusion::arrow::datatypes::SchemaRef,
+    position: usize,
+    file: &FileId,
+    size: u64,
+) -> DfResult<ColumnRead> {
+    let mut reader = ParquetObjectReader::new(Arc::clone(store), ObjectPath::from(file.0.as_str()))
+        .with_file_size(size);
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+
+    let mut group_ends = Vec::new();
+    let mut total = 0u64;
+    for group in metadata.metadata().row_groups() {
+        total += group.num_rows() as u64;
+        group_ends.push(total);
+    }
+
+    Ok(ColumnRead {
+        values: read_column(session, url, schema, position, file, size).await?,
+        group_ends,
+    })
+}
+
+/// Every value of one column of one object, hashed — `None` where null, so
+/// the row's position in the file survives in the vector's.
 async fn read_column(
     session: &Session,
     url: &ObjectStoreUrl,
@@ -305,7 +426,7 @@ async fn read_column(
     position: usize,
     file: &FileId,
     size: u64,
-) -> DfResult<Vec<u64>> {
+) -> DfResult<Vec<Option<u64>>> {
     let config = FileScanConfigBuilder::new(
         url.clone(),
         Arc::clone(schema),
@@ -323,13 +444,16 @@ async fn read_column(
         let column = batch.column(0);
         for row in 0..batch.num_rows() {
             if column.is_null(row) {
+                values.push(None);
                 continue;
             }
             // Via ScalarValue rather than reading the array's native type, so
             // that a value hashes identically whether it came from data here or
             // from a literal in a query. Slower than a typed path, and the
             // obvious thing to optimise once correctness is pinned.
-            values.push(hash_scalar(&ScalarValue::try_from_array(column, row)?));
+            values.push(Some(hash_scalar(&ScalarValue::try_from_array(
+                column, row,
+            )?)));
         }
     }
     Ok(values)

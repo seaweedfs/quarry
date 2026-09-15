@@ -31,8 +31,8 @@ mod store;
 mod table;
 
 pub use build::{
-    build_cube, build_index, build_proposed_index, columns, cube_id, estimate_overlap, index_id,
-    parquet_bounds,
+    build_bitmap, build_cube, build_index, build_proposed_index, columns, cube_id,
+    estimate_overlap, index_id, parquet_bounds,
 };
 pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
@@ -41,9 +41,9 @@ pub use materialized::{MaterializedResult, Rollup, hash_plan};
 pub use optimizer::{Declined, Optimizer, Retired, Round};
 #[cfg(feature = "iceberg")]
 pub use persist::{
-    Advertised, Layout, QUARRY_EQ_INDEX_V2, QUARRY_PATH_PROPERTY, QUARRY_WORKLOAD_V1, Recovered,
-    Store, advertised, discard, read_index, read_workload, recover, write_index, write_manifest,
-    write_workload,
+    Advertised, Layout, QUARRY_BITMAP_V1, QUARRY_EQ_INDEX_V2, QUARRY_PATH_PROPERTY,
+    QUARRY_WORKLOAD_V1, Recovered, Store, advertised, discard, read_bitmap, read_index,
+    read_workload, recover, write_bitmap, write_index, write_manifest, write_workload,
 };
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
