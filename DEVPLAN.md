@@ -1888,7 +1888,29 @@ both row sets.
 - **Positions, not predicates.** A filter set stores where the filter
   passed, not what it would say — so on any diff it reports
   `NeedsRebuild`, like the bitmap.
-- **No proposal wiring yet.** `Workload::proposals` sees fields, not
-  filter text; proposing filter sets wants the observation stream to
-  carry `plan.filters`. Noted as gated on demand — a repeated filtered
-  workload the index alone doesn't help.
+Then Phase 30 wired the loop.
+
+---
+
+## Phase 30 — The loop proposes filter sets `[x]`
+
+A kind nobody proposes is a fixture. `Observation` now carries the
+query's filters — canonical identity plus the SQL to rebuild it, the
+`FilterAsk` — and `Workload` counts them per filter across shapes, for
+the filters an index cannot serve (probeable conjuncts are the index's
+territory; a filter set there would duplicate it at row granularity).
+
+- **Determinism is the precondition.** `build_filter_set` refuses a
+  volatile expression: `random() > 0.5` replayed from stored positions
+  returns the build's coin flips, under-admitting rows a fresh draw
+  would pass. `Expr::is_volatile` makes the check honest.
+- **Same gates as cubes.** `proven` demotes what already failed to pay
+  for itself, `failed_at` stops thrash on the same head, the byte
+  budget applies after build. `built_filters` holds the clause for the
+  refresh arm — a stale set re-runs its filter, it doesn't decay.
+- **In-memory only.** Filter text carries literals; `by_filter` never
+  reaches the workload blob, same rule `by_ask` keeps.
+
+The loop test is the whole point: `tenant_id > 3` — a filter no index
+can probe — observed five times, built by the engine reading its own
+data, then serving at row granularity with the same answer.

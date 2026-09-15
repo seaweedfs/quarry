@@ -1326,6 +1326,7 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         bytes_read: bytes,
         bytes_if_full_scan: bytes,
         used: Vec::new(),
+        filters: Vec::new(),
     }
 }
 
@@ -1866,4 +1867,81 @@ async fn a_high_cardinality_field_earns_a_file_level_index() {
         }
         other => panic!("expected the index to serve, got {other:?}"),
     }
+}
+
+/// The whole loop for a filter set: an unindexable filter, observed enough,
+/// earns its cache — and the build is the engine's own, not hand-fed.
+#[tokio::test]
+async fn the_loop_builds_a_filter_set_for_an_unindexable_filter() {
+    let fixture = fixture("loop_filter_set");
+    // `>` is opaque — no equality index can probe it, so a filter set is the
+    // only thing the loop can offer this shape. Selective, too: a set that
+    // stores half the table's row positions would not earn its bytes.
+    let sql = "SELECT * FROM events WHERE tenant_id > 3";
+
+    let table_bytes: u64 = fixture.sizes.values().sum();
+    let registry = shared(Registry::new());
+    let served = Arc::new(shared_table(&fixture, Arc::clone(&registry)));
+
+    let mut optimizer = Optimizer::new(
+        Arc::clone(&registry),
+        mechanism_policy(Policy::automatic_pct(table_bytes, 50.0).with_min_queries(3)),
+    )
+    .for_reader(POLICY);
+
+    let quarry = quarry();
+    let session = quarry.session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register");
+
+    // OBSERVE: the same filter, unaided, five times.
+    for _ in 0..5 {
+        let rows: usize = session
+            .sql(sql)
+            .await
+            .expect("query")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 500, "tenant 4 only");
+
+        let report = served.last_scan().expect("a scan happened");
+        assert!(report.used.is_empty(), "nothing is built yet");
+        assert_eq!(report.filters.len(), 1, "the conjunct was observed");
+        optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
+    }
+
+    // PROPOSE + BUILD: the filter's own build, not a fixture's.
+    let round = optimizer.round(&session, &served).await;
+    assert_eq!(round.built.len(), 1, "one filter set built: {round:?}");
+    assert!(
+        round.built[0].0.starts_with("fset:"),
+        "a filter set, not an index: {:?}",
+        round.built
+    );
+
+    // SERVE: same answer, carried by the set.
+    let rows: usize = session
+        .sql(sql)
+        .await
+        .expect("query")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 500, "the answer must not change");
+    let report = served.last_scan().expect("a scan happened");
+    assert_eq!(
+        report.used.first().map(String::as_str),
+        Some(round.built[0].0.as_str()),
+        "the set the optimizer built is what served"
+    );
+    assert!(
+        report
+            .scopes
+            .values()
+            .all(|scope| matches!(scope, quarry::derived::Scope::Rows(_))),
+        "row-level scopes reached the plan: {:?}",
+        report.scopes
+    );
 }

@@ -173,6 +173,12 @@ pub async fn build_filter_set(
     let schema = datafusion::catalog::TableProvider::schema(table);
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let expr = session.context().parse_sql_expr(filter_sql, &df_schema)?;
+    // A volatile filter's passing rows are a stale draw, not a reusable
+    // answer — `random() > 0.5` replayed from positions returns the build's
+    // coin flips. Refuse it rather than serve it.
+    if expr.is_volatile() {
+        return exec_err!("a volatile filter's passing rows cannot be reused");
+    }
     let filter = table.canonical_filter(&expr);
 
     // Evaluate against only the columns the clause mentions.
@@ -188,7 +194,7 @@ pub async fn build_filter_set(
         &ExecutionProps::new(),
     )?;
 
-    let mut set = FilterSet::of(filter);
+    let mut set = FilterSet::of(filter.clone());
     for (file, size) in files {
         let mut reader =
             ParquetObjectReader::new(Arc::clone(&store), ObjectPath::from(file.0.as_str()))
@@ -236,6 +242,29 @@ pub async fn build_filter_set(
     }
     let bytes = set.encoded_len();
     Ok(set.with_bytes(bytes))
+}
+
+/// Build the filter set a proposal asked for, ready to register —
+/// [`build_filter_set`] plus the `Derived` wrapper the registry stores.
+pub async fn build_proposed_filter_set(
+    session: &Session,
+    table: &QuarryTable,
+    ask: &crate::workload::FilterAsk,
+    id: DerivedId,
+    policy: PolicyFingerprint,
+) -> DfResult<Derived> {
+    let set = build_filter_set(session, table, &ask.sql).await?;
+    let bytes = set.bytes_estimate();
+    Ok(Derived::new(
+        id,
+        Source {
+            table: table.table_id().clone(),
+            snapshot: table.snapshot(),
+        },
+        policy,
+        bytes,
+        Box::new(set),
+    ))
 }
 
 /// Build the index a proposal asked for, ready to register.

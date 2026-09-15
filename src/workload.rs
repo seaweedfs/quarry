@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
-use crate::derived::{Aggregate, DerivedId, FieldId, Plan, Predicate, Query};
+use crate::derived::{Aggregate, DerivedId, FieldId, Filter, Plan, Predicate, Query};
 use crate::layout::Spread;
 use crate::registry::Registry;
 use crate::snapshot::{SnapshotId, TableId};
@@ -143,6 +143,11 @@ pub struct Observation {
     /// Every named piece is credited with the observation — attribution of
     /// the saving between them is inherently ambiguous.
     pub used: Vec<DerivedId>,
+    /// The filters the query ran, kept whole — canonical identity plus the
+    /// SQL to rebuild it.
+    ///
+    /// Not persisted: the text carries literals. See [`FilterAsk`].
+    pub filters: Vec<FilterAsk>,
 }
 
 impl Observation {
@@ -216,8 +221,46 @@ impl ForeignScan {
             bytes_read: self.bytes_read,
             bytes_if_full_scan,
             used: Vec::new(),
+            // A foreign engine's filter text is in its dialect, not this
+            // one's canonical form — nothing to match a FilterSet by.
+            filters: Vec::new(),
         }
     }
+}
+
+/// One filter worth remembering: what it is, and how to run it.
+///
+/// Like [`AggregateAsk`], this keeps literal text — the filter's canonical
+/// rendering identifies it and its SQL re-executes it — so it is observed
+/// and proposed from but **not** persisted. A filter whose clause cannot be
+/// rendered back to SQL never becomes one of these.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FilterAsk {
+    /// The table the filter ran on.
+    pub table: TableId,
+    /// The canonical filter — the identity a [`FilterSet`] matches on.
+    pub filter: Filter,
+    /// The clause as SQL, so building one can evaluate it.
+    pub sql: String,
+}
+
+/// A filter set worth building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterProposal {
+    /// The table it would be built on.
+    pub table: TableId,
+    /// Which filter it caches.
+    pub ask: FilterAsk,
+    /// How many unaided queries asked it.
+    pub queries: u64,
+    /// Bytes those queries read.
+    pub bytes_scanned: u64,
+    /// The most it could possibly have saved: every byte those queries moved.
+    ///
+    /// A filter set still reads the candidate rows, so this is further from
+    /// honest than a cube's ceiling — but it only gates building, where a
+    /// bound suffices and an estimate would only pretend.
+    pub ceiling_usd: f64,
 }
 
 /// What has been seen for one query shape.
@@ -419,6 +462,8 @@ pub struct Workload {
     /// filters to bake, which a fingerprint has deliberately dropped.
     /// In-memory only — the literals inside never reach storage.
     by_ask: BTreeMap<AggregateAsk, Seen>,
+    /// In-memory only, for the same reason.
+    by_filter: BTreeMap<FilterAsk, Seen>,
 }
 
 impl Workload {
@@ -429,7 +474,10 @@ impl Workload {
 
     /// Record what a query cost.
     pub fn observe(&mut self, observation: Observation) {
-        let shape = self.by_shape.entry(observation.fingerprint).or_default();
+        let shape = self
+            .by_shape
+            .entry(observation.fingerprint.clone())
+            .or_default();
         shape.queries += 1;
         shape.bytes_read = shape.bytes_read.saturating_add(observation.bytes_read);
         shape.bytes_if_full_scan = shape
@@ -438,6 +486,27 @@ impl Workload {
 
         if let Some(ask) = observation.aggregate {
             let seen = self.by_ask.entry(ask).or_default();
+            seen.queries += 1;
+            seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
+            seen.bytes_if_full_scan = seen
+                .bytes_if_full_scan
+                .saturating_add(observation.bytes_if_full_scan);
+            if !observation.used.is_empty() {
+                seen.helped += 1;
+            }
+        }
+
+        // Filters an index can serve are its business; a filter set is
+        // what remains for the ones it cannot.
+        for ask in observation.filters {
+            let eligible = match ask.filter.field {
+                Some(field) => !observation.fingerprint.probeable.contains(&field),
+                None => true,
+            };
+            if !eligible {
+                continue;
+            }
+            let seen = self.by_filter.entry(ask).or_default();
             seen.queries += 1;
             seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
             seen.bytes_if_full_scan = seen
@@ -504,6 +573,7 @@ impl Workload {
             by_shape: shapes.into_iter().collect(),
             by_derived: credits.into_iter().collect(),
             by_ask: BTreeMap::new(),
+            by_filter: BTreeMap::new(),
         }
     }
 
@@ -576,6 +646,29 @@ impl Workload {
             .iter()
             .filter(|(_, seen)| seen.queries.saturating_sub(seen.helped) >= min_queries)
             .map(|(ask, seen)| CubeProposal {
+                table: ask.table.clone(),
+                ask: ask.clone(),
+                queries: seen.queries,
+                bytes_scanned: seen.bytes_read,
+                ceiling_usd: seen.bytes_read as f64
+                    * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far),
+            })
+            .collect();
+        proposals.sort_by(|a, b| b.ceiling_usd.total_cmp(&a.ceiling_usd));
+        proposals
+    }
+
+    /// Filter sets worth building, most promising first.
+    ///
+    /// Same rule as cubes: only unaided asks propose, and only once the
+    /// filter has repeated enough to amortize the build. A filter an index
+    /// could serve never reaches `by_filter` at all — see `observe`.
+    pub fn filter_proposals(&self, prices: &PriceTable, min_queries: u64) -> Vec<FilterProposal> {
+        let mut proposals: Vec<FilterProposal> = self
+            .by_filter
+            .iter()
+            .filter(|(_, seen)| seen.queries.saturating_sub(seen.helped) >= min_queries)
+            .map(|(ask, seen)| FilterProposal {
                 table: ask.table.clone(),
                 ask: ask.clone(),
                 queries: seen.queries,
@@ -665,6 +758,7 @@ mod tests {
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: Vec::new(),
+            filters: Vec::new(),
         }
     }
 
@@ -809,6 +903,7 @@ mod tests {
                 bytes_read: GB / 10,
                 bytes_if_full_scan: GB,
                 used: vec![DerivedId("idx".into())],
+                filters: Vec::new(),
             });
         }
         assert!(workload.proposals(&PriceTable::default(), 1).is_empty());
@@ -830,6 +925,7 @@ mod tests {
                 bytes_read: GB,
                 bytes_if_full_scan: GB,
                 used: Vec::new(),
+                filters: Vec::new(),
             });
         }
         assert_eq!(workload.shapes(), 2);
@@ -837,6 +933,79 @@ mod tests {
         let proposals = workload.proposals(&PriceTable::default(), 1);
         assert_eq!(proposals.len(), 1, "one field, one index");
         assert_eq!(proposals[0].queries, 10, "counts sum across shapes");
+    }
+
+    /// One observation carrying a filter nothing probeable answers.
+    fn filtered(field: FieldId, text: &str, bytes: u64, used: Vec<DerivedId>) -> Observation {
+        Observation {
+            fingerprint: Fingerprint {
+                table: table(),
+                probeable: BTreeSet::new(),
+                opaque: BTreeSet::from([field]),
+                projected: BTreeSet::from([7]),
+            },
+            aggregate: None,
+            bytes_read: bytes,
+            bytes_if_full_scan: bytes,
+            used,
+            filters: vec![FilterAsk {
+                table: table(),
+                filter: Filter {
+                    field: Some(field),
+                    text: text.into(),
+                },
+                sql: text.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_repeated_unindexable_filter_earns_a_set() {
+        let mut workload = Workload::new();
+        for _ in 0..3 {
+            workload.observe(filtered(4, "tenant_id > Int64(2)", GB, Vec::new()));
+        }
+        let proposals = workload.filter_proposals(&PriceTable::default(), 2);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].ask.sql, "tenant_id > Int64(2)");
+        assert_eq!(proposals[0].queries, 3);
+    }
+
+    #[test]
+    fn a_filter_an_index_could_serve_is_not_proposed_for_a_set() {
+        // `tenant_id = 1` is probeable — the index proposal covers it, and a
+        // filter set would duplicate the same work at row granularity.
+        let mut workload = Workload::new();
+        let mut observation = filtered(4, "tenant_id = Int64(1)", GB, Vec::new());
+        observation.fingerprint.probeable = BTreeSet::from([4]);
+        observation.fingerprint.opaque = BTreeSet::new();
+        for _ in 0..5 {
+            workload.observe(observation.clone());
+        }
+        assert!(
+            workload
+                .filter_proposals(&PriceTable::default(), 1)
+                .is_empty()
+        );
+        assert_eq!(workload.proposals(&PriceTable::default(), 1).len(), 1);
+    }
+
+    #[test]
+    fn a_served_filter_does_not_propose_again() {
+        let mut workload = Workload::new();
+        for _ in 0..5 {
+            workload.observe(filtered(
+                4,
+                "tenant_id > Int64(2)",
+                GB,
+                vec![DerivedId("fset:events:x".into())],
+            ));
+        }
+        assert!(
+            workload
+                .filter_proposals(&PriceTable::default(), 1)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -859,6 +1028,7 @@ mod tests {
             bytes_read: GB / 4,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("idx".into())],
+            filters: Vec::new(),
         };
         assert_eq!(observation.bytes_saved(), GB - GB / 4);
     }
@@ -871,6 +1041,7 @@ mod tests {
             bytes_read: 2 * GB,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("idx".into())],
+            filters: Vec::new(),
         };
         assert_eq!(observation.bytes_saved(), 0);
     }
@@ -932,6 +1103,7 @@ mod tests {
                 bytes_read: 0,
                 bytes_if_full_scan: GB,
                 used: vec![DerivedId("useful".into())],
+                filters: Vec::new(),
             });
         }
         assert!(
@@ -952,6 +1124,7 @@ mod tests {
             bytes_read: 0,
             bytes_if_full_scan: 1_000,
             used: vec![DerivedId("bloated".into())],
+            filters: Vec::new(),
         });
         assert_eq!(
             workload.retirements(&registry, &PriceTable::default(), 30.0),
@@ -968,6 +1141,7 @@ mod tests {
             bytes_read: 1,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("a".into())],
+            filters: Vec::new(),
         });
 
         let credited = workload.credited(&DerivedId("a".into())).expect("credited");

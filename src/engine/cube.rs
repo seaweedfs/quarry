@@ -167,7 +167,7 @@ fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
     };
     // Record before the borrow escapes: the report lands on the table while
     // `ask`'s references are still in scope.
-    table.note_scan(report(table, &query, &id, &filter_sql(ask)));
+    table.note_scan(report(table, &query, &id, ask));
 
     let fields = spec.group_by.len() + spec.measures.iter().filter(|m| m.field.is_some()).count();
     let names: BTreeMap<_, _> = spec
@@ -244,10 +244,27 @@ pub(crate) fn report(
     table: &QuarryTable,
     query: &Query,
     used: &DerivedId,
-    filter_sql: &[String],
+    ask: &Ask<'_>,
 ) -> ScanReport {
+    let filter_sql = filter_sql(ask);
     ScanReport {
         files_read: Default::default(),
+        // Each conjunct in both forms — paired per expression, so a clause
+        // that fails to unparse drops out without misaligning the rest.
+        filters: ask
+            .filters
+            .iter()
+            .filter_map(|expr| {
+                let sql = datafusion::sql::unparser::expr_to_sql(expr)
+                    .ok()?
+                    .to_string();
+                Some(crate::workload::FilterAsk {
+                    table: table.table_id().clone(),
+                    filter: table.canonical_filter(expr),
+                    sql,
+                })
+            })
+            .collect(),
         scopes: Default::default(),
         used: vec![used.0.clone()],
         also_scanned: Default::default(),
@@ -264,7 +281,7 @@ pub(crate) fn report(
                 table: table.table_id().clone(),
                 plan,
                 spec,
-                filter_sql: filter_sql.to_vec(),
+                filter_sql: filter_sql.clone(),
             }),
     }
 }

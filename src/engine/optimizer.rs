@@ -28,11 +28,11 @@ use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
 use crate::snapshot::{Commits, SnapshotId};
-use crate::workload::{AggregateAsk, Observation, Policy, Proposal, Workload};
+use crate::workload::{AggregateAsk, FilterAsk, Observation, Policy, Proposal, Workload};
 
 use super::{
-    QuarryTable, Session, SharedRegistry, build_cube, build_proposed_index, cube_id,
-    estimate_overlap, index_id, parquet_bounds,
+    QuarryTable, Session, SharedRegistry, build_cube, build_proposed_filter_set,
+    build_proposed_index, cube_id, estimate_overlap, filter_set_id, index_id, parquet_bounds,
 };
 
 /// A piece of derived state a round dropped, identified enough to delete it.
@@ -151,6 +151,8 @@ pub struct Optimizer {
     built: BTreeMap<DerivedId, FieldId>,
     /// Cubes this optimizer built, keyed the same way.
     built_cubes: BTreeMap<DerivedId, AggregateAsk>,
+    /// Same for filter sets — the clause a rebuild re-runs.
+    built_filters: BTreeMap<DerivedId, FilterAsk>,
     /// What each build was expected to save, in dollars.
     ///
     /// Kept so a prediction can be held against the realized credit later:
@@ -193,6 +195,7 @@ impl Optimizer {
             reader: PolicyFingerprint(0),
             built: BTreeMap::new(),
             built_cubes: BTreeMap::new(),
+            built_filters: BTreeMap::new(),
             predicted: BTreeMap::new(),
             commits: Commits::new(),
             failed_at: BTreeMap::new(),
@@ -421,6 +424,8 @@ impl Optimizer {
                 build_proposed_index(session, table, field, id.clone(), self.reader).await
             } else if let Some(ask) = self.built_cubes.get(&id) {
                 build_cube(session, table, ask, id.clone()).await
+            } else if let Some(ask) = self.built_filters.get(&id) {
+                build_proposed_filter_set(session, table, ask, id.clone(), self.reader).await
             } else {
                 continue;
             };
@@ -614,6 +619,70 @@ impl Optimizer {
             round.built.push(id);
         }
 
+        // 5. Filter sets: a repeated filter nothing else serves is worth
+        // caching. Same gates as cubes — the ceiling bounds the build, and
+        // `proven` demotes what already failed to pay for itself.
+        for proposal in self
+            .workload
+            .filter_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = filter_set_id(&proposal.table, &proposal.ask.filter);
+            if existing.contains(&id) {
+                round.declined.push((id, Declined::AlreadyBuilt));
+                continue;
+            }
+            if round.built.len() >= self.policy.max_builds_per_round {
+                round.declined.push((id, Declined::RoundFull));
+                continue;
+            }
+            let proven = self.proven(&id);
+            if proven < 1.0
+                && proposal.ceiling_usd * proven
+                    <= table.live_bytes() as f64
+                        * self
+                            .prices
+                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+            {
+                round.declined.push((id, Declined::NotWorthIt));
+                continue;
+            }
+            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
+                continue;
+            }
+            let derived = match build_proposed_filter_set(
+                session,
+                table,
+                &proposal.ask,
+                id.clone(),
+                self.reader,
+            )
+            .await
+            {
+                Ok(derived) => derived,
+                Err(_) => {
+                    self.failed_at.insert(id.clone(), head);
+                    round.declined.push((id, Declined::BuildFailed));
+                    continue;
+                }
+            };
+            self.failed_at.remove(&id);
+            let held = self.registry.read().expect("registry lock").bytes();
+            if held + derived.bytes > self.policy.budget_bytes {
+                round.declined.push((id, Declined::OverBudget));
+                continue;
+            }
+            self.registry
+                .write()
+                .expect("registry lock")
+                .register(derived);
+            self.built_filters.insert(id.clone(), proposal.ask);
+            self.predicted.insert(id.clone(), proposal.ceiling_usd);
+            round.built.push(id);
+        }
+
         round
     }
 
@@ -681,6 +750,7 @@ impl Optimizer {
         self.built
             .keys()
             .chain(self.built_cubes.keys())
+            .chain(self.built_filters.keys())
             .filter(|id| registry.get(id).is_some())
             .filter(|id| {
                 let Some(derived) = registry.get(id) else {
@@ -737,6 +807,7 @@ mod tests {
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: Vec::new(),
+            filters: Vec::new(),
         }
     }
 

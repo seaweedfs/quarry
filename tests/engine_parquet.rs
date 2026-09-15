@@ -895,3 +895,33 @@ async fn a_built_filter_set_serves_the_next_identical_filter() {
         full.stats().bytes_fetched
     );
 }
+
+#[tokio::test]
+async fn a_volatile_filter_refuses_to_become_a_set() {
+    // `random()` draws once at build time; replaying those positions as the
+    // answer would return a stale draw. The build must refuse.
+    let dir = scratch("parquet_volatile");
+    let rows: Vec<(i64, &str)> = (0..10).map(|i| (i, "m")).collect();
+    let (a, a_size) = write_parquet(&dir, "a.parquet", &rows);
+
+    let graph =
+        SnapshotGraph::new().with(Snapshot::root(SnapshotId(810)).with_clean_file(a.clone()));
+    let table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(810),
+        graph,
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .on_object_store(ObjectStoreUrl::local_filesystem())
+    .with_parquet_file(a, a_size);
+
+    let quarry = Quarry::new(
+        Url::parse("file://").expect("url"),
+        Arc::new(LocalFileSystem::new()),
+    );
+    let session = quarry.session();
+    let result = build_filter_set(&session, &table, "random() > 0.5").await;
+    assert!(result.is_err(), "volatile filters cannot be cached");
+}

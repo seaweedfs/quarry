@@ -112,6 +112,13 @@ pub struct ScanReport {
     /// `GROUP BY` that `scan` cannot — and `None` otherwise means nothing
     /// more than "no aggregate was visible".
     pub aggregate: Option<crate::workload::AggregateAsk>,
+    /// The filters this scan ran, kept for the optimizer's proposals.
+    ///
+    /// Each is a [`FilterAsk`](crate::workload::FilterAsk): the canonical
+    /// filter plus the SQL that re-executes it. A filter that cannot be
+    /// unparsed is absent — it cannot be rebuilt, so proposing it would be
+    /// noise.
+    pub filters: Vec<crate::workload::FilterAsk>,
 }
 
 impl ScanReport {
@@ -132,6 +139,7 @@ impl ScanReport {
         Observation {
             fingerprint: self.fingerprint.clone(),
             aggregate: self.aggregate.clone(),
+            filters: self.filters.clone(),
             bytes_read,
             bytes_if_full_scan: self.bytes_if_full_scan,
             used: self.used.iter().cloned().map(DerivedId).collect(),
@@ -695,6 +703,23 @@ impl QuarryTable {
         };
         let fingerprint = Fingerprint::of(&query);
 
+        // Each conjunct kept in both its forms: canonical for matching,
+        // SQL for rebuilding. One that cannot unparse cannot be built, so
+        // it is not worth observing.
+        let asks: Vec<crate::workload::FilterAsk> = filters
+            .iter()
+            .filter_map(|expr| {
+                let sql = datafusion::sql::unparser::expr_to_sql(expr)
+                    .ok()?
+                    .to_string();
+                Some(crate::workload::FilterAsk {
+                    table: self.table.clone(),
+                    filter: self.canonical_filter(expr),
+                    sql,
+                })
+            })
+            .collect();
+
         // The unaided baseline, known exactly rather than estimated: every
         // live data file's size. Only available where sizes are known, which
         // is the Parquet path; an in-memory table reports zero and its
@@ -722,6 +747,7 @@ impl QuarryTable {
                 };
                 Some(ScanReport {
                     aggregate: None,
+                    filters: asks.clone(),
                     files_read: BTreeSet::new(),
                     scopes: BTreeMap::new(),
                     used: vec![candidate.derived.id.0.clone()],
@@ -739,6 +765,7 @@ impl QuarryTable {
                 pieces,
             } => Some(ScanReport {
                 aggregate: None,
+                filters: asks.clone(),
                 scopes: files.clone(),
                 files_read: files.into_keys().collect(),
                 used: pieces.iter().map(|p| p.derived.id.0.clone()).collect(),
@@ -755,6 +782,7 @@ impl QuarryTable {
         match usable {
             None => ScanReport {
                 aggregate: None,
+                filters: asks,
                 files_read: live,
                 scopes: BTreeMap::new(),
                 used: Vec::new(),
