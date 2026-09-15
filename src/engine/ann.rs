@@ -32,6 +32,18 @@
 //! would have to set [`ScanReport::approximate`](super::ScanReport) and
 //! require the `quarry.approximate` opt-in, because candidates can miss a
 //! true neighbour. This one cannot.
+//!
+//! # What an append does
+//!
+//! Nothing here repairs staleness, and a top-k is why: the k nearest of
+//! (stored ∪ appended) is not the k nearest of each side, so reading the
+//! residual alongside would need a re-ranking merge rather than a union.
+//! [`VectorIndex`](crate::kinds::VectorIndex) therefore declares itself
+//! non-unionable, so the rule rejects an appended-to table by name and the
+//! query reads the table — correct, and slower until the optimizer's refresh
+//! step rebuilds the index. The rebuild lands on the same id, which is keyed
+//! on what the index covers rather than on the snapshot, so it replaces
+//! rather than accumulates.
 
 use std::sync::Arc;
 
@@ -286,10 +298,10 @@ fn stored_source(
         .map(|candidate| (candidate.derived.id.clone(), candidate.decision.clone()))?;
 
     // A rollup holds partial aggregates, not rows a distance can be computed
-    // against; only a row-shaped substitute serves this. And only `Use`: a
-    // `UseWith` would need the residual files read alongside, which a leaf
-    // swap does not do — see the module comment on what is deliberately
-    // left to a later kind.
+    // against; only a row-shaped substitute serves this. `Use` alone reaches
+    // here in practice — `VectorIndex` declares itself non-unionable, so the
+    // rule rejects an appended-to table by name rather than leaving this to
+    // decline it quietly.
     let Decision::Use(Rewrite::Substitute { rollup: None, .. }) = decision else {
         return None;
     };

@@ -380,6 +380,127 @@ async fn a_delete_since_the_build_disqualifies_the_index() {
 }
 
 #[tokio::test]
+async fn an_append_since_the_build_leaves_the_answer_correct() {
+    // A flat index is the whole table, so an append leaves it holding fewer
+    // rows than the table has. The leaf swap reads the stored rows *instead*
+    // of the files, so it cannot also read the residual — and rather than
+    // return a top-k over the wrong row set, it declines and the scan runs.
+    let mut registry = Registry::new();
+    registry.register(vector_index("vec", SnapshotId(810), Metric::L2, DIM as u32));
+
+    // A second file, nearer the origin than anything the index holds.
+    let nearer = {
+        let ids: Int64Array = vec![6i64].into();
+        let tenants: Int64Array = vec![1i64].into();
+        let embeddings = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM,
+            Arc::new(Float32Array::from(vec![0.0f32, 0.0, 0.5])),
+            None,
+        )
+        .expect("embeddings");
+        RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(ids), Arc::new(embeddings), Arc::new(tenants)],
+        )
+        .expect("batch")
+    };
+
+    let graph = SnapshotGraph::new()
+        .with(Snapshot::root(SnapshotId(810)).with_clean_file(FileId("a".into())))
+        .with(
+            Snapshot::child_of(SnapshotId(811), SnapshotId(810))
+                .with_clean_file(FileId("a".into()))
+                .with_clean_file(FileId("b".into())),
+        );
+
+    let table = Arc::new(
+        QuarryTable::new(
+            schema(),
+            TableId("docs".into()),
+            SnapshotId(811),
+            graph,
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .with_file(FileId("a".into()), vec![batch()])
+        .with_file(FileId("b".into()), vec![nearer])
+        .with_registry(registry)
+        .with_projection(DerivedId("vec".into()), vec![batch()]),
+    );
+
+    let session = session();
+    session.register("docs", Arc::clone(&table)).expect("reg");
+    let rows = session
+        .sql(&format!(
+            "SELECT id FROM docs ORDER BY quarry_l2_distance(embedding, {ORIGIN}) LIMIT 2"
+        ))
+        .await
+        .expect("query");
+
+    assert_eq!(
+        ids(&rows),
+        vec![6, 1],
+        "row 6 is nearest and the index has never seen it"
+    );
+    let report = table.last_scan().expect("scan");
+    assert!(
+        !report.substituted,
+        "serving from a stale flat index would have missed row 6"
+    );
+}
+
+#[tokio::test]
+async fn a_built_index_is_keyed_on_what_it_covers_not_on_the_k() {
+    // Why this matters for refresh: the optimizer rebuilds onto the same id,
+    // so an index whose table has moved is *replaced* rather than
+    // accumulated beside. (The refresh step itself needs a Parquet table —
+    // `stale` measures residual bytes, which an in-memory table has none of
+    // — and is exercised in tests/loop_closes.rs for the other kinds.)
+    let shared = quarry::engine::shared(Registry::new());
+    let table = Arc::new(table(SnapshotId(810)).with_shared_registry(Arc::clone(&shared)));
+    let session = session();
+    session.register("docs", Arc::clone(&table)).expect("reg");
+
+    let mut optimizer = quarry::engine::Optimizer::new(
+        Arc::clone(&shared),
+        quarry::workload::Policy::automatic(1_000_000_000).with_min_queries(2),
+    )
+    .for_reader(POLICY);
+
+    let sql =
+        format!("SELECT id FROM docs ORDER BY quarry_l2_distance(embedding, {ORIGIN}) LIMIT 3");
+    for _ in 0..2 {
+        session.sql(&sql).await.expect("query");
+        let report = table.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_if_full_scan));
+    }
+    let built = optimizer.round(&session, &table).await;
+    assert_eq!(built.built.len(), 1, "{built:?}");
+
+    // It serves at the snapshot it was built for.
+    session.sql(&sql).await.expect("query");
+    assert!(table.last_scan().expect("scan").substituted);
+
+    // A rebuild onto the same id is what a refresh does; the id is keyed on
+    // what the index covers, not on the snapshot, so it replaces in place.
+    let id = quarry::engine::vector_index_id(
+        &TableId("docs".into()),
+        &quarry::derived::Nearest {
+            field: EMBEDDING,
+            metric: Metric::L2,
+            dimension: DIM as u32,
+            k: 3,
+        },
+    );
+    assert!(
+        built.built.contains(&id),
+        "the id names what it covers, not the k: {:?}",
+        built.built
+    );
+}
+
+#[tokio::test]
 async fn an_unserved_top_k_still_reports_the_ask() {
     // What lets the optimizer propose an index: the scan itself cannot see
     // the sort, so `Session::sql` reports the ask even when nothing served.

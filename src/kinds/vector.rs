@@ -63,7 +63,18 @@ impl Kind for VectorIndex {
         } = query.nearest.as_ref()?;
         if *field == self.field && *metric == self.metric && *dimension == self.dimension {
             Some(Rewrite::Substitute {
-                unionable: true,
+                // `false`, though the rows *are* table-shaped and could in
+                // principle be read alongside an appended file. A top-k is
+                // why not: the k nearest of (stored ∪ residual) is not the k
+                // nearest of the stored rows plus the k nearest of the
+                // residual, so a union would have to re-rank across both —
+                // which the leaf-swap rewrite does not do.
+                //
+                // Claiming `true` would make the rule admit a `UseWith` the
+                // serve path then declines, hiding the reason. Declaring it
+                // here means the rule rejects with
+                // `Reason::ResidualNotUnionable` and `EXPLAIN` says so.
+                unionable: false,
                 rollup: None,
             })
         } else {
@@ -128,7 +139,7 @@ mod tests {
         assert_eq!(
             got,
             Some(Rewrite::Substitute {
-                unionable: true,
+                unionable: false,
                 rollup: None
             })
         );
@@ -205,7 +216,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_vector_index_is_usable_with_the_files_added_since() {
+    fn an_append_makes_the_rule_reject_rather_than_union() {
+        // The k nearest of (stored ∪ appended) is not the k nearest of each,
+        // so there is no union that answers the query — and the rule says so
+        // by name rather than the serve path declining quietly.
         let g = SnapshotGraph::new()
             .with(
                 Snapshot::root(SnapshotId(810))
@@ -226,10 +240,27 @@ mod tests {
         let mut q = query_with(Some(ask));
         q.snapshot = SnapshotId(811);
 
-        let decision = derived_vector(SnapshotId(810)).may_serve(&q, &g);
+        assert_eq!(
+            derived_vector(SnapshotId(810)).may_serve(&q, &g),
+            crate::derived::Decision::Reject(crate::derived::Reason::ResidualNotUnionable)
+        );
+    }
+
+    #[test]
+    fn an_unchanged_table_admits_the_index() {
+        let g = SnapshotGraph::new().with(
+            Snapshot::root(SnapshotId(810)).with_clean_file(crate::snapshot::FileId("a".into())),
+        );
+        let ask = Nearest {
+            field: VEC,
+            metric: Metric::L2,
+            dimension: 3,
+            k: 10,
+        };
         assert!(
-            decision.is_admitted(),
-            "a substituting kind tolerates additive change"
+            derived_vector(SnapshotId(810))
+                .may_serve(&query_with(Some(ask)), &g)
+                .is_admitted()
         );
     }
 
