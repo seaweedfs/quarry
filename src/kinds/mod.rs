@@ -16,6 +16,7 @@ mod filter_set;
 pub mod index;
 pub mod projection;
 pub mod result_cache;
+pub mod text;
 pub mod vector;
 
 pub use bitmap::Bitmap;
@@ -23,6 +24,7 @@ pub use filter_set::FilterSet;
 pub use index::Index;
 pub use projection::Projection;
 pub use result_cache::ResultCache;
+pub use text::TextIndex;
 pub use vector::VectorIndex;
 
 /// Price reading `bytes` of derived state.
