@@ -91,9 +91,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use crate::derived::{
-        Decision, Derived, DerivedId, PolicyFingerprint, Source,
-    };
+    use crate::derived::{Derived, DerivedId, PolicyFingerprint, Source};
     use crate::snapshot::{Snapshot, SnapshotGraph, SnapshotId, TableId};
 
     const POLICY: PolicyFingerprint = PolicyFingerprint(1);
@@ -238,10 +236,15 @@ mod tests {
     #[test]
     fn a_delete_disqualifies_a_substituting_vector_index() {
         let g = SnapshotGraph::new()
-            .with(Snapshot::root(SnapshotId(810)).with_clean_file(crate::snapshot::FileId("a".into())))
             .with(
-                Snapshot::child_of(SnapshotId(811), SnapshotId(810))
-                    .with_file(crate::snapshot::FileId("a".into()), crate::snapshot::DeleteState(7)),
+                Snapshot::root(SnapshotId(810))
+                    .with_clean_file(crate::snapshot::FileId("a".into())),
+            )
+            .with(
+                Snapshot::child_of(SnapshotId(811), SnapshotId(810)).with_file(
+                    crate::snapshot::FileId("a".into()),
+                    crate::snapshot::DeleteState(7),
+                ),
             );
 
         let ask = Nearest {
@@ -254,6 +257,9 @@ mod tests {
         q.snapshot = SnapshotId(811);
 
         let decision = derived_vector(SnapshotId(810)).may_serve(&q, &g);
-        assert!(!decision.is_admitted(), "a delete means the stored rows hold deleted ones");
+        assert!(
+            !decision.is_admitted(),
+            "a delete means the stored rows hold deleted ones"
+        );
     }
 }

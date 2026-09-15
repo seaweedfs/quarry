@@ -17,9 +17,11 @@
 //! nothing in `derived`, `registry`, or `explain` knows it exists, and none of
 //! them changed to accommodate it.
 
+mod ann;
 mod build;
 mod cache;
 mod cube;
+mod distance;
 mod hll;
 #[cfg(feature = "iceberg")]
 mod iceberg_table;

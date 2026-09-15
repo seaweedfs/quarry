@@ -149,6 +149,7 @@ impl Quarry {
             .insert(super::options::QuarryOptions::default());
         let ctx = SessionContext::new_with_config(config);
         super::hll::register(&ctx);
+        super::distance::register(&ctx);
         // Take the parallelism from DataFusion rather than assuming it. Reads
         // that overlap wait once, not once each, and on a sixteen-core machine
         // the difference is sixteenfold on what is often the largest part of a
@@ -212,7 +213,27 @@ impl Session {
                 .collect()
                 .await;
         }
+        // Cubes first, then vectors: an aggregate over a top-k is served by
+        // the cube if one covers it, and a cube's rewrite leaves no shape a
+        // vector index would recognise. They cannot both fire.
+        let (rewritten, served) = super::ann::rewrite(&plan, approximate)?;
+        if served.is_some() {
+            return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
+                .collect()
+                .await;
+        }
         let rows = df.collect().await?;
+        // A top-k no index could serve still reports the ask: the scan saw
+        // only `nearest: None`, and the optimizer proposes what it can see.
+        if let Some(ask) = super::ann::first_ask(&plan) {
+            if let Some(mut report) = ask.table.last_scan() {
+                report.nearest = Some(crate::workload::NearestAsk {
+                    table: ask.table.table_id().clone(),
+                    nearest: ask.nearest.clone(),
+                });
+                ask.table.note_scan(report);
+            }
+        }
         // An aggregate no cube could serve still reports the ask: the scan
         // itself saw only `aggregate: None`, and the optimizer can only
         // propose what it can see.
