@@ -149,7 +149,9 @@ impl MaterializedResult {
     ///
     /// ```text
     /// grain      the query's keys and measures roll up from the cube's
-    /// build     every filter baked into the cube is one the query shares
+    /// build     every filter baked into the cube is one the query's own
+    ///             filters imply — a narrower range still honours a wider
+    ///             one, so `ts >= Mar` answers `ts >= Jan`'s cube
     /// query      every remaining query filter sits on a stored group key,
     ///            so it can be applied to the partials before re-aggregating
     /// ```
@@ -161,7 +163,11 @@ impl MaterializedResult {
             return false;
         };
         want.covered_by(&rollup.spec)
-            && self.plan.filters.iter().all(|f| plan.filters.contains(f))
+            && self
+                .plan
+                .filters
+                .iter()
+                .all(|baked| plan.filters.iter().any(|q| q.implies(baked)))
             && plan.filters.iter().all(|f| {
                 self.plan.filters.contains(f)
                     || f.field

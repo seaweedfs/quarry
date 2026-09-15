@@ -150,6 +150,147 @@ impl From<&str> for Filter {
     }
 }
 
+/// One side of `column op literal`, recovered from a [`Filter`]'s text.
+///
+/// The canonical rendering writes `column op Literal(...)`, and this parses
+/// only exactly that shape — anything else, including a column name that
+/// happens to contain an operator, yields `None` and no implication is
+/// claimed. A missed implication costs a declined reuse; a wrong one costs
+/// a wrong answer, so the parser errs toward saying nothing.
+#[derive(Clone, Debug, PartialEq)]
+enum Bound {
+    /// `column = literal`.
+    Eq(Literal),
+    /// `column >= literal` or `column > literal`; the bool is "inclusive".
+    Lower(Literal, bool),
+    /// `column <= literal` or `column < literal`; same.
+    Upper(Literal, bool),
+}
+
+/// A literal whose ordering is known.
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+enum Literal {
+    /// Any ordered numeric — integers, floats, dates, and timestamps all
+    /// compare on their inner value for the bounds that matter.
+    Num(f64),
+    /// `Utf8` and friends, compared lexicographically.
+    Str(String),
+    /// `Boolean`.
+    Bool(bool),
+}
+
+fn bound_of(filter: &Filter) -> Option<Bound> {
+    // `column op literal`: the operator is the first ` op ` in the text,
+    // and the tail must be a `Variant(inner)` scalar rendering.
+    for (needle, make) in [
+        (" >= ", |l| Some(Bound::Lower(l, true))),
+        (" <= ", |l| Some(Bound::Upper(l, true))),
+        (" > ", |l| Some(Bound::Lower(l, false))),
+        (" < ", |l| Some(Bound::Upper(l, false))),
+        (" = ", |l| Some(Bound::Eq(l))),
+        (" != ", |_| None),
+    ] as [(&str, fn(Literal) -> Option<Bound>); 6]
+    {
+        let Some(at) = filter.text.find(needle) else {
+            continue;
+        };
+        // `!=` is found as ` = `'s neighbour; the explicit arms above keep
+        // the equality arm from splitting `a != 1` into `a !` and `= 1`.
+        if needle == " = " && filter.text[..at].ends_with('!') {
+            return None;
+        }
+        // The left must be a bare column — `a + 1 = 5` is not `a = 5`, and
+        // claiming it is would imply bounds it does not satisfy.
+        let column = filter.text[..at].trim();
+        if column.is_empty()
+            || !column
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        {
+            return None;
+        }
+        let literal = literal_of(filter.text[at + needle.len()..].trim())?;
+        return make(literal);
+    }
+    None
+}
+
+/// `Variant(inner)` — the scalar's `Debug` shape, with the inner parsed for
+/// the variants whose ordering is meaningful.
+fn literal_of(text: &str) -> Option<Literal> {
+    let open = text.find('(')?;
+    let variant = &text[..open];
+    let inner = text[open + 1..].strip_suffix(')')?;
+
+    // Timestamp renderings carry a timezone after the value; only the
+    // value orders.
+    let first = inner.split(',').next()?.trim();
+    match variant {
+        "Int8"
+        | "Int16"
+        | "Int32"
+        | "Int64"
+        | "UInt8"
+        | "UInt16"
+        | "UInt32"
+        | "UInt64"
+        | "Float16"
+        | "Float32"
+        | "Float64"
+        | "Date32"
+        | "Date64"
+        | "Time32Second"
+        | "Time32Millisecond"
+        | "Time64Microsecond"
+        | "Time64Nanosecond"
+        | "TimestampSecond"
+        | "TimestampMillisecond"
+        | "TimestampMicrosecond"
+        | "TimestampNanosecond" => first.parse().ok().map(Literal::Num),
+        "Utf8" | "LargeUtf8" | "Utf8View" => {
+            let quoted = inner.strip_prefix('"')?.strip_suffix('"')?;
+            Some(Literal::Str(quoted.to_owned()))
+        }
+        "Boolean" => first.parse().ok().map(Literal::Bool),
+        _ => None,
+    }
+}
+
+impl Filter {
+    /// Whether this filter — a query's — implies `baked`, a stored one.
+    ///
+    /// Identity counts as implication: a filter implies itself. Beyond
+    /// that, only the orderable `column op literal` shapes reason — `x >= 3`
+    /// implies `x >= 2` and `x = 4` implies `x >= 2` — and fields must
+    /// agree, because `a >= 3` says nothing about `b >= 2`.
+    pub fn implies(&self, baked: &Filter) -> bool {
+        if self == baked {
+            return true;
+        }
+        if self.field.is_none() || self.field != baked.field {
+            return false;
+        }
+        let (Some(want), Some(have)) = (bound_of(baked), bound_of(self)) else {
+            return false;
+        };
+        match (have, want) {
+            // An equality implies whatever bound its value satisfies.
+            (Bound::Eq(v), Bound::Eq(w)) => v == w,
+            (Bound::Eq(v), Bound::Lower(w, inclusive)) => v > w || (inclusive && v == w),
+            (Bound::Eq(v), Bound::Upper(w, inclusive)) => v < w || (inclusive && v == w),
+            // A lower bound implies a weaker lower bound; the edge case is
+            // the strictness — `x >= 3` does not imply `x > 3`.
+            (Bound::Lower(v, v_incl), Bound::Lower(w, w_incl)) => {
+                v > w || (v == w && (!v_incl || w_incl))
+            }
+            (Bound::Upper(v, v_incl), Bound::Upper(w, w_incl)) => {
+                v < w || (v == w && (!v_incl || w_incl))
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Plan {
     /// A plan reading `projected` under `filters`, canonicalised.
     pub fn new(
@@ -730,6 +871,69 @@ mod tests {
         let a = rows(&[(0, &[1])]);
         let b = rows(&[(0, &[2])]);
         assert_eq!(a.intersect(&b), None);
+    }
+
+    fn filt(field: u32, text: &str) -> Filter {
+        Filter {
+            field: Some(field),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_filter_implies_itself() {
+        let f = filt(1, "ts >= Int64(3)");
+        assert!(f.implies(&f));
+    }
+
+    #[test]
+    fn a_narrower_range_implies_a_wider_one() {
+        let query = filt(1, "ts >= Int64(3)");
+        let baked = filt(1, "ts >= Int64(1)");
+        assert!(query.implies(&baked));
+        assert!(
+            !baked.implies(&query),
+            "the wider bound proves nothing narrower"
+        );
+    }
+
+    #[test]
+    fn an_equality_implies_the_bounds_it_satisfies() {
+        let eq = filt(1, "status = Int64(3)");
+        assert!(eq.implies(&filt(1, "status >= Int64(3)")));
+        assert!(eq.implies(&filt(1, "status <= Int64(3)")));
+        assert!(!eq.implies(&filt(1, "status > Int64(3)")));
+        assert!(!eq.implies(&filt(1, "status < Int64(3)")));
+    }
+
+    #[test]
+    fn strictness_is_respected_at_the_edge() {
+        // `x >= 3` does not imply `x > 3`; `x > 3` does imply `x >= 3`.
+        assert!(!filt(1, "x >= Int64(3)").implies(&filt(1, "x > Int64(3)")));
+        assert!(filt(1, "x > Int64(3)").implies(&filt(1, "x >= Int64(3)")));
+    }
+
+    #[test]
+    fn different_fields_imply_nothing() {
+        assert!(!filt(1, "a >= Int64(3)").implies(&filt(2, "b >= Int64(1)")));
+    }
+
+    #[test]
+    fn unparseable_filters_imply_nothing() {
+        // A filter outside `column op literal` — say `a + 1 = 5` rendered
+        // whole — gets no implication; matching stays exact-text only.
+        assert!(!filt(1, "a + Int64(1) = Int64(5)").implies(&filt(1, "a >= Int64(1)")));
+    }
+
+    #[test]
+    fn timestamp_and_string_bounds_order() {
+        let baked = filt(1, "ts >= TimestampNanosecond(100, None)");
+        let query = filt(1, "ts >= TimestampNanosecond(200, None)");
+        assert!(query.implies(&baked));
+
+        let baked = filt(1, "name >= Utf8(\"b\")");
+        let query = filt(1, "name >= Utf8(\"c\")");
+        assert!(query.implies(&baked));
     }
 
     const POLICY: PolicyFingerprint = PolicyFingerprint(1);

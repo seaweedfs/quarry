@@ -1914,3 +1914,24 @@ territory; a filter set there would duplicate it at row granularity).
 The loop test is the whole point: `tenant_id > 3` — a filter no index
 can probe — observed five times, built by the engine reading its own
 data, then serving at row granularity with the same answer.
+
+## Phase 31 — Range implication for cube coverage `[x]`
+
+The cube-coverage check asked whether every baked filter appeared in the
+query verbatim — so `tenant_id >= 1`'s cube could not serve
+`tenant_id >= 2`, though the narrower bound implies the wider one
+exactly. `Filter::implies` now does the reasoning a textual match could
+not: `column op literal` bounds on the same field, with strictness
+respected at the edge (`x >= 3` does not imply `x > 3`) and equality
+implying whatever bound its value satisfies.
+
+- **Parse failure means no claim.** The parser recognises only a bare
+  identifier, a comparison operator, and a `Variant(inner)` literal —
+  `a + 1 = 5` is not `a = 5`, and refusing to claim that implication is
+  the same refusal coverage made before. A missed implication costs a
+  declined reuse; a wrong one costs a wrong answer.
+- **Exactness holds.** The served side still applies the query's own
+  filter to the stored partials — the narrower bound executes, the
+  implication only admits the cube to try.
+- **Deferred item closed**: "time-range narrowing for exact aggregate
+  subsumption."

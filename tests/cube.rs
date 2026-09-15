@@ -408,3 +408,85 @@ async fn repeated_asks_make_the_optimizer_build_the_cube() {
         report.used
     );
 }
+
+/// A cube carrying its baked filter, so tests can ask narrower ones of it.
+fn with_filtered_cube(at: SnapshotId, baked: &str) -> Arc<QuarryTable> {
+    let id = DerivedId("cube".into());
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        id.clone(),
+        Source {
+            table: TableId("events".into()),
+            snapshot: at,
+        },
+        POLICY,
+        128,
+        Box::new(MaterializedResult::aggregate_of(
+            Plan::new(
+                BTreeSet::from([DAY, BYTES, TENANT]),
+                [quarry::derived::Filter {
+                    field: Some(TENANT),
+                    text: baked.into(),
+                }],
+            ),
+            rollup(),
+            cube_rows(),
+        )),
+    ));
+    Arc::new(
+        table(at)
+            .with_registry(registry)
+            .with_cube(id, &rollup(), cube_rows()),
+    )
+}
+
+#[tokio::test]
+async fn a_narrower_range_is_served_by_a_wider_cube() {
+    // The cube baked `tenant_id >= 1`; the query asks `tenant_id >= 2`,
+    // which implies it — and the bound is on a group key, so it applies to
+    // the partials exactly.
+    let table = with_filtered_cube(SnapshotId(810), "tenant_id >= Int64(1)");
+    let session = session();
+    session.register("events", Arc::clone(&table)).expect("reg");
+
+    let rows = session
+        .sql(
+            "SELECT day, tenant_id, sum(bytes) FROM events \
+             WHERE tenant_id >= 2 GROUP BY day, tenant_id",
+        )
+        .await
+        .expect("sql");
+    let got: BTreeMap<i64, i64> = rows
+        .iter()
+        .flat_map(|b| {
+            let days = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let sums = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..b.num_rows()).map(|i| (days.value(i), sums.value(i)))
+        })
+        .collect();
+    assert_eq!(got, BTreeMap::from([(1, 30), (2, 110)]), "tenant 2 only");
+    assert!(table.last_scan().expect("report").substituted);
+}
+
+#[tokio::test]
+async fn a_wider_range_is_not_served_by_a_narrower_cube() {
+    // The cube baked `tenant_id >= 2`: tenant 1's rows were never stored.
+    // A query for `tenant_id >= 1` implies nothing of it, and must not be
+    // answered from partials that are missing a tenant.
+    let table = with_filtered_cube(SnapshotId(810), "tenant_id >= Int64(2)");
+    let session = session();
+    session.register("events", Arc::clone(&table)).expect("reg");
+
+    let rows = session
+        .sql(
+            "SELECT day, tenant_id, count(*) FROM events \
+             WHERE tenant_id >= 1 GROUP BY day, tenant_id",
+        )
+        .await
+        .expect("sql");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+    assert!(
+        !table.last_scan().expect("report").substituted,
+        "the narrower cube must not serve the wider query"
+    );
+}
