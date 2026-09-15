@@ -770,12 +770,15 @@ L3 reusable computation      PARTIAL — `FilterSet` reuses a filter's
                              interior plan nodes (join hash tables, keyed
                              by ComputeID) — revisit when telemetry
                              demands it
-FTS / vector / spatial       FTS needs a MATCH predicate variant; vector
-                             indexes remain gated on a distance-predicate
-                             shape. Sketch aggregates landed: HLL states
-                             serve `approx_distinct` unconditionally and
-                             `count(distinct)` under the session's
-                             `quarry.approximate` opt-in
+FTS / vector / spatial       Vector landed: `quarry_l2_distance` /
+                             `quarry_cosine_distance` give the shape, and
+                             a flat `VectorIndex` serves
+                             `ORDER BY distance LIMIT k` exactly. FTS
+                             still needs a MATCH predicate variant;
+                             spatial needs its own. Sketch aggregates
+                             landed: HLL states serve `approx_distinct`
+                             unconditionally and `count(distinct)` under
+                             the session's `quarry.approximate` opt-in
 join accelerators            need a repeated-join workload to justify
 SegmentDirectory             pays only once the registry is observed
                              probing hundreds of pieces per query
@@ -1975,3 +1978,54 @@ The loop test is the point: `count(distinct tenant_id)` observed twice,
 the round builds the cube (normalising to sketch partials), and the
 served path stays exact until `SET quarry.approximate = true` — then the
 sketch answers, flagged approximate.
+
+## Phase 34 — Vector search `[x]`
+
+Top-k nearest-neighbour queries served from a vector index — the second
+plan-level rewrite, and the one that made the leaf-swap technique
+explicit.
+
+- **The shape is a distance function.** `quarry_l2_distance(v, q)` and
+  `quarry_cosine_distance(v, q)` are registered on every session and are
+  real arithmetic, not markers: the `Sort` above a substituted scan
+  recomputes distances with them, so they decide the answer. L2 is left
+  squared — the square root is monotone and does not change a top-k
+  order. A null vector, and a zero vector under cosine, score infinity:
+  the ask is "the nearest k", and a row with no direction is near
+  nothing.
+- **`Nearest` is the ask, and it holds no vector.** `(field, metric,
+  dimension, k)`. The query vector is the *probe*, not the identity, so
+  one index serves every vector the way one equality index serves every
+  value — and `k` is absent from the id, so a search for the nearest 10
+  and one for the nearest 100 build one index rather than two.
+- **Only the leaf is replaced.** The rewrite swaps the `TableScan`'s
+  source and keeps every other field, the projected schema included, so
+  a plan built on the old schema keeps resolving against the new.
+  Nothing above the leaf changes. That is a stronger correctness
+  argument than shape-checking would be: the plan cannot disagree with
+  itself, because it is the same plan.
+
+The leaf swap is what makes trailing sort keys safe, so `ORDER BY
+distance, id` — the usual way to make a top-k reproducible — is served
+rather than refused. Only the leading key decides which index applies.
+
+Refused, each for a named reason: `DESC` (that asks for the *farthest*
+rows), any `OFFSET` (it reaches past the k-th), a non-literal limit, a
+distance between two columns, a wrong metric or dimension, and any node
+below the sort that is not row-preserving.
+
+**No opt-in.** A flat index holds every row and the sort re-ranks them,
+so the answer is exact and `ScanReport.approximate` stays false. The
+kind that stores *candidates* is the one that would need
+`quarry.approximate`, because candidates can miss a true neighbour.
+
+**Staleness is refused, not repaired.** The k nearest of (stored ∪
+appended) is not the k nearest of each side, so `VectorIndex` declares
+itself non-unionable and the rule rejects an appended-to table as
+`Reason::ResidualNotUnionable` — the query reads the table, correctly,
+until refresh rebuilds onto the same id.
+
+The loop closes: two unaided top-k searches, the round builds the index
+(the one build in the crate that cannot be cheaper than the scan it
+replaces — a flat index *is* the table, read once at build instead of
+once per query), and the next search is served with no file read.
