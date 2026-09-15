@@ -56,7 +56,12 @@ impl FilterSet {
     }
 
     /// Bytes the postings occupy once encoded: two u64s per row.
-    pub(crate) fn encoded_len(&self) -> u64 {
+    ///
+    /// `pub`, like [`Index::encoded_len`](super::Index::encoded_len) and
+    /// [`Bitmap::encoded_len`](super::Bitmap::encoded_len): it is what a
+    /// storage budget is enforced against, so a caller sizing derived state
+    /// needs it for every kind or for none.
+    pub fn encoded_len(&self) -> u64 {
         self.postings
             .values()
             .flat_map(|groups| groups.values())
