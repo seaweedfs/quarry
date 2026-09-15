@@ -30,7 +30,9 @@ use quarry::cost::{Cost, PriceTable};
 use quarry::derived::{
     Derived, DerivedId, FieldId, Kind, PolicyFingerprint, Query, Refreshed, Rewrite, Scope, Source,
 };
-use quarry::engine::{MeteredStore, Quarry, QuarryTable, hash_scalar};
+use quarry::engine::{
+    MeteredStore, Quarry, QuarryTable, build_filter_set, filter_set_id, hash_scalar,
+};
 use quarry::kinds::{Bitmap, Index};
 use quarry::registry::Registry;
 use quarry::snapshot::{Diff, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -789,4 +791,107 @@ async fn a_generous_budget_lets_the_query_finish() {
     assert_eq!(total_rows(&rows), 4);
     assert!(store.outcome().is_complete());
     assert!(store.stats().bytes_fetched > 0, "something was read");
+}
+
+#[tokio::test]
+async fn a_built_filter_set_serves_the_next_identical_filter() {
+    // The reusable-computation layer end to end: `build_filter_set` runs
+    // `message = 'needle'` once, the registry serves the next query asking
+    // it, and the scan reads only the row that passed.
+    let dir = scratch("parquet_filter_set");
+    let wide: Vec<(i64, String)> = (0..200)
+        .map(|i| {
+            (
+                2,
+                format!(
+                    "{}-{:04}-{}",
+                    (b'a' + (i % 26) as u8) as char,
+                    i,
+                    "x".repeat(4_000)
+                ),
+            )
+        })
+        .collect();
+    let wide_rows: Vec<(i64, &str)> = wide.iter().map(|(t, m)| (*t, m.as_str())).collect();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .build();
+    let (a, a_size) = write_parquet_grouped(
+        &dir,
+        "a.parquet",
+        &[&[(1, "needle")], &wide_rows],
+        Some(props),
+    );
+
+    let graph =
+        SnapshotGraph::new().with(Snapshot::root(SnapshotId(810)).with_clean_file(a.clone()));
+    let table = |registry: Option<Registry>| {
+        let t = QuarryTable::new(
+            schema(),
+            TableId("events".into()),
+            SnapshotId(810),
+            graph.clone(),
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .on_object_store(ObjectStoreUrl::local_filesystem())
+        .with_parquet_file(a.clone(), a_size);
+        match registry {
+            Some(registry) => t.with_registry(registry),
+            None => t,
+        }
+    };
+    let sql = "SELECT * FROM events WHERE message = 'needle'";
+
+    let full = metered_local();
+    let rows = run_metered(Arc::new(table(None)), sql, Arc::clone(&full))
+        .await
+        .expect("full scan");
+    assert_eq!(total_rows(&rows), 1);
+
+    // BUILD: the filter runs once, over the real objects.
+    let quarry = Quarry::new(
+        Url::parse("file://").expect("url"),
+        Arc::new(LocalFileSystem::new()),
+    );
+    let session = quarry.session();
+    let bare = table(None);
+    let set = build_filter_set(&session, &bare, "message = 'needle'")
+        .await
+        .expect("build the filter set");
+    assert_eq!(set.filter().field, Some(7), "the clause named message");
+
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        filter_set_id(&TableId("events".into()), set.filter()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        1,
+        Box::new(set),
+    ));
+    let scoped_table = Arc::new(table(Some(registry)));
+    let pruned = metered_local();
+    let rows = run_metered(Arc::clone(&scoped_table), sql, Arc::clone(&pruned))
+        .await
+        .expect("scoped scan");
+    assert_eq!(total_rows(&rows), 1, "identical answer");
+
+    assert_eq!(
+        scoped_table.last_scan().expect("scan").scopes,
+        BTreeMap::from([(
+            a.clone(),
+            Scope::Rows(BTreeMap::from([(0, BTreeSet::from([0]))]))
+        )]),
+        "the built set carried the row that passed"
+    );
+    assert!(
+        pruned.stats().bytes_fetched < full.stats().bytes_fetched,
+        "the reused filter skipped {} bytes of {}",
+        full.stats().bytes_fetched - pruned.stats().bytes_fetched,
+        full.stats().bytes_fetched
+    );
 }

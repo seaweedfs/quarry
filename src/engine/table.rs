@@ -830,7 +830,7 @@ impl QuarryTable {
     /// `500 = status` are one plan. Failing to normalise something costs a
     /// missed match; normalising it *wrongly* would cost a wrong answer, so
     /// anything else is left exactly as written.
-    fn canonical_filter(&self, expr: &Expr) -> Filter {
+    pub(crate) fn canonical_filter(&self, expr: &Expr) -> Filter {
         if let Expr::BinaryExpr(binary) = expr {
             let symmetric = matches!(binary.op, Operator::Eq | Operator::NotEq);
             let mut sides = vec![(binary.left.as_ref(), binary.right.as_ref())];

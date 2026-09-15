@@ -12,11 +12,13 @@ use crate::cost::{Cost, PriceTable, Tier};
 use crate::place::Distance;
 
 pub mod bitmap;
+mod filter_set;
 pub mod index;
 pub mod projection;
 pub mod result_cache;
 
 pub use bitmap::Bitmap;
+pub use filter_set::FilterSet;
 pub use index::Index;
 pub use projection::Projection;
 pub use result_cache::ResultCache;

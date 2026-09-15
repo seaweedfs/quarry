@@ -15,21 +15,24 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::common::Result as DfResult;
+use datafusion::arrow::array::BooleanArray;
 use datafusion::common::exec_err;
+use datafusion::common::{DFSchema, Result as DfResult};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
 use datafusion::parquet::file::statistics::Statistics;
+use datafusion::physical_expr::{create_physical_expr, execution_props::ExecutionProps};
 use datafusion::physical_plan::collect;
 use datafusion::scalar::ScalarValue;
 use object_store::path::Path as ObjectPath;
 
-use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
-use crate::kinds::{Bitmap, Index};
+use crate::derived::{Derived, DerivedId, FieldId, Filter, PolicyFingerprint, Source};
+use crate::kinds::{Bitmap, FilterSet, Index};
 use crate::snapshot::FileId;
 use crate::workload::AggregateAsk;
 
@@ -146,6 +149,93 @@ pub async fn build_bitmap(
     let bitmap = populate_bitmap(field, &reads);
     let bytes = bitmap.encoded_len();
     Ok(bitmap.with_bytes(bytes))
+}
+
+/// Build the set of rows that pass `filter_sql`, per file and group.
+///
+/// The clause is evaluated as SQL against the file's own columns and
+/// canonicalised exactly the way the query path renders filters, so the
+/// stored set matches future queries by construction rather than by the
+/// caller remembering to spell it identically.
+///
+/// The read is per group and projected to the columns the clause
+/// mentions — the build pays for the filter's evidence, not the file's.
+pub async fn build_filter_set(
+    session: &Session,
+    table: &QuarryTable,
+    filter_sql: &str,
+) -> DfResult<FilterSet> {
+    let Some((url, files)) = table.parquet_files() else {
+        return exec_err!("an in-memory table has no objects to scan");
+    };
+    let store = session.context().runtime_env().object_store(url)?;
+
+    let schema = datafusion::catalog::TableProvider::schema(table);
+    let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
+    let expr = session.context().parse_sql_expr(filter_sql, &df_schema)?;
+    let filter = table.canonical_filter(&expr);
+
+    // Evaluate against only the columns the clause mentions.
+    let wanted: Vec<usize> = expr
+        .column_refs()
+        .iter()
+        .filter_map(|column| schema.index_of(column.name()).ok())
+        .collect();
+    let narrowed = Arc::new(schema.project(&wanted)?);
+    let physical = create_physical_expr(
+        &expr,
+        &DFSchema::try_from(Arc::clone(&narrowed))?,
+        &ExecutionProps::new(),
+    )?;
+
+    let mut set = FilterSet::of(filter);
+    for (file, size) in files {
+        let mut reader =
+            ParquetObjectReader::new(Arc::clone(&store), ObjectPath::from(file.0.as_str()))
+                .with_file_size(*size);
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+        let groups = metadata.metadata().num_row_groups();
+
+        for group in 0..groups {
+            let mut plan = ParquetAccessPlan::new_all(groups);
+            for other in 0..groups {
+                if other != group {
+                    plan.skip(other);
+                }
+            }
+            let partitioned =
+                PartitionedFile::new(file.0.clone(), *size).with_extensions(Arc::new(plan));
+            let config = FileScanConfigBuilder::new(
+                url.clone(),
+                Arc::clone(&narrowed),
+                Arc::new(ParquetSource::default()),
+            )
+            .with_file(partitioned)
+            .build();
+            let batches = collect(
+                DataSourceExec::from_data_source(config),
+                session.context().task_ctx(),
+            )
+            .await?;
+
+            let mut row = 0u64;
+            for batch in batches {
+                let mask = physical.evaluate(&batch)?.into_array(batch.num_rows())?;
+                let mask = mask
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("a filter evaluates to booleans");
+                for (index, passed) in mask.iter().enumerate() {
+                    if passed == Some(true) {
+                        set.insert(file.clone(), group as u32, row + index as u64);
+                    }
+                }
+                row += batch.num_rows() as u64;
+            }
+        }
+    }
+    let bytes = set.encoded_len();
+    Ok(set.with_bytes(bytes))
 }
 
 /// Build the index a proposal asked for, ready to register.
@@ -465,6 +555,15 @@ async fn read_column(
 /// snapshot moves replaces the old entry rather than accumulating beside it.
 pub fn index_id(table: &crate::snapshot::TableId, field: FieldId) -> DerivedId {
     DerivedId(format!("idx:{}:{field}", table.0))
+}
+
+/// The id for a reusable filter set — the canonical text, hashed stably.
+pub fn filter_set_id(table: &crate::snapshot::TableId, filter: &Filter) -> DerivedId {
+    DerivedId(format!(
+        "fset:{}:{}",
+        table.0,
+        crate::stable_hash::StableHasher::of(filter)
+    ))
 }
 
 /// A cube's id names what it answers, so the same ask rebuilds onto the same

@@ -762,10 +762,13 @@ accelerator taxonomy (core-design §4):
 bitmap indexes               DONE — `Bitmap` posts rows inside row
                              groups; composing, staleness, and deletes
                              ride the same rules as file-level postings
-L3 reusable computation      subplan substitution keyed by ComputeID; the
-                             cube path proves the seam on Aggregate only —
-                             revisit when telemetry demands a second
-                             position (filter candidates, join hash tables)
+L3 reusable computation      PARTIAL — `FilterSet` reuses a filter's
+                             passing rows via `Scope::Rows`, no interior
+                             rewrite needed; the cube path reuses partial
+                             aggregates. What remains is substitution at
+                             interior plan nodes (join hash tables, keyed
+                             by ComputeID) — revisit when telemetry
+                             demands it
 FTS / vector / spatial       FTS needs a MATCH predicate variant; vector
                              and sketch aggregates are approximate and need
                              the approximate-answer marker decided first
@@ -1867,3 +1870,25 @@ now has the full lifecycle:
 
 The choice tests pin the boundary: two tenants across two row groups
 earns `Scope::Rows`; a hundred earns `Scope::Whole`.
+
+## Phase 29 — Reusable filter sets `[x]`
+
+The taxonomy's distinctive layer — cached computation — turned out to need
+no interior-plan substitution for its first member. A filter's result *is*
+a scope: `FilterSet` stores the rows that passed one filter, per file and
+row group, and `matches` when the query's `plan.filters` contain that
+filter. Composition is free — asking this filter AND another's intersects
+both row sets.
+
+- **One source of truth.** `build_filter_set` takes a SQL clause, parses
+  it once, canonicalises it through `canonical_filter` (the same function
+  the query path renders filters with), and evaluates it per group as a
+  physical expression projected to just the columns it mentions. The
+  stored filter matches future queries by construction.
+- **Positions, not predicates.** A filter set stores where the filter
+  passed, not what it would say — so on any diff it reports
+  `NeedsRebuild`, like the bitmap.
+- **No proposal wiring yet.** `Workload::proposals` sees fields, not
+  filter text; proposing filter sets wants the observation stream to
+  carry `plan.filters`. Noted as gated on demand — a repeated filtered
+  workload the index alone doesn't help.
