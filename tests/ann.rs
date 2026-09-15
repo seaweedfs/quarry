@@ -423,6 +423,88 @@ async fn a_tie_breaking_sort_key_is_still_served() {
 }
 
 #[tokio::test]
+async fn repeated_top_k_searches_make_the_optimizer_build_the_index() {
+    // The whole loop for the vector shape: observe, propose, build, serve.
+    let shared = quarry::engine::shared(Registry::new());
+    let table = Arc::new(table(SnapshotId(810)).with_shared_registry(Arc::clone(&shared)));
+    let session = session();
+    session.register("docs", Arc::clone(&table)).expect("reg");
+
+    let mut optimizer = quarry::engine::Optimizer::new(
+        Arc::clone(&shared),
+        quarry::workload::Policy::automatic(1_000_000_000).with_min_queries(2),
+    )
+    .for_reader(POLICY);
+
+    let sql =
+        format!("SELECT id FROM docs ORDER BY quarry_l2_distance(embedding, {ORIGIN}) LIMIT 3");
+
+    // Two unaided searches. Each reports its ask even though nothing served.
+    for _ in 0..2 {
+        session.sql(&sql).await.expect("query");
+        let report = table.last_scan().expect("scan");
+        assert!(!report.substituted, "nothing to serve it yet");
+        optimizer.observe(report.observation(report.bytes_if_full_scan));
+    }
+
+    let round = optimizer.round(&session, &table).await;
+    assert_eq!(
+        round.built.len(),
+        1,
+        "the repeated top-k earned an index: {round:?}"
+    );
+
+    // And now it serves, with the same answer.
+    let rows = session.sql(&sql).await.expect("query");
+    assert_eq!(ids(&rows), vec![1, 2, 3]);
+    let report = table.last_scan().expect("scan");
+    assert!(report.substituted, "the built index served the next search");
+    assert!(report.files_read.is_empty());
+}
+
+#[tokio::test]
+async fn one_index_serves_every_k() {
+    // A search for the nearest 2 and one for the nearest 4 are the same
+    // proposal: k is not part of what an index covers.
+    let shared = quarry::engine::shared(Registry::new());
+    let table = Arc::new(table(SnapshotId(810)).with_shared_registry(Arc::clone(&shared)));
+    let session = session();
+    session.register("docs", Arc::clone(&table)).expect("reg");
+
+    let mut optimizer = quarry::engine::Optimizer::new(
+        Arc::clone(&shared),
+        quarry::workload::Policy::automatic(1_000_000_000).with_min_queries(2),
+    )
+    .for_reader(POLICY);
+
+    for k in [2, 4] {
+        session
+            .sql(&format!(
+                "SELECT id FROM docs ORDER BY quarry_l2_distance(embedding, {ORIGIN}) LIMIT {k}"
+            ))
+            .await
+            .expect("query");
+        let report = table.last_scan().expect("scan");
+        optimizer.observe(report.observation(report.bytes_if_full_scan));
+    }
+
+    let round = optimizer.round(&session, &table).await;
+    assert_eq!(round.built.len(), 1, "one index, not one per k: {round:?}");
+
+    // Both k's are served by it.
+    for (k, want) in [(1usize, vec![1i64]), (5, vec![1, 2, 3, 4, 5])] {
+        let rows = session
+            .sql(&format!(
+                "SELECT id FROM docs ORDER BY quarry_l2_distance(embedding, {ORIGIN}) LIMIT {k}"
+            ))
+            .await
+            .expect("query");
+        assert_eq!(ids(&rows), want, "k={k}");
+        assert!(table.last_scan().expect("scan").substituted, "k={k}");
+    }
+}
+
+#[tokio::test]
 async fn a_cosine_search_is_served_by_a_cosine_index() {
     let table = with_index(Metric::Cosine, DIM as u32);
     let session = session();

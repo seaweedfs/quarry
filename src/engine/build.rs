@@ -32,9 +32,10 @@ use datafusion::scalar::ScalarValue;
 use object_store::path::Path as ObjectPath;
 
 use crate::derived::{
-    AggFunc, Aggregate, Derived, DerivedId, FieldId, Filter, Measure, PolicyFingerprint, Source,
+    AggFunc, Aggregate, Derived, DerivedId, FieldId, Filter, Measure, Nearest, PolicyFingerprint,
+    Source,
 };
-use crate::kinds::{Bitmap, FilterSet, Index};
+use crate::kinds::{Bitmap, FilterSet, Index, VectorIndex};
 use crate::snapshot::FileId;
 use crate::workload::AggregateAsk;
 
@@ -736,6 +737,89 @@ pub async fn build_cube(
             ask.plan.clone(),
             rollup,
             batches,
+        )),
+    ))
+}
+
+/// A vector index's id names what it covers, so the same ask rebuilds onto
+/// the same id rather than accumulating beside it.
+///
+/// `k` is deliberately absent: one flat index answers any k, so an ask for
+/// the nearest 10 and one for the nearest 100 must not build two.
+pub fn vector_index_id(table: &crate::snapshot::TableId, nearest: &Nearest) -> DerivedId {
+    DerivedId(format!(
+        "vec:{}:{}:{:?}:{}",
+        table.0, nearest.field, nearest.metric, nearest.dimension
+    ))
+}
+
+/// Build the vector index `ask` proposes: the table's rows, held where a
+/// distance can be computed against them without reading object storage.
+///
+/// A flat index, so the build is a read of the whole table — the one build
+/// in this crate that cannot be cheaper than the scan it replaces. That is
+/// the trade a top-k query makes: it reads everything *once* at build time
+/// instead of once per query.
+pub async fn build_vector_index(
+    session: &Session,
+    table: &Arc<QuarryTable>,
+    nearest: &Nearest,
+    id: DerivedId,
+) -> DfResult<Derived> {
+    let Some(column) = table.column_of(nearest.field) else {
+        return exec_err!("field {} is not a column of this table", nearest.field);
+    };
+    let schema = datafusion::catalog::TableProvider::schema(table.as_ref());
+    let position = schema.index_of(column)?;
+    // The stored dimension must be the one the ask names, or the index would
+    // claim to cover a shape it does not.
+    if super::distance::dimension_of(schema.field(position).data_type()) != Some(nearest.dimension)
+    {
+        return exec_err!(
+            "column {column} is not a {}-dimensional vector",
+            nearest.dimension
+        );
+    }
+
+    // Through the session's context, not `Session::sql`: the point is to read
+    // the table, not to be answered by an index that already exists.
+    let source = format!("__quarry_vec_{}", id.0.replace(':', "_"));
+    session
+        .context()
+        .register_table(
+            source.as_str(),
+            Arc::clone(table) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let batches = session
+        .context()
+        .sql(&format!("SELECT * FROM {source}"))
+        .await?
+        .collect()
+        .await?;
+    session
+        .context()
+        .deregister_table(source.as_str())
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+    let bytes = batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    table.store_rows(id.clone(), batches);
+    Ok(Derived::new(
+        id,
+        Source {
+            table: table.table_id().clone(),
+            snapshot: table.snapshot(),
+        },
+        table.policy(),
+        bytes,
+        Box::new(VectorIndex::new(
+            nearest.field,
+            nearest.metric,
+            nearest.dimension,
+            bytes,
         )),
     ))
 }

@@ -28,11 +28,14 @@ use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
 use crate::snapshot::{Commits, SnapshotId};
-use crate::workload::{AggregateAsk, FilterAsk, Observation, Policy, Proposal, Workload};
+use crate::workload::{
+    AggregateAsk, FilterAsk, NearestAsk, Observation, Policy, Proposal, Workload,
+};
 
 use super::{
     QuarryTable, Session, SharedRegistry, build_cube, build_proposed_filter_set,
-    build_proposed_index, cube_id, estimate_overlap, filter_set_id, index_id, parquet_bounds,
+    build_proposed_index, build_vector_index, cube_id, estimate_overlap, filter_set_id, index_id,
+    parquet_bounds, vector_index_id,
 };
 
 /// A piece of derived state a round dropped, identified enough to delete it.
@@ -153,6 +156,8 @@ pub struct Optimizer {
     built_cubes: BTreeMap<DerivedId, AggregateAsk>,
     /// Same for filter sets — the clause a rebuild re-runs.
     built_filters: BTreeMap<DerivedId, FilterAsk>,
+    /// Same for vector indexes — the ask a rebuild re-reads the table for.
+    built_vectors: BTreeMap<DerivedId, NearestAsk>,
     /// What each build was expected to save, in dollars.
     ///
     /// Kept so a prediction can be held against the realized credit later:
@@ -196,6 +201,7 @@ impl Optimizer {
             built: BTreeMap::new(),
             built_cubes: BTreeMap::new(),
             built_filters: BTreeMap::new(),
+            built_vectors: BTreeMap::new(),
             predicted: BTreeMap::new(),
             commits: Commits::new(),
             failed_at: BTreeMap::new(),
@@ -431,6 +437,8 @@ impl Optimizer {
                     Ok(Some(derived)) => Ok(derived),
                     Err(e) => Err(e),
                 }
+            } else if let Some(ask) = self.built_vectors.get(&id) {
+                build_vector_index(session, table, &ask.nearest, id.clone()).await
             } else {
                 continue;
             };
@@ -695,6 +703,62 @@ impl Optimizer {
             round.built.push(id);
         }
 
+        // 6. Vector indexes: a repeated top-k search is worth holding the
+        // rows for. Same gates as cubes and filter sets.
+        for proposal in self
+            .workload
+            .vector_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = vector_index_id(&proposal.table, &proposal.ask.nearest);
+            if existing.contains(&id) {
+                round.declined.push((id, Declined::AlreadyBuilt));
+                continue;
+            }
+            if round.built.len() >= self.policy.max_builds_per_round {
+                round.declined.push((id, Declined::RoundFull));
+                continue;
+            }
+            let proven = self.proven(&id);
+            if proven < 1.0
+                && proposal.ceiling_usd * proven
+                    <= table.live_bytes() as f64
+                        * self
+                            .prices
+                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+            {
+                round.declined.push((id, Declined::NotWorthIt));
+                continue;
+            }
+            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
+                continue;
+            }
+            let derived =
+                match build_vector_index(session, table, &proposal.ask.nearest, id.clone()).await {
+                    Ok(derived) => derived,
+                    Err(_) => {
+                        self.failed_at.insert(id.clone(), head);
+                        round.declined.push((id, Declined::BuildFailed));
+                        continue;
+                    }
+                };
+            self.failed_at.remove(&id);
+            let held = self.registry.read().expect("registry lock").bytes();
+            if held + derived.bytes > self.policy.budget_bytes {
+                round.declined.push((id, Declined::OverBudget));
+                continue;
+            }
+            self.registry
+                .write()
+                .expect("registry lock")
+                .register(derived);
+            self.built_vectors.insert(id.clone(), proposal.ask);
+            self.predicted.insert(id.clone(), proposal.ceiling_usd);
+            round.built.push(id);
+        }
+
         round
     }
 
@@ -763,6 +827,7 @@ impl Optimizer {
             .keys()
             .chain(self.built_cubes.keys())
             .chain(self.built_filters.keys())
+            .chain(self.built_vectors.keys())
             .filter(|id| registry.get(id).is_some())
             .filter(|id| {
                 let Some(derived) = registry.get(id) else {
