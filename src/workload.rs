@@ -748,6 +748,7 @@ mod tests {
                 })
                 .collect(),
             aggregate: None,
+            nearest: None,
             approximate: false,
         }
     }

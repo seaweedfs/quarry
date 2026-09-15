@@ -403,6 +403,40 @@ impl Measure {
     }
 }
 
+/// The distance function a vector index measures with.
+///
+/// One metric per index: an L2 index cannot answer a cosine query without
+/// re-reading the rows, so it does not match. Adding a metric means adding a
+/// variant, not changing any signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Metric {
+    /// Squared Euclidean distance — the form a top-k sort actually compares,
+    /// since the square root is monotone and does not change the order.
+    L2,
+    /// One minus cosine similarity.
+    Cosine,
+}
+
+/// A top-k nearest-neighbour ask: the `ORDER BY distance(col, v) LIMIT k`
+/// shape, reduced to what a vector index needs to match it.
+///
+/// The query vector is **not** here. It is the probe argument, not the
+/// identity: one index over `(field, metric, dimension)` serves any query
+/// vector, the way one index over a field serves any equality value. The
+/// plan above the substituted scan carries the specific vector in its
+/// `Sort` expression and re-ranks the candidates exactly.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Nearest {
+    /// The vector column searched.
+    pub field: FieldId,
+    /// The distance metric the sort uses.
+    pub metric: Metric,
+    /// The vector dimension, which the stored column must match.
+    pub dimension: u32,
+    /// How many nearest rows the query wants.
+    pub k: u64,
+}
+
 /// What a query needs, reduced to what the rule and the kinds have to reason
 /// about.
 ///
@@ -443,6 +477,12 @@ pub struct Query {
     /// scan-level query means "no aggregate was visible", which a cube treats
     /// as not-a-match rather than as "plain scan".
     pub aggregate: Option<Aggregate>,
+    /// A top-k nearest-neighbour search, if the plan is that shape.
+    ///
+    /// Like [`Query::aggregate`], this sits above the scan in the logical
+    /// plan — the `Sort` and `Limit` are not visible to `TableProvider::scan`
+    /// — so it is populated only by a caller that can see the whole plan.
+    pub nearest: Option<Nearest>,
     /// Whether the session accepts an approximate answer to an exact ask.
     ///
     /// `false` means a stored estimate may serve only a query that asked for
@@ -1068,6 +1108,7 @@ mod tests {
                 value: 0xABC,
             }],
             aggregate: None,
+            nearest: None,
             approximate: false,
         }
     }

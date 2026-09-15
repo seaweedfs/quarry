@@ -101,6 +101,7 @@ fn main() {
             value: TENANT_42,
         }],
         aggregate: None,
+            nearest: None,
         approximate: false,
     };
 

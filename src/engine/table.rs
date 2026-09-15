@@ -600,6 +600,7 @@ impl QuarryTable {
             projected,
             predicates: self.predicates(filters),
             aggregate: Some(aggregate),
+            nearest: None,
             approximate,
         })
     }
@@ -714,6 +715,7 @@ impl QuarryTable {
             projected: self.projected_fields(projection),
             predicates: self.predicates(filters),
             aggregate: None,
+            nearest: None,
             approximate,
         };
         let fingerprint = Fingerprint::of(&query);
