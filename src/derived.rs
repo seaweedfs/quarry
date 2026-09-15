@@ -304,8 +304,8 @@ impl Query {
 ///
 /// A kind that knows files only returns [`Scope::Whole`]; a kind that knows
 /// which parts of a file hold a value names them instead. The granularity is
-/// the file's own row groups — for an in-memory file, its batches play the
-/// same role.
+/// the file's own row groups and, finer, rows within a group — for an
+/// in-memory file, its batches play the row-group role.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
     /// Every row group.
@@ -316,18 +316,44 @@ pub enum Scope {
     /// A group not named cannot hold a row satisfying the predicate this
     /// scope came from.
     Groups(BTreeSet<u32>),
+    /// Named rows within named groups: group id → row offsets inside it.
+    ///
+    /// A group not named admits nothing. Group-local offsets, not file
+    /// ordinals, so the scope composes with [`Scope::Groups`] without
+    /// needing the file's footer.
+    Rows(BTreeMap<u32, BTreeSet<u64>>),
 }
 
 impl Scope {
     /// What both scopes admit — how two prunes on one file compose.
     ///
-    /// `None` means no group survives: the file cannot satisfy the conjunct.
+    /// `None` means nothing survives: the file cannot satisfy the conjunct.
     pub fn intersect(&self, other: &Scope) -> Option<Scope> {
         match (self, other) {
             (Scope::Whole, scope) | (scope, Scope::Whole) => Some(scope.clone()),
             (Scope::Groups(a), Scope::Groups(b)) => {
                 let both: BTreeSet<u32> = a.intersection(b).cloned().collect();
                 (!both.is_empty()).then_some(Scope::Groups(both))
+            }
+            (Scope::Groups(groups), Scope::Rows(rows))
+            | (Scope::Rows(rows), Scope::Groups(groups)) => {
+                let both: BTreeMap<u32, BTreeSet<u64>> = rows
+                    .iter()
+                    .filter(|(group, _)| groups.contains(group))
+                    .map(|(group, rows)| (*group, rows.clone()))
+                    .collect();
+                (!both.is_empty()).then_some(Scope::Rows(both))
+            }
+            (Scope::Rows(a), Scope::Rows(b)) => {
+                let both: BTreeMap<u32, BTreeSet<u64>> = a
+                    .iter()
+                    .filter_map(|(group, rows)| {
+                        let shared: BTreeSet<u64> =
+                            rows.intersection(b.get(group)?).cloned().collect();
+                        (!shared.is_empty()).then_some((*group, shared))
+                    })
+                    .collect();
+                (!both.is_empty()).then_some(Scope::Rows(both))
             }
         }
     }
@@ -652,6 +678,59 @@ impl Derived {
 mod tests {
     use super::*;
     use crate::snapshot::{DeleteState, Snapshot};
+
+    fn rows(entries: &[(u32, &[u64])]) -> Scope {
+        Scope::Rows(
+            entries
+                .iter()
+                .map(|(group, rows)| (*group, rows.iter().cloned().collect()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn whole_intersected_with_anything_is_that_thing() {
+        let rows = rows(&[(0, &[1, 2])]);
+        assert_eq!(
+            Scope::Whole.intersect(&rows),
+            Some(rows.clone()),
+            "Whole admits everything, so the finer scope decides"
+        );
+        assert_eq!(rows.intersect(&Scope::Whole), Some(rows));
+    }
+
+    #[test]
+    fn group_scopes_restrict_row_scopes_without_offsets() {
+        let scoped = rows(&[(0, &[1, 2]), (1, &[5])]);
+        assert_eq!(
+            Scope::Groups(BTreeSet::from([0])).intersect(&scoped),
+            Some(rows(&[(0, &[1, 2])])),
+            "group 1 falls away — it needs no row offsets to do so"
+        );
+        assert_eq!(
+            Scope::Groups(BTreeSet::from([9])).intersect(&scoped),
+            None,
+            "no admitted group survives"
+        );
+    }
+
+    #[test]
+    fn row_scopes_intersect_group_by_group() {
+        let a = rows(&[(0, &[1, 2]), (1, &[7])]);
+        let b = rows(&[(0, &[2, 3]), (2, &[9])]);
+        assert_eq!(
+            a.intersect(&b),
+            Some(rows(&[(0, &[2])])),
+            "only row 2 of group 0 is admitted by both"
+        );
+    }
+
+    #[test]
+    fn an_empty_intersection_means_the_file_drops() {
+        let a = rows(&[(0, &[1])]);
+        let b = rows(&[(0, &[2])]);
+        assert_eq!(a.intersect(&b), None);
+    }
 
     const POLICY: PolicyFingerprint = PolicyFingerprint(1);
     const OTHER_POLICY: PolicyFingerprint = PolicyFingerprint(2);

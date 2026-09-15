@@ -759,9 +759,9 @@ writes (INSERT/MERGE/DELETE) read-only; iceberg-rust lacks row-level writes
 natural-language queries     belongs in the client, not the engine
 
 accelerator taxonomy (core-design §4):
-bitmap indexes               file-level postings already exist and now
-                             intersect at row-group scope; row-level
-                             bitmaps need a row-mask Rewrite variant
+bitmap indexes               DONE — `Bitmap` posts rows inside row
+                             groups; composing, staleness, and deletes
+                             ride the same rules as file-level postings
 L3 reusable computation      subplan substitution keyed by ComputeID; the
                              cube path proves the seam on Aggregate only —
                              revisit when telemetry demands a second
@@ -1814,3 +1814,30 @@ The tests pin the boundary, not just the result:
 - `a_projection_stored_out_of_order_is_served_in_table_order` —
   canonicalisation is load-bearing: reversed storage serves `SELECT *`
   in table order.
+
+---
+
+## Phase 27 — Row masks and the bitmap kind `[x]`
+
+The last granularity the taxonomy's level 2 needed: `Scope::Rows`
+admits named row offsets inside named row groups — group-local, not
+file ordinals, so a `Rows` scope intersects a `Groups` one without
+knowing where any group begins. Intersection rules: `Groups ∩ Rows`
+drops unadmitted groups; `Rows ∩ Rows` intersects per group; anything
+empty drops the file. Admit-only throughout — an offset past a group's
+end names nothing and is ignored.
+
+Execution carries it. The in-memory path `take`s the named rows of the
+named batches. The Parquet path composes `ParquetAccessPlan` with
+`RowSelection`s — the same per-group selection DataFusion's page-index
+pruning produces — and the footer cache now keeps each group's row
+count, since a selection must know the length it ranges over.
+`ScanReport.groups` became `scopes`, the full composed map.
+
+`Bitmap` (`src/kinds/bitmap.rs`) is the first kind that produces it:
+`value → file → group → rows`, the same contract `Index` keeps —
+equality only, alternatives union, unmodelled predicates don't match.
+The telling test is the negative one:
+`a_bitmap_that_names_the_wrong_row_loses_it` admits only a non-matching
+row and the answer shrinks — the mask executes, and the contract's
+"complete postings" precondition is shown, not just stated.

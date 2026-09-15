@@ -403,6 +403,32 @@ mod tests {
         )
     }
 
+    /// file → group → row offsets, as fixtures spell it.
+    type RowPostings<'a> = &'a [(&'a str, &'a [(u32, &'a [u64])])];
+
+    /// A prune entry whose postings name rows inside groups.
+    fn row_entry(id: &str, field: u32, usd: f64, files: RowPostings) -> Derived {
+        pruner(
+            id,
+            field,
+            usd,
+            files
+                .iter()
+                .map(|(f, groups)| {
+                    (
+                        FileId(f.to_string()),
+                        Scope::Rows(
+                            groups
+                                .iter()
+                                .map(|(g, rows)| (*g, rows.iter().cloned().collect()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn pruner(id: &str, field: u32, usd: f64, files: BTreeMap<FileId, Scope>) -> Derived {
         Derived::new(
             DerivedId(id.into()),
@@ -815,6 +841,31 @@ mod tests {
         match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
             Composed::Pruned { files, .. } => {
                 assert!(files.is_empty(), "no group satisfies both, so no file can");
+            }
+            _ => panic!("expected a pruned plan"),
+        }
+    }
+
+    #[test]
+    fn row_masks_intersect_within_a_shared_group() {
+        // One bitmap names rows {0,1} of a's group 0, the other {1,2} —
+        // the conjunct holds only at row 1.
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(row_entry("a_idx", 4, 1.0, &[("a", &[(0, &[0, 1])])]));
+        r.register(row_entry("b_idx", 9, 2.0, &[("a", &[(0, &[1, 2])])]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned { files, pieces, .. } => {
+                assert_eq!(
+                    files,
+                    BTreeMap::from([(
+                        FileId("a".into()),
+                        Scope::Rows(BTreeMap::from([(0, BTreeSet::from([1]))])),
+                    )]),
+                    "only row 1 satisfies both"
+                );
+                assert_eq!(pieces.len(), 2, "both narrowed");
             }
             _ => panic!("expected a pruned plan"),
         }

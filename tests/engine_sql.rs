@@ -24,7 +24,7 @@ use quarry::derived::{
     Source,
 };
 use quarry::engine::{MaterializedResult, QuarryTable, Rollup, hash_scalar};
-use quarry::kinds::{Index, Projection, ResultCache};
+use quarry::kinds::{Bitmap, Index, Projection, ResultCache};
 use quarry::registry::Registry;
 use quarry::snapshot::{DeleteState, Diff, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 
@@ -312,9 +312,12 @@ async fn a_scoped_prune_reads_only_the_named_batches() {
 
     let report = table.last_scan().expect("a scan happened");
     assert_eq!(
-        report.groups,
-        BTreeMap::from([(file("a"), BTreeSet::from([0]))]),
-        "the plan carries the scope through; c is whole and absent"
+        report.scopes,
+        BTreeMap::from([
+            (file("a"), Scope::Groups(BTreeSet::from([0]))),
+            (file("c"), Scope::Whole),
+        ]),
+        "the plan carries the scope through"
     );
     assert_eq!(report.used, ["scoped_idx"]);
 }
@@ -1142,4 +1145,105 @@ async fn a_projection_stored_out_of_order_is_served_in_table_order() {
         .map(|f| f.name().clone())
         .collect();
     assert_eq!(names, vec!["tenant_id", "message"], "table order restored");
+}
+
+#[tokio::test]
+async fn a_bitmap_reads_only_the_rows_it_names() {
+    // File a's batch 0 holds tenant 2 at row 0 and tenant 1 at row 1 — the
+    // bitmap names row 1 — and c's only row is tenant 1.
+    let mut bitmap = Bitmap::new(TENANT_FIELD);
+    bitmap.insert(tenant_hash(1), file("a"), 0, 1);
+    bitmap.insert(tenant_hash(1), file("c"), 0, 0);
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        DerivedId("tenant_bitmap".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        1,
+        Box::new(bitmap),
+    ));
+    let table = Arc::new(
+        QuarryTable::new(
+            schema(),
+            TableId("events".into()),
+            SnapshotId(810),
+            flat_graph(&["a", "c"], 810),
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .with_file(file("a"), vec![batch(&[(2, "a0"), (1, "a1")])])
+        .with_file(file("c"), vec![batch(&[(1, "c1")])])
+        .with_registry(registry),
+    );
+
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT * FROM events WHERE tenant_id = 1",
+    )
+    .await;
+    assert_eq!(total_rows(&rows), 2, "a1 and c1");
+
+    assert_eq!(
+        table.last_scan().expect("scan").scopes,
+        BTreeMap::from([
+            (
+                file("a"),
+                Scope::Rows(BTreeMap::from([(0, BTreeSet::from([1]))]))
+            ),
+            (
+                file("c"),
+                Scope::Rows(BTreeMap::from([(0, BTreeSet::from([0]))]))
+            ),
+        ]),
+        "row-level postings reached the plan"
+    );
+}
+
+#[tokio::test]
+async fn a_bitmap_that_names_the_wrong_row_loses_it() {
+    // The bitmap claims tenant 1 sits at row 0 of a's batch 0 — row 0 holds
+    // tenant 2. Admit-only is a promise: a kind that breaks it loses rows,
+    // which is exactly why complete postings are the kind's precondition
+    // and added files are unioned rather than trusted.
+    let mut bitmap = Bitmap::new(TENANT_FIELD);
+    bitmap.insert(tenant_hash(1), file("a"), 0, 0);
+    bitmap.insert(tenant_hash(1), file("c"), 0, 0);
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        DerivedId("tenant_bitmap".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        1,
+        Box::new(bitmap),
+    ));
+    let table = Arc::new(
+        QuarryTable::new(
+            schema(),
+            TableId("events".into()),
+            SnapshotId(810),
+            flat_graph(&["a", "c"], 810),
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .with_file(file("a"), vec![batch(&[(2, "a0"), (1, "a1")])])
+        .with_file(file("c"), vec![batch(&[(1, "c1")])])
+        .with_registry(registry),
+    );
+
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT * FROM events WHERE tenant_id = 1",
+    )
+    .await;
+    assert_eq!(
+        total_rows(&rows),
+        1,
+        "a's match was scoped out — proof the mask executes"
+    );
 }

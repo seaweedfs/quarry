@@ -6,7 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{RecordBatch, UInt64Array};
+use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -18,7 +19,7 @@ use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
-use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowSelection};
 use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::union::UnionExec;
@@ -70,12 +71,12 @@ pub fn hash_scalar(value: &ScalarValue) -> u64 {
 pub struct ScanReport {
     /// Files the plan reads.
     pub files_read: BTreeSet<FileId>,
-    /// Row groups the plan reads, for files not read whole.
+    /// How much of each file the plan reads.
     ///
-    /// A file absent from this map is read whole. Populated only when a
-    /// contributing kind knows row groups — a file-level index leaves it
-    /// empty.
-    pub groups: BTreeMap<FileId, BTreeSet<u32>>,
+    /// The composed scope map — a file absent from it was not part of a
+    /// pruned plan at all; `Scope::Whole` entries are read end to end.
+    /// Empty for a substitute or an unaided scan.
+    pub scopes: BTreeMap<FileId, Scope>,
     /// Which derived state was used, if any.
     ///
     /// Plural because prunes compose: `a = 1 AND b = 2` can be served by two
@@ -193,13 +194,14 @@ pub struct QuarryTable {
     /// other's types.
     materialized: Mutex<BTreeMap<DerivedId, Vec<RecordBatch>>>,
     last_scan: Mutex<Option<ScanReport>>,
-    /// Row-group counts for Parquet files already opened.
+    /// Per-group row counts for Parquet files already opened.
     ///
-    /// A scoped prune needs the count at plan time — a `ParquetAccessPlan`
-    /// must name exactly the file's groups — and the footer holding it is a
-    /// few kilobytes read once per file through the session's store, so it
-    /// is metered like any other read.
-    row_groups: Mutex<BTreeMap<FileId, u32>>,
+    /// A scoped prune needs them at plan time — a `ParquetAccessPlan` must
+    /// name exactly the file's groups, and a row-level selection must know
+    /// each group's length — and the footer holding them is a few kilobytes
+    /// read once per file through the session's store, so it is metered
+    /// like any other read.
+    row_groups: Mutex<BTreeMap<FileId, Vec<i64>>>,
 }
 
 impl QuarryTable {
@@ -721,7 +723,7 @@ impl QuarryTable {
                 Some(ScanReport {
                     aggregate: None,
                     files_read: BTreeSet::new(),
-                    groups: BTreeMap::new(),
+                    scopes: BTreeMap::new(),
                     used: vec![candidate.derived.id.0.clone()],
                     also_scanned,
                     substituted: true,
@@ -737,13 +739,7 @@ impl QuarryTable {
                 pieces,
             } => Some(ScanReport {
                 aggregate: None,
-                groups: files
-                    .iter()
-                    .filter_map(|(f, scope)| match scope {
-                        Scope::Groups(g) => Some((f.clone(), g.clone())),
-                        Scope::Whole => None,
-                    })
-                    .collect(),
+                scopes: files.clone(),
                 files_read: files.into_keys().collect(),
                 used: pieces.iter().map(|p| p.derived.id.0.clone()).collect(),
                 also_scanned: residual,
@@ -760,7 +756,7 @@ impl QuarryTable {
             None => ScanReport {
                 aggregate: None,
                 files_read: live,
-                groups: BTreeMap::new(),
+                scopes: BTreeMap::new(),
                 used: Vec::new(),
                 also_scanned: BTreeSet::new(),
                 substituted: false,
@@ -944,7 +940,7 @@ impl TableProvider for QuarryTable {
 
         if !report.files_read.is_empty() {
             parts.push(
-                self.file_plan(&report.files_read, &report.groups, projection, _state)
+                self.file_plan(&report.files_read, &report.scopes, projection, _state)
                     .await?,
             );
         }
@@ -1030,7 +1026,7 @@ impl QuarryTable {
     async fn file_plan(
         &self,
         files: &BTreeSet<FileId>,
-        groups: &BTreeMap<FileId, BTreeSet<u32>>,
+        scopes: &BTreeMap<FileId, Scope>,
         projection: Option<&Vec<usize>>,
         state: &dyn Session,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
@@ -1040,14 +1036,22 @@ impl QuarryTable {
                     .iter()
                     .filter_map(|file| {
                         let batches = available.get(file)?;
-                        Some(match groups.get(file) {
-                            None => batches.clone(),
+                        Some(match scopes.get(file) {
+                            None | Some(Scope::Whole) => batches.clone(),
                             // Batches play the role of row groups.
-                            Some(groups) => batches
+                            Some(Scope::Groups(groups)) => batches
                                 .iter()
                                 .enumerate()
                                 .filter(|(i, _)| groups.contains(&(*i as u32)))
                                 .map(|(_, batch)| batch.clone())
+                                .collect(),
+                            Some(Scope::Rows(rows)) => batches
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, batch)| {
+                                    let rows = rows.get(&(i as u32))?;
+                                    take_rows(batch, rows)
+                                })
                                 .collect(),
                         })
                     })
@@ -1067,15 +1071,29 @@ impl QuarryTable {
                 for file in files {
                     let size = sizes.get(file).copied().unwrap_or(0);
                     let mut partitioned = PartitionedFile::new(file.0.clone(), size);
-                    if let Some(groups) = groups.get(file) {
-                        let count = self.row_group_count(state, url, file, size).await?;
-                        let mut plan = ParquetAccessPlan::new_all(count as usize);
-                        for group in 0..count {
-                            if !groups.contains(&group) {
-                                plan.skip(group as usize);
+                    match scopes.get(file) {
+                        None | Some(Scope::Whole) => {}
+                        Some(scope) => {
+                            let groups = self.row_group_rows(state, url, file, size).await?;
+                            let mut plan = ParquetAccessPlan::new_all(groups.len());
+                            for (group, &len) in groups.iter().enumerate() {
+                                match scope {
+                                    Scope::Whole => {}
+                                    Scope::Groups(admit) => {
+                                        if !admit.contains(&(group as u32)) {
+                                            plan.skip(group);
+                                        }
+                                    }
+                                    Scope::Rows(rows) => match rows.get(&(group as u32)) {
+                                        Some(rows) => {
+                                            plan.scan_selection(group, row_selection(rows, len));
+                                        }
+                                        None => plan.skip(group),
+                                    },
+                                }
                             }
+                            partitioned = partitioned.with_extensions(Arc::new(plan));
                         }
-                        partitioned = partitioned.with_extensions(Arc::new(plan));
                     }
                     builder = builder.with_file_group(vec![partitioned].into());
                 }
@@ -1085,31 +1103,74 @@ impl QuarryTable {
         }
     }
 
-    /// A file's row-group count, read once from its footer and cached.
+    /// A file's per-group row counts, read once from its footer and cached.
     ///
     /// The footer is a few kilobytes at the file's tail; the read resolves
     /// through the session's registered store, so it is metered like any
     /// other — and `ParquetAccessPlan` is strict about it: a plan naming the
     /// wrong number of groups fails rather than guessing.
-    async fn row_group_count(
+    async fn row_group_rows(
         &self,
         state: &dyn Session,
         url: &ObjectStoreUrl,
         file: &FileId,
         size: u64,
-    ) -> DfResult<u32> {
-        if let Some(count) = self.row_groups.lock().expect("row-group cache").get(file) {
-            return Ok(*count);
+    ) -> DfResult<Vec<i64>> {
+        if let Some(groups) = self.row_groups.lock().expect("row-group cache").get(file) {
+            return Ok(groups.clone());
         }
         let store = state.runtime_env().object_store(url)?;
         let mut reader =
             ParquetObjectReader::new(store, ObjectPath::from(file.0.as_str())).with_file_size(size);
         let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
-        let count = metadata.metadata().num_row_groups() as u32;
+        let groups: Vec<i64> = metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows())
+            .collect();
         self.row_groups
             .lock()
             .expect("row-group cache")
-            .insert(file.clone(), count);
-        Ok(count)
+            .insert(file.clone(), groups.clone());
+        Ok(groups)
     }
+}
+
+/// The `RowSelection` admitting `rows` of a group `total` rows long.
+///
+/// Admit-only, like the scope it came from: an offset past the end cannot
+/// name a real row and is ignored rather than erroring.
+fn row_selection(rows: &BTreeSet<u64>, total: i64) -> RowSelection {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for &row in rows {
+        if row as i64 >= total {
+            continue;
+        }
+        let row = row as usize;
+        match ranges.last_mut() {
+            Some(last) if last.end == row => last.end += 1,
+            _ => ranges.push(row..row + 1),
+        }
+    }
+    RowSelection::from_consecutive_ranges(ranges.into_iter(), total as usize)
+}
+
+/// `batch` restricted to the named rows, or `None` if it holds none of them.
+fn take_rows(batch: &RecordBatch, rows: &BTreeSet<u64>) -> Option<RecordBatch> {
+    let indices: Vec<u64> = rows
+        .iter()
+        .cloned()
+        .filter(|row| *row < batch.num_rows() as u64)
+        .collect();
+    if indices.is_empty() {
+        return None;
+    }
+    let indices = UInt64Array::from(indices);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column, &indices, None).expect("indices are in range"))
+        .collect();
+    Some(RecordBatch::try_new(batch.schema(), columns).expect("taken batch"))
 }

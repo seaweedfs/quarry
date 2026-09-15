@@ -31,7 +31,7 @@ use quarry::derived::{
     Derived, DerivedId, FieldId, Kind, PolicyFingerprint, Query, Refreshed, Rewrite, Scope, Source,
 };
 use quarry::engine::{MeteredStore, Quarry, QuarryTable, hash_scalar};
-use quarry::kinds::Index;
+use quarry::kinds::{Bitmap, Index};
 use quarry::registry::Registry;
 use quarry::snapshot::{Diff, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 use url::Url;
@@ -494,9 +494,107 @@ async fn a_scoped_prune_reads_only_the_named_row_groups() {
     );
 
     assert_eq!(
-        scoped_table.last_scan().expect("scan").groups,
-        BTreeMap::from([(a.clone(), BTreeSet::from([0]))]),
+        scoped_table.last_scan().expect("scan").scopes,
+        BTreeMap::from([(a.clone(), Scope::Groups(BTreeSet::from([0])))]),
         "the plan carried group 0 only"
+    );
+    assert!(
+        pruned.stats().bytes_fetched < full.stats().bytes_fetched,
+        "skipping group 1 fetched {} bytes, full scan fetched {}",
+        pruned.stats().bytes_fetched,
+        full.stats().bytes_fetched
+    );
+}
+
+#[tokio::test]
+async fn a_row_bitmap_skips_unnamed_groups_and_rows() {
+    // Same fixture shape as the group-scope test — 'needle' alone in
+    // group 0, group 1 wide and unskippable by statistics — but the bitmap
+    // names the row, so group 0 is read under a RowSelection.
+    let dir = scratch("parquet_bitmap");
+    let wide: Vec<(i64, String)> = (0..200)
+        .map(|i| {
+            (
+                2,
+                format!(
+                    "{}-{:04}-{}",
+                    (b'a' + (i % 26) as u8) as char,
+                    i,
+                    "x".repeat(4_000)
+                ),
+            )
+        })
+        .collect();
+    let wide_rows: Vec<(i64, &str)> = wide.iter().map(|(t, m)| (*t, m.as_str())).collect();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .build();
+    let (a, a_size) = write_parquet_grouped(
+        &dir,
+        "a.parquet",
+        &[&[(1, "needle")], &wide_rows],
+        Some(props),
+    );
+
+    let graph =
+        SnapshotGraph::new().with(Snapshot::root(SnapshotId(810)).with_clean_file(a.clone()));
+    let table = |registry: Option<Registry>| {
+        let t = QuarryTable::new(
+            schema(),
+            TableId("events".into()),
+            SnapshotId(810),
+            graph.clone(),
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .on_object_store(ObjectStoreUrl::local_filesystem())
+        .with_parquet_file(a.clone(), a_size);
+        match registry {
+            Some(registry) => t.with_registry(registry),
+            None => t,
+        }
+    };
+    let sql = "SELECT * FROM events WHERE message = 'needle'";
+
+    let full = metered_local();
+    let rows = run_metered(Arc::new(table(None)), sql, Arc::clone(&full))
+        .await
+        .expect("full scan");
+    assert_eq!(total_rows(&rows), 1);
+
+    let mut bitmap = Bitmap::new(7);
+    bitmap.insert(
+        hash_scalar(&ScalarValue::Utf8(Some("needle".to_owned()))),
+        a.clone(),
+        0,
+        0,
+    );
+    let mut registry = Registry::new();
+    registry.register(Derived::new(
+        DerivedId("message_bitmap".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(810),
+        },
+        POLICY,
+        1,
+        Box::new(bitmap),
+    ));
+    let scoped_table = Arc::new(table(Some(registry)));
+    let pruned = metered_local();
+    let rows = run_metered(Arc::clone(&scoped_table), sql, Arc::clone(&pruned))
+        .await
+        .expect("scoped scan");
+    assert_eq!(total_rows(&rows), 1, "identical answer");
+
+    assert_eq!(
+        scoped_table.last_scan().expect("scan").scopes,
+        BTreeMap::from([(
+            a.clone(),
+            Scope::Rows(BTreeMap::from([(0, BTreeSet::from([0]))]))
+        )]),
+        "the plan carried the row mask"
     );
     assert!(
         pruned.stats().bytes_fetched < full.stats().bytes_fetched,
