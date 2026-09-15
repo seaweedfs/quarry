@@ -74,6 +74,16 @@ impl FilterSet {
     pub fn filter(&self) -> &Filter {
         &self.filter
     }
+
+    /// The postings, for persistence.
+    pub fn postings(&self) -> &BTreeMap<FileId, BTreeMap<u32, BTreeSet<u64>>> {
+        &self.postings
+    }
+
+    /// Bytes held, as declared at build.
+    pub fn bytes_estimate(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Kind for FilterSet {

@@ -27,10 +27,11 @@ use url::Url;
 
 use iceberg::puffin::{Blob, CompressionCodec, PuffinWriter};
 use quarry::derived::PolicyFingerprint;
-use quarry::derived::{Decision, Predicate, Query, Rewrite, Scope};
+use quarry::derived::{Decision, Plan, Predicate, Query, Rewrite, Scope};
 use quarry::engine::{
     Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_bitmap,
-    build_index, hash_scalar, index_id, read_bitmap, read_index, shared, write_index,
+    build_filter_set, build_index, filter_set_id, hash_scalar, index_id, read_bitmap,
+    read_filter_set, read_index, shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -1040,5 +1041,104 @@ async fn a_bitmap_survives_being_written_and_read_back() {
             );
         }
         other => panic!("expected the recovered bitmap to serve, got {other:?}"),
+    }
+}
+
+/// A filter set round-trips: write it, read it, and a restart finds and
+/// serves it — identity carried by the blob's metadata, not the path.
+#[tokio::test]
+async fn a_filter_set_survives_being_written_and_read_back() {
+    let dir = scratch("persist_filter_set");
+
+    let mut sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    for (index, tenants) in [
+        vec![vec![1; 100], vec![2; 100]],
+        vec![vec![3; 100], vec![1; 100]],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (file, size) = write_parquet_grouped(&dir, &format!("{index}.parquet"), &tenants);
+        sizes.insert(file.clone(), size);
+        files.push(file);
+    }
+    let mut snapshot = Snapshot::root(SnapshotId(1));
+    for file in &files {
+        snapshot = snapshot.with_clean_file(file.clone());
+    }
+    let graph = SnapshotGraph::new().with(snapshot);
+
+    let mut table = QuarryTable::new(
+        schema(),
+        TableId("events".into()),
+        SnapshotId(1),
+        graph.clone(),
+        field_ids(),
+    )
+    .with_policy(POLICY)
+    .on_object_store(ObjectStoreUrl::local_filesystem());
+    for (file, size) in &sizes {
+        table = table.with_parquet_file(file.clone(), *size);
+    }
+
+    let fixture_dir = Fixture {
+        dir: dir.clone(),
+        sizes,
+        graph,
+        files,
+    };
+    let (file_io, store) = stacks(&fixture_dir);
+
+    let session = quarry().session();
+    let built = build_filter_set(&session, &table, "tenant_id = 1")
+        .await
+        .expect("build");
+
+    let path = store
+        .write_filter_set(&events(), SnapshotId(1), POLICY, &built)
+        .await
+        .expect("write");
+    let (read, policy) = read_filter_set(&file_io, &path)
+        .await
+        .expect("read")
+        .expect("a usable filter set");
+    assert_eq!(policy, POLICY);
+    assert_eq!(read.filter(), built.filter());
+    assert_eq!(
+        read.postings(),
+        built.postings(),
+        "postings round-trip exactly"
+    );
+
+    // A restart finds it by listing, and it serves the filter it names.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = filter_set_id(&events(), built.filter());
+    let derived = recovered.registry.get(&id).expect("registered");
+
+    let query = Query {
+        table: events(),
+        snapshot: SnapshotId(1),
+        policy: POLICY,
+        plan_hash: 0,
+        plan: Some(Plan::new(
+            BTreeSet::from([TENANT_FIELD]),
+            [built.filter().clone()],
+        )),
+        projected: BTreeSet::from([TENANT_FIELD]),
+        predicates: Vec::new(),
+        aggregate: None,
+    };
+    match derived.may_serve(&query, &fixture_dir.graph) {
+        Decision::Use(Rewrite::Prune { files }) => {
+            assert!(
+                files.values().all(|scope| matches!(scope, Scope::Rows(_))),
+                "the recovered piece posts rows: {files:?}"
+            );
+        }
+        other => panic!("expected the recovered filter set to serve, got {other:?}"),
     }
 }

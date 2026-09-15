@@ -69,8 +69,8 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
-use crate::derived::{Derived, DerivedId, FieldId, PolicyFingerprint, Source};
-use crate::kinds::{Bitmap, Index};
+use crate::derived::{Derived, DerivedId, FieldId, Filter, PolicyFingerprint, Source};
+use crate::kinds::{Bitmap, FilterSet, Index};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
 use crate::stable_hash::HASH_VERSION;
@@ -84,6 +84,12 @@ pub const QUARRY_EQ_INDEX_V2: &str = "quarry-eq-index-v2";
 
 /// The blob type for a row-level [`Bitmap`] index.
 pub const QUARRY_BITMAP_V1: &str = "quarry-bitmap-v1";
+
+/// The blob type for a persisted filter set.
+pub const QUARRY_FILTER_SET_V1: &str = "quarry-filter-set-v1";
+
+/// The blob property holding the canonical filter text a filter set answers.
+const FILTER_TEXT_PROPERTY: &str = "quarry.filter";
 
 /// Property carrying the hash version the postings were built with.
 const HASH_VERSION_PROPERTY: &str = "quarry.hash-version";
@@ -121,6 +127,18 @@ impl Layout {
     /// Where one index belongs, in the path space `FileIO` uses.
     pub fn index_path(&self, table: &TableId, field: FieldId, at: SnapshotId) -> String {
         format!("{}/{}/{}/{}.puffin", self.prefix, table.0, field, at.0)
+    }
+
+    /// Where one filter set belongs — keyed by the filter's hash, not a
+    /// field, because the filter is the identity.
+    pub fn filter_set_path(&self, table: &TableId, filter: &Filter, at: SnapshotId) -> String {
+        self.filter_set_path_for(table, crate::stable_hash::StableHasher::of(filter), at)
+    }
+
+    /// The same path, keyed by the hash directly — for recovery, which has
+    /// the hash from the listing before it has read the filter inside.
+    fn filter_set_path_for(&self, table: &TableId, hash: u64, at: SnapshotId) -> String {
+        format!("{}/{}/fset-{}/{}.puffin", self.prefix, table.0, hash, at.0)
     }
 
     /// Where a table's saved workload belongs.
@@ -182,6 +200,22 @@ impl Layout {
             return None;
         }
         Some((TableId(table.to_owned()), field, SnapshotId(snapshot)))
+    }
+
+    /// Recover `(table, filter hash, snapshot)` from a [`filter_set_path`].
+    ///
+    /// The hash is not the identity itself — the filter text inside the
+    /// blob is — so the caller must read the blob before trusting it. The
+    /// segment exists only so listing can route the read.
+    pub fn parse_filter_set(&self, path: &str) -> Option<(TableId, u64, SnapshotId)> {
+        let mut segments = path.rsplit('/');
+        let snapshot = segments.next()?.strip_suffix(".puffin")?.parse().ok()?;
+        let hash = segments.next()?.strip_prefix("fset-")?.parse().ok()?;
+        let table = segments.next()?;
+        if table.is_empty() {
+            return None;
+        }
+        Some((TableId(table.to_owned()), hash, SnapshotId(snapshot)))
     }
 }
 
@@ -340,6 +374,77 @@ fn decode_bitmap(field: FieldId, bytes: &[u8]) -> Option<Bitmap> {
         return None;
     }
     Some(bitmap)
+}
+
+/// Serialise a filter set's postings: the path table, then
+/// `file → group → rows`. The filter itself travels in blob metadata —
+/// it is the piece's identity, and identity does not belong in the data.
+fn encode_filter_set(set: &FilterSet) -> Vec<u8> {
+    let paths: Vec<&FileId> = set
+        .postings()
+        .keys()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let number_of: BTreeMap<&FileId, u32> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (*file, index as u32))
+        .collect();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for file in &paths {
+        let bytes = file.0.as_bytes();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    out.extend_from_slice(&(set.postings().len() as u32).to_le_bytes());
+    for (file, groups) in set.postings() {
+        out.extend_from_slice(&number_of[file].to_le_bytes());
+        out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+        for (group, rows) in groups {
+            out.extend_from_slice(&group.to_le_bytes());
+            out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            for row in rows {
+                out.extend_from_slice(&row.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Read filter-set postings back; the filter arrives from the caller,
+/// which took it from the blob's metadata.
+fn decode_filter_set(filter: Filter, bytes: &[u8]) -> Option<FilterSet> {
+    let mut cursor = Cursor { bytes, at: 0 };
+
+    let path_count = cursor.u32()?;
+    let mut paths = Vec::with_capacity(path_count.min(1 << 16) as usize);
+    for _ in 0..path_count {
+        let len = cursor.u32()? as usize;
+        paths.push(FileId(String::from_utf8(cursor.take(len)?.to_vec()).ok()?));
+    }
+
+    let files = cursor.u32()?;
+    let mut set = FilterSet::of(filter);
+    for _ in 0..files {
+        let file = paths.get(cursor.u32()? as usize)?.clone();
+        let groups = cursor.u32()?;
+        for _ in 0..groups {
+            let group = cursor.u32()?;
+            let rows = cursor.u32()?;
+            for _ in 0..rows {
+                set.insert(file.clone(), group, cursor.u64()?);
+            }
+        }
+    }
+
+    if cursor.at != bytes.len() {
+        return None;
+    }
+    Some(set)
 }
 
 struct Cursor<'a> {
@@ -550,6 +655,92 @@ pub async fn read_bitmap(
         if let Some(bitmap) = decode_bitmap(field, blob.data()) {
             let bytes = blob.data().len() as u64;
             return Ok(Some((bitmap.with_bytes(bytes), policy)));
+        }
+    }
+    Ok(None)
+}
+
+/// Write a filter set to storage as a Puffin blob.
+///
+/// The canonical filter text goes in the blob's properties — it is the
+/// piece's identity, so it belongs in the metadata, not the data.
+pub async fn write_filter_set(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    policy: PolicyFingerprint,
+    set: &FilterSet,
+) -> iceberg::Result<String> {
+    let path = layout.filter_set_path(table, set.filter(), at);
+    let output = file_io.new_output(&path)?;
+
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_FILTER_SET_V1.to_owned())
+                .fields(set.filter().field.iter().map(|f| *f as i32).collect())
+                .snapshot_id(at.0)
+                .sequence_number(0)
+                .data(encode_filter_set(set))
+                .properties(HashMap::from([
+                    (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
+                    (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                    (FILTER_TEXT_PROPERTY.to_owned(), set.filter().text.clone()),
+                ]))
+                .build(),
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(path)
+}
+
+/// Read one filter set back. The filter's field comes from the blob's
+/// `fields`; the text from its properties — either missing means the blob
+/// is not what the path claimed.
+pub async fn read_filter_set(
+    file_io: &FileIO,
+    path: &str,
+) -> iceberg::Result<Option<(FilterSet, PolicyFingerprint)>> {
+    if !is_plausible_puffin(file_io, path).await? {
+        return Ok(None);
+    }
+    let reader = PuffinReader::new(file_io.new_input(path)?);
+    let metadata = reader.file_metadata().await?;
+
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_FILTER_SET_V1 {
+            continue;
+        }
+        let properties = blob_metadata.properties();
+        if properties.get(HASH_VERSION_PROPERTY).map(String::as_str)
+            != Some(&HASH_VERSION.to_string())
+        {
+            continue;
+        }
+        let Some(policy) = properties
+            .get(POLICY_PROPERTY)
+            .and_then(|raw| raw.parse().ok())
+            .map(PolicyFingerprint)
+        else {
+            continue;
+        };
+        let Some(text) = properties.get(FILTER_TEXT_PROPERTY).cloned() else {
+            continue;
+        };
+        let field = match blob_metadata.fields() {
+            [] => None,
+            [f] => u32::try_from(*f).ok(),
+            _ => continue,
+        };
+        let filter = Filter { field, text };
+
+        let blob = reader.blob(blob_metadata).await?;
+        if let Some(set) = decode_filter_set(filter, blob.data()) {
+            let bytes = blob.data().len() as u64;
+            return Ok(Some((set.with_bytes(bytes), policy)));
         }
     }
     Ok(None)
@@ -788,61 +979,88 @@ pub async fn recover(
     let mut recovered = Recovered::default();
 
     for path in list_paths(store, &layout.object_prefix(table)).await {
-        let Some((found_table, field, at)) = layout.parse(&path) else {
-            continue;
-        };
-        if &found_table != table {
-            continue;
-        }
-        // Listing gave an object-store path; reading and deleting both need
-        // the FileIO one. Recording the wrong form here made `discard` report
-        // success for deletes that hit nothing, because object stores treat
-        // deleting an absent key as a no-op.
-        let readable = layout.index_path(table, field, at);
-
-        if !known_snapshots.contains(&at) {
-            // Built from a snapshot the table no longer retains, so the rule
-            // could not admit it. Disposable; drop it.
-            recovered.discarded.push(readable);
-            continue;
-        }
-        let read = match read_index(file_io, &readable, field).await? {
-            Some((index, policy)) => {
-                let bytes = index.bytes_estimate();
-                Some((
-                    Box::new(index) as Box<dyn crate::derived::Kind>,
-                    bytes,
-                    policy,
-                ))
+        // Two path shapes: a field id names an index or bitmap, an
+        // `fset-<hash>` segment names a filter set.
+        if let Some((found_table, field, at)) = layout.parse(&path) {
+            if &found_table != table {
+                continue;
             }
-            None => match read_bitmap(file_io, &readable, field).await? {
-                Some((bitmap, policy)) => {
-                    let bytes = bitmap.bytes_estimate();
+            // Listing gave an object-store path; reading and deleting both
+            // need the FileIO one. Recording the wrong form here made
+            // `discard` report success for deletes that hit nothing, because
+            // object stores treat deleting an absent key as a no-op.
+            let readable = layout.index_path(table, field, at);
+
+            if !known_snapshots.contains(&at) {
+                // Built from a snapshot the table no longer retains, so the
+                // rule could not admit it. Disposable; drop it.
+                recovered.discarded.push(readable);
+                continue;
+            }
+            let read = match read_index(file_io, &readable, field).await? {
+                Some((index, policy)) => {
+                    let bytes = index.bytes_estimate();
                     Some((
-                        Box::new(bitmap) as Box<dyn crate::derived::Kind>,
+                        Box::new(index) as Box<dyn crate::derived::Kind>,
                         bytes,
                         policy,
                     ))
                 }
-                None => None,
-            },
-        };
-        match read {
-            Some((kind, bytes, policy)) => {
-                let id = super::index_id(table, field);
-                recovered.fields.insert(id.clone(), field);
-                recovered.registry.register(Derived::new(
-                    id,
-                    Source {
-                        table: table.clone(),
-                        snapshot: at,
-                    },
-                    policy,
-                    bytes,
-                    kind,
-                ));
+                None => match read_bitmap(file_io, &readable, field).await? {
+                    Some((bitmap, policy)) => {
+                        let bytes = bitmap.bytes_estimate();
+                        Some((
+                            Box::new(bitmap) as Box<dyn crate::derived::Kind>,
+                            bytes,
+                            policy,
+                        ))
+                    }
+                    None => None,
+                },
+            };
+            match read {
+                Some((kind, bytes, policy)) => {
+                    let id = super::index_id(table, field);
+                    recovered.fields.insert(id.clone(), field);
+                    recovered.registry.register(Derived::new(
+                        id,
+                        Source {
+                            table: table.clone(),
+                            snapshot: at,
+                        },
+                        policy,
+                        bytes,
+                        kind,
+                    ));
+                }
+                None => recovered.discarded.push(readable),
             }
-            None => recovered.discarded.push(readable),
+        } else if let Some((found_table, _hash, at)) = layout.parse_filter_set(&path) {
+            if &found_table != table {
+                continue;
+            }
+            let readable = layout.filter_set_path_for(table, _hash, at);
+            if !known_snapshots.contains(&at) {
+                recovered.discarded.push(readable);
+                continue;
+            }
+            match read_filter_set(file_io, &readable).await? {
+                Some((set, policy)) => {
+                    let bytes = set.bytes_estimate();
+                    let id = super::filter_set_id(table, set.filter());
+                    recovered.registry.register(Derived::new(
+                        id,
+                        Source {
+                            table: table.clone(),
+                            snapshot: at,
+                        },
+                        policy,
+                        bytes,
+                        Box::new(set),
+                    ));
+                }
+                None => recovered.discarded.push(readable),
+            }
         }
     }
     Ok(recovered)
@@ -1056,6 +1274,17 @@ impl Store {
         write_bitmap(&self.file_io, &self.layout, table, at, policy, bitmap).await
     }
 
+    /// Persist a filter set beside the table it indexes.
+    pub async fn write_filter_set(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        policy: PolicyFingerprint,
+        set: &FilterSet,
+    ) -> iceberg::Result<String> {
+        write_filter_set(&self.file_io, &self.layout, table, at, policy, set).await
+    }
+
     /// Rebuild a table's registry from storage.
     pub async fn recover(
         &self,
@@ -1136,7 +1365,29 @@ impl Store {
             return Ok(recovered);
         }
         for entry in advertised(stats) {
-            if !matches!(entry.kind.as_str(), QUARRY_EQ_INDEX_V2 | QUARRY_BITMAP_V1) {
+            // A filter set names no field it must parse; its blob carries
+            // the filter itself.
+            if entry.kind == QUARRY_FILTER_SET_V1 {
+                match read_filter_set(&self.file_io, &entry.path).await? {
+                    Some((set, policy)) => {
+                        let bytes = set.bytes_estimate();
+                        let id = super::filter_set_id(table, set.filter());
+                        recovered.registry.register(Derived::new(
+                            id,
+                            Source {
+                                table: table.clone(),
+                                snapshot: at,
+                            },
+                            policy,
+                            bytes,
+                            Box::new(set),
+                        ));
+                    }
+                    None => recovered.discarded.push(entry.path),
+                }
+                continue;
+            }
+            if entry.kind != QUARRY_EQ_INDEX_V2 && entry.kind != QUARRY_BITMAP_V1 {
                 continue;
             }
             let Some(&field) = entry.fields.first() else {
