@@ -760,8 +760,8 @@ natural-language queries     belongs in the client, not the engine
 
 accelerator taxonomy (core-design §4):
 bitmap indexes               file-level postings already exist and now
-                             intersect; row-level bitmaps need intra-file
-                             Rewrite granularity
+                             intersect at row-group scope; row-level
+                             bitmaps need a row-mask Rewrite variant
 L3 reusable computation      subplan substitution keyed by ComputeID; the
                              cube path proves the seam on Aggregate only —
                              revisit when telemetry demands a second
@@ -1751,3 +1751,36 @@ Three of the tests pin decisions, not just results:
   decides the leader; composition did not smuggle in a second strategy.
 - `residuals_intersect_with_postings` — both indexes predate a file, so
   {a,b,d} ∩ {b,d} = {b,d}: the residual unions before it intersects.
+
+---
+
+## Phase 25 — Row-group scopes `[x]`
+
+Composition intersected whole files only. `Rewrite::Prune` now maps each
+file to a `Scope` — `Whole`, or `Groups(row-group ids)` — and
+`Scope::intersect` defines how two prunes on one file combine:
+Whole ∩ Groups = Groups, Groups ∩ Groups = set intersection, an empty
+intersection drops the file. A kind that knows files only writes
+`Rewrite::prune(...)` and changes nothing.
+
+Execution carries the scope through. The in-memory path treats a file's
+batches as its row groups and reads only the named ones. The Parquet path
+attaches a `ParquetAccessPlan` per file — the mechanism DataFusion itself
+uses for row-group skipping — which requires the file's group count at
+plan time; `row_group_count` fetches the footer once per file through the
+session's registered store, so it is metered like any other read.
+
+The scope is admit-only by construction, the same safety shape as the
+file set: a kind that names too many groups is merely slow, and a group
+id a file does not have is ignored rather than erroring. Deletes still
+apply above the scan.
+
+`ScanReport.groups` records what was selected — a file absent from it was
+read whole. The tests:
+
+- `a_scoped_prune_reads_only_the_named_batches` — file a holds tenant 1
+  in batch 0 and tenant 2 in batch 1; the scope names batch 0 and the
+  answer is unchanged.
+- `a_scoped_prune_reads_only_the_named_row_groups` — the honest version:
+  group 1's messages span 'a'..'z' so the file's own statistics cannot
+  skip it; only the scope does, and the metered bytes prove it.

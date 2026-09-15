@@ -10,7 +10,7 @@
 //! prevented by construction rather than by care. A new kind implements three
 //! methods and inherits the correctness argument.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::cost::{Cost, PriceTable};
@@ -300,25 +300,58 @@ impl Query {
     }
 }
 
+/// How much of one file a [`Rewrite::Prune`] admits.
+///
+/// A kind that knows files only returns [`Scope::Whole`]; a kind that knows
+/// which parts of a file hold a value names them instead. The granularity is
+/// the file's own row groups — for an in-memory file, its batches play the
+/// same role.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// Every row group.
+    #[default]
+    Whole,
+    /// The named row groups only.
+    ///
+    /// A group not named cannot hold a row satisfying the predicate this
+    /// scope came from.
+    Groups(BTreeSet<u32>),
+}
+
+impl Scope {
+    /// What both scopes admit — how two prunes on one file compose.
+    ///
+    /// `None` means no group survives: the file cannot satisfy the conjunct.
+    pub fn intersect(&self, other: &Scope) -> Option<Scope> {
+        match (self, other) {
+            (Scope::Whole, scope) | (scope, Scope::Whole) => Some(scope.clone()),
+            (Scope::Groups(a), Scope::Groups(b)) => {
+                let both: BTreeSet<u32> = a.intersection(b).cloned().collect();
+                (!both.is_empty()).then_some(Scope::Groups(both))
+            }
+        }
+    }
+}
+
 /// How derived state changes a plan.
 ///
 /// The distinction carries the design's central safety property, so it is a
 /// type rather than a convention.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rewrite {
-    /// Narrow which files must be read.
+    /// Narrow which files must be read, and how much of each.
     ///
     /// The engine still reads real data and applies deletes, so naming too
-    /// many files is merely slow. Naming too *few* would lose rows, which is
-    /// why files added since the derived state was built are unioned back in
-    /// by [`Derived::may_serve`].
+    /// many files — or too many row groups — is merely slow. Naming too
+    /// *few* would lose rows, which is why files added since the derived
+    /// state was built are unioned back in by [`Derived::may_serve`].
     ///
     /// When returned by [`Derived::may_serve`], `files` is guaranteed to
     /// contain only files live at the queried snapshot. A [`Kind`] computing
     /// one from older metadata need not check that itself.
     Prune {
-        /// Files that may contain matching rows.
-        files: BTreeSet<FileId>,
+        /// Files that may contain matching rows, and how much of each.
+        files: BTreeMap<FileId, Scope>,
     },
     /// Replace the data source with the derived state.
     ///
@@ -348,6 +381,16 @@ pub enum Rewrite {
 }
 
 impl Rewrite {
+    /// A pruning rewrite admitting `files` whole.
+    ///
+    /// Most kinds know files only; a kind that also knows row groups writes
+    /// the [`BTreeMap`] itself.
+    pub fn prune(files: impl IntoIterator<Item = FileId>) -> Rewrite {
+        Rewrite::Prune {
+            files: files.into_iter().map(|f| (f, Scope::Whole)).collect(),
+        }
+    }
+
     /// Whether this rewrite replaces the data source rather than narrowing it.
     pub fn is_substituting(&self) -> bool {
         matches!(self, Rewrite::Substitute { .. })
@@ -578,7 +621,7 @@ impl Derived {
             Rewrite::Prune { files } => Rewrite::Prune {
                 files: files
                     .into_iter()
-                    .filter(|file| at.files().contains_key(file))
+                    .filter(|(file, _)| at.files().contains_key(file))
                     .collect(),
             },
             substituting => substituting,
@@ -639,9 +682,7 @@ mod tests {
             query
                 .filtered_fields()
                 .contains(&4)
-                .then(|| Rewrite::Prune {
-                    files: self.files.clone(),
-                })
+                .then(|| Rewrite::prune(self.files.iter().cloned()))
         }
         fn cost(&self, _prices: &PriceTable) -> Cost {
             Cost::ZERO
@@ -743,7 +784,7 @@ mod tests {
         assert_eq!(
             d.may_serve(&query_at(s(812)), &g),
             Decision::Use(Rewrite::Prune {
-                files: BTreeSet::from([f("a")])
+                files: BTreeMap::from([(f("a"), Scope::Whole)])
             })
         );
     }
@@ -758,7 +799,7 @@ mod tests {
             d.may_serve(&query_at(s(812)), &g),
             Decision::UseWith {
                 rewrite: Rewrite::Prune {
-                    files: BTreeSet::from([f("a")])
+                    files: BTreeMap::from([(f("a"), Scope::Whole)])
                 },
                 also_scan: BTreeSet::from([f("b"), f("c")]),
             }
@@ -861,7 +902,7 @@ mod tests {
         assert_eq!(
             index.may_serve(&query_at(s(811)), &g),
             Decision::Use(Rewrite::Prune {
-                files: BTreeSet::from([f("a")])
+                files: BTreeMap::from([(f("a"), Scope::Whole)])
             }),
             "pruning is safe: the engine still reads the file and applies deletes"
         );
@@ -883,7 +924,7 @@ mod tests {
             index_at(s(810), &["a"]).may_serve(&query_at(s(811)), &g),
             Decision::UseWith {
                 rewrite: Rewrite::Prune {
-                    files: BTreeSet::new()
+                    files: BTreeMap::new()
                 },
                 also_scan: BTreeSet::from([f("merged")]),
             },
@@ -898,7 +939,7 @@ mod tests {
             index_at(s(810), &["a"]).may_serve(&query_at(s(811)), &g),
             Decision::UseWith {
                 rewrite: Rewrite::Prune {
-                    files: BTreeSet::from([f("a")])
+                    files: BTreeMap::from([(f("a"), Scope::Whole)])
                 },
                 also_scan: BTreeSet::from([f("b")]),
             }

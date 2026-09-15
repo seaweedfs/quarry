@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::PriceTable;
-use crate::derived::{Decision, Derived, DerivedId, Query, Rewrite};
+use crate::derived::{Decision, Derived, DerivedId, Query, Rewrite, Scope};
 use crate::snapshot::{FileId, SnapshotGraph};
 
 /// One admissible candidate for serving a query.
@@ -40,9 +40,10 @@ pub enum Composed<'a> {
     /// leader is always listed, even when it narrows nothing, because it is
     /// still the piece the scan reads its candidate files from.
     Pruned {
-        /// Files to read: every contributing index's set intersected, each
-        /// already unioned with the files added since it was built.
-        files: BTreeSet<FileId>,
+        /// Files to read, and how much of each: every contributing index's
+        /// set intersected, each already unioned with the files added since
+        /// it was built. Residual files are always whole.
+        files: BTreeMap<FileId, Scope>,
         /// The added-since portion of `files`.
         residual: BTreeSet<FileId>,
         /// The pieces that narrowed the set, cheapest first.
@@ -62,7 +63,7 @@ pub fn compose<'a>(
     candidates: &'a [Candidate<'a>],
     can_substitute: impl Fn(&Derived) -> bool,
 ) -> Composed<'a> {
-    let mut files: Option<BTreeSet<FileId>> = None;
+    let mut files: Option<BTreeMap<FileId, Scope>> = None;
     let mut residual = BTreeSet::new();
     let mut pieces = Vec::new();
     for candidate in candidates {
@@ -78,11 +79,12 @@ pub fn compose<'a>(
                 }
             }
             Rewrite::Prune { files: named } => {
-                let effective: BTreeSet<FileId> = named
-                    .iter()
-                    .chain(also_scan.into_iter().flatten())
-                    .cloned()
-                    .collect();
+                // Files added since the piece was built may match anything;
+                // they join its set at whole-file scope.
+                let mut effective = named.clone();
+                for file in also_scan.into_iter().flatten() {
+                    effective.entry(file.clone()).or_insert(Scope::Whole);
+                }
                 match &mut files {
                     None => {
                         residual.extend(also_scan.into_iter().flatten().cloned());
@@ -90,11 +92,17 @@ pub fn compose<'a>(
                         pieces.push(candidate.clone());
                     }
                     Some(current) => {
-                        let narrowed: BTreeSet<FileId> =
-                            current.intersection(&effective).cloned().collect();
-                        if narrowed.len() < current.len() {
+                        let mut next = BTreeMap::new();
+                        for (file, scope) in current.iter() {
+                            if let Some(scope) =
+                                effective.get(file).and_then(|o| scope.intersect(o))
+                            {
+                                next.insert(file.clone(), scope);
+                            }
+                        }
+                        if *current != next {
                             residual.extend(also_scan.into_iter().flatten().cloned());
-                            *current = narrowed;
+                            *current = next;
                             pieces.push(candidate.clone());
                         }
                     }
@@ -104,7 +112,10 @@ pub fn compose<'a>(
     }
     match files {
         Some(files) => Composed::Pruned {
-            residual: residual.intersection(&files).cloned().collect(),
+            residual: residual
+                .into_iter()
+                .filter(|f| files.contains_key(f))
+                .collect(),
             files,
             pieces,
         },
@@ -288,7 +299,7 @@ mod tests {
         Derived, DerivedId, FieldId, Kind, PolicyFingerprint, Predicate, Refreshed, Rewrite, Source,
     };
     use crate::snapshot::{Diff, FileId, Snapshot, SnapshotId, TableId};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const POLICY: PolicyFingerprint = PolicyFingerprint(1);
 
@@ -335,7 +346,7 @@ mod tests {
     #[derive(Debug)]
     struct Pruner {
         field: FieldId,
-        files: BTreeSet<FileId>,
+        files: BTreeMap<FileId, Scope>,
         usd: f64,
     }
 
@@ -363,6 +374,36 @@ mod tests {
     }
 
     fn prune_entry(id: &str, field: u32, usd: f64, files: &[&str]) -> Derived {
+        pruner(
+            id,
+            field,
+            usd,
+            files
+                .iter()
+                .map(|f| (FileId(f.to_string()), Scope::Whole))
+                .collect(),
+        )
+    }
+
+    /// A prune entry whose postings name row groups, not just files.
+    fn scoped_entry(id: &str, field: u32, usd: f64, files: &[(&str, &[u32])]) -> Derived {
+        pruner(
+            id,
+            field,
+            usd,
+            files
+                .iter()
+                .map(|(f, groups)| {
+                    (
+                        FileId(f.to_string()),
+                        Scope::Groups(groups.iter().cloned().collect()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn pruner(id: &str, field: u32, usd: f64, files: BTreeMap<FileId, Scope>) -> Derived {
         Derived::new(
             DerivedId(id.into()),
             Source {
@@ -371,11 +412,7 @@ mod tests {
             },
             POLICY,
             files.len() as u64,
-            Box::new(Pruner {
-                field,
-                files: files.iter().map(|f| FileId(f.to_string())).collect(),
-                usd,
-            }),
+            Box::new(Pruner { field, files, usd }),
         )
     }
 
@@ -596,7 +633,7 @@ mod tests {
                 residual,
                 pieces,
             } => {
-                assert_eq!(files, BTreeSet::from([FileId("b".into())]));
+                assert_eq!(files, BTreeMap::from([(FileId("b".into()), Scope::Whole)]));
                 assert!(residual.is_empty());
                 assert_eq!(
                     pieces
@@ -620,7 +657,7 @@ mod tests {
 
         match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
             Composed::Pruned { files, pieces, .. } => {
-                assert_eq!(files, BTreeSet::from([FileId("a".into())]));
+                assert_eq!(files, BTreeMap::from([(FileId("a".into()), Scope::Whole)]));
                 assert_eq!(
                     pieces.len(),
                     1,
@@ -680,7 +717,10 @@ mod tests {
                 // postings + {d}: {a,b,d} ∩ {b,d} = {b,d}.
                 assert_eq!(
                     files,
-                    BTreeSet::from([FileId("b".into()), FileId("d".into())])
+                    BTreeMap::from([
+                        (FileId("b".into()), Scope::Whole),
+                        (FileId("d".into()), Scope::Whole)
+                    ])
                 );
                 assert_eq!(residual, BTreeSet::from([FileId("d".into())]));
             }
@@ -712,7 +752,7 @@ mod tests {
 
         match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
             Composed::Pruned { files, pieces, .. } => {
-                assert_eq!(files, BTreeSet::from([FileId("a".into())]));
+                assert_eq!(files, BTreeMap::from([(FileId("a".into()), Scope::Whole)]));
                 assert_eq!(pieces.len(), 1);
             }
             _ => panic!("the cheaper prune leads; stored rows never get asked"),
@@ -738,5 +778,45 @@ mod tests {
     #[test]
     fn nothing_admissible_is_a_full_scan() {
         assert!(matches!(compose(&[], |_| true), Composed::Scan));
+    }
+
+    #[test]
+    fn scopes_intersect_within_a_shared_file() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(scoped_entry(
+            "a_idx",
+            4,
+            1.0,
+            &[("a", &[0, 1]), ("b", &[0])],
+        ));
+        r.register(scoped_entry("b_idx", 9, 2.0, &[("a", &[1, 2])]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned { files, pieces, .. } => {
+                assert_eq!(
+                    files,
+                    BTreeMap::from([(FileId("a".into()), Scope::Groups(BTreeSet::from([1])))]),
+                    "b is dropped — no index names it — and a keeps only group 1"
+                );
+                assert_eq!(pieces.len(), 2);
+            }
+            _ => panic!("expected a pruned plan"),
+        }
+    }
+
+    #[test]
+    fn disjoint_scopes_drop_the_file() {
+        let prices = PriceTable::default();
+        let mut r = Registry::new();
+        r.register(scoped_entry("a_idx", 4, 1.0, &[("a", &[0])]));
+        r.register(scoped_entry("b_idx", 9, 2.0, &[("a", &[1])]));
+
+        match compose(&r.candidates(&and_query(), &graph(), &prices), |_| true) {
+            Composed::Pruned { files, .. } => {
+                assert!(files.is_empty(), "no group satisfies both, so no file can");
+            }
+            _ => panic!("expected a pruned plan"),
+        }
     }
 }

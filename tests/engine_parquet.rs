@@ -19,17 +19,21 @@ use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use object_store::local::LocalFileSystem;
 
 use quarry::budget::Budget;
-use quarry::cost::PriceTable;
-use quarry::derived::{Derived, DerivedId, PolicyFingerprint, Source};
+use quarry::cost::{Cost, PriceTable};
+use quarry::derived::{
+    Derived, DerivedId, FieldId, Kind, PolicyFingerprint, Query, Refreshed, Rewrite, Scope, Source,
+};
 use quarry::engine::{MeteredStore, Quarry, QuarryTable, hash_scalar};
 use quarry::kinds::Index;
 use quarry::registry::Registry;
-use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
+use quarry::snapshot::{Diff, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 use url::Url;
 
 const TENANT_FIELD: u32 = 4;
@@ -66,10 +70,25 @@ fn scratch(name: &str) -> PathBuf {
 
 /// Write one Parquet file and return its object path and byte length.
 fn write_parquet(dir: &Path, name: &str, rows: &[(i64, &str)]) -> (FileId, u64) {
+    write_parquet_grouped(dir, name, &[rows], None)
+}
+
+/// Write one Parquet file with one row group per entry — each `flush`
+/// closes the group in progress, so this is the shape a scoped prune
+/// selects within.
+fn write_parquet_grouped(
+    dir: &Path,
+    name: &str,
+    groups: &[&[(i64, &str)]],
+    props: Option<WriterProperties>,
+) -> (FileId, u64) {
     let path = dir.join(name);
     let file = fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema(), None).expect("writer");
-    writer.write(&batch(rows)).expect("write batch");
+    let mut writer = ArrowWriter::try_new(file, schema(), props).expect("writer");
+    for rows in groups {
+        writer.write(&batch(rows)).expect("write batch");
+        writer.flush().expect("close row group");
+    }
     writer.close().expect("close writer");
 
     let size = fs::metadata(&path).expect("stat").len();
@@ -144,6 +163,50 @@ fn parquet_table(dir: &Path, snapshot: i64) -> (QuarryTable, [FileId; 3]) {
     .with_parquet_file(c.clone(), c_size);
 
     (table, [a, b, c])
+}
+
+/// A kind admitting only the named row groups of the named files — the
+/// shape a row-group-aware index produces, stood in for by a fixture.
+#[derive(Debug)]
+struct ScopedIndex {
+    field: FieldId,
+    files: BTreeMap<FileId, Scope>,
+}
+
+impl Kind for ScopedIndex {
+    fn name(&self) -> &'static str {
+        "scoped"
+    }
+    fn matches(&self, query: &Query) -> Option<Rewrite> {
+        (!query.equalities(self.field).is_empty()).then(|| Rewrite::Prune {
+            files: self.files.clone(),
+        })
+    }
+    fn cost(&self, _prices: &PriceTable) -> Cost {
+        Cost::ZERO
+    }
+    fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+        Refreshed::UpToDate
+    }
+}
+
+fn scoped_index(at: i64, field: FieldId, files: &[(FileId, &[u32])]) -> Derived {
+    Derived::new(
+        DerivedId("scoped_idx".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(at),
+        },
+        POLICY,
+        1,
+        Box::new(ScopedIndex {
+            field,
+            files: files
+                .iter()
+                .map(|(f, groups)| (f.clone(), Scope::Groups(groups.iter().cloned().collect())))
+                .collect(),
+        }),
+    )
 }
 
 fn tenant_index(at: i64, entries: &[(i64, &FileId)]) -> Derived {
@@ -356,6 +419,90 @@ async fn pruning_measurably_reduces_bytes_fetched() {
         "pruning should mean fewer requests too: {} vs {}",
         pruned.stats().requests,
         full.stats().requests
+    );
+}
+
+#[tokio::test]
+async fn a_scoped_prune_reads_only_the_named_row_groups() {
+    // One file, two row groups on `message`: 'needle' alone in group 0,
+    // group 1 padded wide with messages whose min/max span 'a'..'z' — so
+    // the file's own statistics admit group 1 and only the scoped kind
+    // knows to skip it.
+    let dir = scratch("parquet_scoped");
+    let wide: Vec<(i64, String)> = (0..200)
+        .map(|i| {
+            (
+                2,
+                format!(
+                    "{}-{:04}-{}",
+                    (b'a' + (i % 26) as u8) as char,
+                    i,
+                    "x".repeat(4_000)
+                ),
+            )
+        })
+        .collect();
+    let wide_rows: Vec<(i64, &str)> = wide.iter().map(|(t, m)| (*t, m.as_str())).collect();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .build();
+    let (a, a_size) = write_parquet_grouped(
+        &dir,
+        "a.parquet",
+        &[&[(1, "needle")], &wide_rows],
+        Some(props),
+    );
+
+    let graph =
+        SnapshotGraph::new().with(Snapshot::root(SnapshotId(810)).with_clean_file(a.clone()));
+    let table = |registry: Option<Registry>| {
+        let t = QuarryTable::new(
+            schema(),
+            TableId("events".into()),
+            SnapshotId(810),
+            graph.clone(),
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .on_object_store(ObjectStoreUrl::local_filesystem())
+        .with_parquet_file(a.clone(), a_size);
+        match registry {
+            Some(registry) => t.with_registry(registry),
+            None => t,
+        }
+    };
+    let sql = "SELECT * FROM events WHERE message = 'needle'";
+
+    let full = metered_local();
+    let rows = run_metered(Arc::new(table(None)), sql, Arc::clone(&full))
+        .await
+        .expect("full scan");
+    assert_eq!(total_rows(&rows), 1);
+
+    let mut registry = Registry::new();
+    registry.register(scoped_index(810, 7, &[(a.clone(), &[0])]));
+    let scoped_table = Arc::new(table(Some(registry)));
+    let pruned = metered_local();
+    let rows = run_metered(Arc::clone(&scoped_table), sql, Arc::clone(&pruned))
+        .await
+        .expect("scoped scan");
+    assert_eq!(
+        total_rows(&rows),
+        1,
+        "identical answer — the scope only skips work"
+    );
+
+    assert_eq!(
+        scoped_table.last_scan().expect("scan").groups,
+        BTreeMap::from([(a.clone(), BTreeSet::from([0]))]),
+        "the plan carried group 0 only"
+    );
+    assert!(
+        pruned.stats().bytes_fetched < full.stats().bytes_fetched,
+        "skipping group 1 fetched {} bytes, full scan fetched {}",
+        pruned.stats().bytes_fetched,
+        full.stats().bytes_fetched
     );
 }
 

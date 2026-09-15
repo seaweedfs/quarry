@@ -151,7 +151,7 @@ impl Kind for Index {
                 files.extend(posting.iter().cloned());
             }
         }
-        Some(Rewrite::Prune { files })
+        Some(Rewrite::prune(files))
     }
 
     fn cost(&self, prices: &PriceTable) -> Cost {
@@ -178,7 +178,7 @@ impl Kind for Index {
 mod tests {
     use super::*;
     use crate::derived::{
-        Decision, Derived, DerivedId, PolicyFingerprint, Predicate, Reason, Source,
+        Decision, Derived, DerivedId, PolicyFingerprint, Predicate, Reason, Scope, Source,
     };
     use crate::snapshot::{DeleteState, Snapshot, SnapshotGraph, SnapshotId, TableId};
 
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(
             got,
             Some(Rewrite::Prune {
-                files: BTreeSet::from([f("a"), f("b")])
+                files: BTreeMap::from([(f("a"), Scope::Whole), (f("b"), Scope::Whole)])
             })
         );
     }
@@ -231,7 +231,11 @@ mod tests {
         assert_eq!(
             got,
             Some(Rewrite::Prune {
-                files: BTreeSet::from([f("a"), f("b"), f("c")])
+                files: BTreeMap::from([
+                    (f("a"), Scope::Whole),
+                    (f("b"), Scope::Whole),
+                    (f("c"), Scope::Whole)
+                ])
             })
         );
     }
@@ -243,7 +247,7 @@ mod tests {
         assert_eq!(
             got,
             Some(Rewrite::Prune {
-                files: BTreeSet::new()
+                files: BTreeMap::new()
             })
         );
     }
@@ -337,7 +341,7 @@ mod tests {
             derived_index(SnapshotId(810)).may_serve(&q, &g),
             Decision::UseWith {
                 rewrite: Rewrite::Prune {
-                    files: BTreeSet::from([f("a"), f("b")])
+                    files: BTreeMap::from([(f("a"), Scope::Whole), (f("b"), Scope::Whole)])
                 },
                 also_scan: BTreeSet::from([f("d")]),
             },

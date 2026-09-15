@@ -18,11 +18,15 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
-use quarry::derived::{Derived, DerivedId, Plan, PolicyFingerprint, Source};
+use quarry::cost::{Cost, PriceTable};
+use quarry::derived::{
+    Derived, DerivedId, FieldId, Kind, Plan, PolicyFingerprint, Query, Refreshed, Rewrite, Scope,
+    Source,
+};
 use quarry::engine::{MaterializedResult, QuarryTable, Rollup, hash_scalar};
 use quarry::kinds::{Index, ResultCache};
 use quarry::registry::Registry;
-use quarry::snapshot::{DeleteState, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
+use quarry::snapshot::{DeleteState, Diff, FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
 
 const TENANT_FIELD: u32 = 4;
 const POLICY: PolicyFingerprint = PolicyFingerprint(1);
@@ -99,6 +103,50 @@ fn message_index(id: &str, at: i64, entries: &[(&str, &str)]) -> Derived {
         );
     }
     field_index(id, at, index)
+}
+
+/// A kind admitting only the named batches of the named files — stands in
+/// for a kind that knows row groups, which an in-memory file's batches are.
+#[derive(Debug)]
+struct ScopedIndex {
+    field: FieldId,
+    files: BTreeMap<FileId, Scope>,
+}
+
+impl Kind for ScopedIndex {
+    fn name(&self) -> &'static str {
+        "scoped"
+    }
+    fn matches(&self, query: &Query) -> Option<Rewrite> {
+        (!query.equalities(self.field).is_empty()).then(|| Rewrite::Prune {
+            files: self.files.clone(),
+        })
+    }
+    fn cost(&self, _prices: &PriceTable) -> Cost {
+        Cost::ZERO
+    }
+    fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+        Refreshed::UpToDate
+    }
+}
+
+fn scoped_index(at: i64, files: &[(&str, Scope)]) -> Derived {
+    Derived::new(
+        DerivedId("scoped_idx".into()),
+        Source {
+            table: TableId("events".into()),
+            snapshot: SnapshotId(at),
+        },
+        POLICY,
+        1,
+        Box::new(ScopedIndex {
+            field: TENANT_FIELD,
+            files: files
+                .iter()
+                .map(|(f, scope)| (file(f), scope.clone()))
+                .collect(),
+        }),
+    )
 }
 
 fn field_index(id: &str, at: i64, index: Index) -> Derived {
@@ -222,6 +270,53 @@ async fn an_index_that_narrows_nothing_is_not_credited() {
     let report = table.last_scan().expect("a scan happened");
     assert_eq!(report.files_read, BTreeSet::from([file("a"), file("c")]),);
     assert_eq!(report.used, ["tenant_idx"], "only the piece that narrowed");
+}
+
+#[tokio::test]
+async fn a_scoped_prune_reads_only_the_named_batches() {
+    // File a holds tenant 1 in batch 0 and tenant 2 in batch 1 — an
+    // in-memory file's batches playing the role of row groups — and the
+    // kind names batch 0 only. File c is admitted whole.
+    let mut registry = Registry::new();
+    registry.register(scoped_index(
+        810,
+        &[
+            ("a", Scope::Groups(BTreeSet::from([0]))),
+            ("c", Scope::Whole),
+        ],
+    ));
+    let table = Arc::new(
+        QuarryTable::new(
+            schema(),
+            TableId("events".into()),
+            SnapshotId(810),
+            flat_graph(&["a", "c"], 810),
+            field_ids(),
+        )
+        .with_policy(POLICY)
+        .with_file(file("a"), vec![batch(&[(1, "a1")]), batch(&[(2, "a2")])])
+        .with_file(file("c"), vec![batch(&[(1, "c1")])])
+        .with_registry(registry),
+    );
+
+    let rows = run(
+        Arc::clone(&table),
+        "SELECT * FROM events WHERE tenant_id = 1",
+    )
+    .await;
+    assert_eq!(
+        total_rows(&rows),
+        2,
+        "a1 and c1 — the scope never changes the answer"
+    );
+
+    let report = table.last_scan().expect("a scan happened");
+    assert_eq!(
+        report.groups,
+        BTreeMap::from([(file("a"), BTreeSet::from([0]))]),
+        "the plan carries the scope through; c is whole and absent"
+    );
+    assert_eq!(report.used, ["scoped_idx"]);
 }
 
 #[tokio::test]
