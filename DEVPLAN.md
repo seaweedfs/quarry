@@ -646,10 +646,13 @@ lock, not an async one, because planning takes a read guard and never awaits
 while holding it. The test asserts the built index serves the *same* table
 instance that was registered before it existed.
 
-**Advisory and automatic share one code path.** `Policy::ADVISORY` runs the
-same decisions and reports them as `Declined::Advisory` rather than acting. A
-separate advisory path could disagree with what automatic mode would do, which
-would make the advice worthless.
+**Recommendations, not automatic builds.** The optimizer collects usage
+stats and produces structured recommendations with cost analysis
+(`expected_savings_usd`, `build_cost_usd`, `ceiling_usd`) through
+`recommend()`. The caller acts on them explicitly through `build()`,
+`build_recommended()`, `retire()`, or `retire_recommended()`. What `round()`
+does automatically is refresh — rebuilding state that has fallen too far
+behind, which is correctness maintenance, not optimization.
 
 Rebuilding after a freshly-built index would otherwise happen every round: the
 index has not served a query yet, so the workload still sees the shape as
@@ -695,8 +698,8 @@ the same round rebuilds it. That ordering was chosen to free budget and happens
 to fix this too.
 
 **A unit test was deleted for asserting on constants.** `Policy::ADVISORY` is a
-`const`, so `assert!(!Policy::ADVISORY.auto_optimize)` is constant-folded and
-proves nothing — clippy caught it. The behaviour that matters is tested against
+`const`, so asserting on its fields is constant-folded and proves nothing —
+clippy caught it. The behaviour that matters is tested against
 a real table instead. Silencing the lint with a `const` block would have kept a
 test that tests nothing.
 
