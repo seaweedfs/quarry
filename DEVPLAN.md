@@ -2036,3 +2036,23 @@ The loop closes: two unaided top-k searches, the round builds the index
 (the one build in the crate that cannot be cheaper than the scan it
 replaces — a flat index *is* the table, read once at build instead of
 once per query), and the next search is served with no file read.
+
+## Phase 36 — Text index persistence `[x]`
+
+`TextIndex` postings (term → file set) are reusable derived state: they
+can be persisted and recovered without re-reading the table. A new
+`quarry-text-index-v1` Puffin blob type carries the postings alongside
+the existing hash-version and policy metadata, following the same
+encode/decode discipline as equality indexes and bitmaps.
+
+Recovery distinguishes text blobs from equality indexes and bitmaps by
+blob type, even though they share the `(table, field, snapshot)` path.
+Malformed, truncated, or trailing data is discarded rather than
+partially recovered — a partial text index under-selects files.
+
+`VectorIndex` persistence is deliberately not implemented. The kind
+holds only metadata (field, metric, dimension), while the actual rows
+are stored in memory by `QuarryTable`. Persisting metadata without rows
+would falsely advertise a substituting index that has nothing to serve.
+A correct implementation would need to persist the rows or trigger a
+rebuild on recovery; neither is done yet.
