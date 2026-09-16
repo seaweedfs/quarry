@@ -31,7 +31,8 @@ use quarry::derived::{Decision, Plan, Predicate, Query, Rewrite, Scope};
 use quarry::engine::{
     Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_bitmap,
     build_filter_set, build_index, filter_set_id, hash_scalar, index_id, read_bitmap,
-    read_filter_set, read_index, read_text_index, shared, write_index,
+    read_filter_set, read_index, read_text_index, read_vector_index, read_vector_rows, shared,
+    write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -1272,5 +1273,139 @@ async fn a_text_index_with_trailing_bytes_is_rejected() {
             .expect("read")
             .is_none(),
         "trailing bytes must be refused, not partially recovered"
+    );
+}
+
+/// A vector index round-trips through storage and survives a restart with
+/// its rows intact, so the recovered index can serve a top-k.
+#[tokio::test]
+async fn a_vector_index_round_trips_and_recovers() {
+    use datafusion::arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use quarry::derived::Metric;
+    use quarry::kinds::VectorIndex;
+
+    let fixture = fixture("persist_vector");
+    let (file_io, store) = stacks(&fixture);
+
+    const EMBEDDING: u32 = 9;
+    const DIM: i32 = 3;
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            true,
+        ),
+    ]));
+    let ids = Int64Array::from(vec![1, 2, 3]);
+    let flat = vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0];
+    let embeddings = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .expect("embeddings");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(ids), Arc::new(embeddings)],
+    )
+    .expect("batch");
+
+    let vector = VectorIndex::new(EMBEDDING, Metric::L2, DIM as u32, 4096);
+    let meta_path = store
+        .write_vector_index(&events(), SnapshotId(1), POLICY, &vector, std::slice::from_ref(&batch))
+        .await
+        .expect("write");
+
+    // Read the metadata back.
+    let read = read_vector_index(&file_io, &meta_path)
+        .await
+        .expect("read")
+        .expect("a usable vector index");
+    assert_eq!(read.0, EMBEDDING);
+    assert_eq!(read.1, Metric::L2);
+    assert_eq!(read.2, DIM as u32);
+    assert_eq!(read.3, POLICY);
+
+    // Read the rows back.
+    let rows = read_vector_rows(store.store(), &read.4)
+        .await
+        .expect("rows");
+    assert_eq!(rows.len(), 1, "one batch recovered");
+    assert_eq!(rows[0].num_rows(), 3, "three rows recovered");
+    assert_eq!(rows[0].schema(), schema, "schema preserved");
+
+    // A restart finds it and registers it with rows.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = index_id(&events(), EMBEDDING);
+    let derived = recovered.registry.get(&id).expect("registered");
+    assert_eq!(derived.source.snapshot, SnapshotId(1));
+    assert_eq!(derived.policy, POLICY);
+    let recovered_rows = recovered.rows.get(&id).expect("rows recovered");
+    assert_eq!(recovered_rows.len(), 1, "one batch in recovered rows");
+    assert_eq!(
+        recovered_rows[0].num_rows(),
+        3,
+        "three rows in recovered rows"
+    );
+}
+
+/// A vector index from a stale snapshot is discarded, and a metadata blob
+/// whose rows are missing is also discarded.
+#[tokio::test]
+async fn a_vector_index_from_a_stale_snapshot_is_discarded() {
+    use datafusion::arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use quarry::derived::Metric;
+    use quarry::kinds::VectorIndex;
+
+    let fixture = fixture("persist_vector_stale");
+    let (_, store) = stacks(&fixture);
+
+    const EMBEDDING: u32 = 9;
+    const DIM: i32 = 3;
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            true,
+        ),
+    ]));
+    let ids = Int64Array::from(vec![1]);
+    let flat = vec![1.0, 0.0, 0.0];
+    let embeddings = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .expect("embeddings");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(embeddings)]).expect("batch");
+
+    let vector = VectorIndex::new(EMBEDDING, Metric::L2, DIM as u32, 4096);
+    store
+        .write_vector_index(&events(), SnapshotId(1), POLICY, &vector, &[batch])
+        .await
+        .expect("write");
+
+    // Recover with no known snapshots — everything is stale.
+    let recovered = store.recover(&events(), &[]).await.expect("recover");
+    assert!(
+        recovered.registry.is_empty(),
+        "stale vector index must not be registered"
+    );
+    assert_eq!(
+        recovered.discarded.len(),
+        1,
+        "the stale vector index metadata is discarded"
     );
 }

@@ -69,8 +69,8 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
-use crate::derived::{Derived, DerivedId, FieldId, Filter, PolicyFingerprint, Source};
-use crate::kinds::{Bitmap, FilterSet, Index, TextIndex};
+use crate::derived::{Derived, DerivedId, FieldId, Filter, Metric, PolicyFingerprint, Source};
+use crate::kinds::{Bitmap, FilterSet, Index, TextIndex, VectorIndex};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
 use crate::stable_hash::HASH_VERSION;
@@ -90,6 +90,13 @@ pub const QUARRY_FILTER_SET_V1: &str = "quarry-filter-set-v1";
 
 /// The blob type for a persisted text index.
 pub const QUARRY_TEXT_INDEX_V1: &str = "quarry-text-index-v1";
+
+/// The blob type for a saved vector index's metadata. The rows themselves
+/// are written as Parquet at a companion path — see `Layout::vector_rows_path`
+/// — because they are the bulk of the index and Parquet is their native
+/// columnar format. The Puffin blob carries only what recovery needs to
+/// reconstruct the kind and find the rows.
+pub const QUARRY_VECTOR_INDEX_V1: &str = "quarry-vector-index-v1";
 
 /// The blob property holding the canonical filter text a filter set answers.
 const FILTER_TEXT_PROPERTY: &str = "quarry.filter";
@@ -130,6 +137,15 @@ impl Layout {
     /// Where one index belongs, in the path space `FileIO` uses.
     pub fn index_path(&self, table: &TableId, field: FieldId, at: SnapshotId) -> String {
         format!("{}/{}/{}/{}.puffin", self.prefix, table.0, field, at.0)
+    }
+
+    /// Where a vector index's rows belong, as Parquet.
+    ///
+    /// Distinct from [`index_path`](Self::index_path) by extension: a
+    /// `.parquet` file beside the `.puffin` metadata blob. The two travel
+    /// together and share the `(table, field, snapshot)` identity.
+    pub fn vector_rows_path(&self, table: &TableId, field: FieldId, at: SnapshotId) -> String {
+        format!("{}/{}/{}/{}.parquet", self.prefix, table.0, field, at.0)
     }
 
     /// Where one filter set belongs — keyed by the filter's hash, not a
@@ -517,6 +533,35 @@ fn decode_text_index(field: FieldId, bytes: &[u8]) -> Option<TextIndex> {
     Some(text)
 }
 
+/// Encode a vector index's metadata: field, metric, dimension.
+///
+/// The rows themselves are Parquet, written separately; this is only what
+/// recovery needs to reconstruct the kind and locate them.
+fn encode_vector_index(vector: &VectorIndex) -> Vec<u8> {
+    let (field, metric, dimension) = vector.covers();
+    let mut out = Vec::new();
+    out.extend_from_slice(&field.to_le_bytes());
+    out.extend_from_slice(&(metric as u32).to_le_bytes());
+    out.extend_from_slice(&dimension.to_le_bytes());
+    out
+}
+
+/// Read vector metadata back, or `None` if the bytes are not well-formed.
+fn decode_vector_index(bytes: &[u8]) -> Option<(FieldId, Metric, u32)> {
+    let mut cursor = Cursor { bytes, at: 0 };
+    let field = cursor.u32()?;
+    let metric = match cursor.u32()? {
+        0 => Metric::L2,
+        1 => Metric::Cosine,
+        _ => return None,
+    };
+    let dimension = cursor.u32()?;
+    if cursor.at != bytes.len() {
+        return None;
+    }
+    Some((field, metric, dimension))
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -894,6 +939,139 @@ pub async fn read_text_index(
     Ok(None)
 }
 
+/// Write a vector index: the rows as Parquet, then the metadata as a Puffin
+/// blob beside them.
+///
+/// The Parquet file is the bulk of the index — the rows the kind substitutes
+/// for the scan. The Puffin blob carries only the field, metric, and
+/// dimension recovery needs to reconstruct the kind, plus the policy and
+/// hash version the same gate as every other kind checks.
+///
+/// Returns the Puffin metadata path; the rows path is derived from it by
+/// swapping `.puffin` for `.parquet`.
+pub async fn write_vector_index(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    policy: PolicyFingerprint,
+    vector: &VectorIndex,
+    rows: &[datafusion::arrow::record_batch::RecordBatch],
+) -> iceberg::Result<String> {
+    let field = vector.covers().0;
+    let rows_path = layout.vector_rows_path(table, field, at);
+    let meta_path = layout.index_path(table, field, at);
+
+    // Parquet rows first; the Puffin metadata is the registry entry, and a
+    // recovered metadata blob whose rows are absent is discarded.
+    let schema = rows
+        .first()
+        .ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                format!("vector index for {table:?} field {field} has no rows"),
+            )
+        })?
+        .schema();
+    let mut buffer = Vec::new();
+    let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)?;
+    for batch in rows {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    file_io
+        .new_output(&rows_path)?
+        .write(bytes::Bytes::from(buffer))
+        .await?;
+
+    let output = file_io.new_output(&meta_path)?;
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_VECTOR_INDEX_V1.to_owned())
+                .fields(vec![field as i32])
+                .snapshot_id(at.0)
+                .sequence_number(0)
+                .data(encode_vector_index(vector))
+                .properties(HashMap::from([
+                    (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
+                    (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                ]))
+                .build(),
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(meta_path)
+}
+
+/// Read a vector index's metadata blob, returning the kind and the path to
+/// its Parquet rows.
+///
+/// `None` for wrong type, wrong hash version, missing policy, or bytes that
+/// do not decode exactly — same discipline as every other kind.
+pub async fn read_vector_index(
+    file_io: &FileIO,
+    path: &str,
+) -> iceberg::Result<Option<(FieldId, Metric, u32, PolicyFingerprint, String)>> {
+    if !is_plausible_puffin(file_io, path).await? {
+        return Ok(None);
+    }
+    let reader = PuffinReader::new(file_io.new_input(path)?);
+    let metadata = reader.file_metadata().await?;
+
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_VECTOR_INDEX_V1 {
+            continue;
+        }
+        let properties = blob_metadata.properties();
+        if properties.get(HASH_VERSION_PROPERTY).map(String::as_str)
+            != Some(&HASH_VERSION.to_string())
+        {
+            continue;
+        }
+        let policy = properties
+            .get(POLICY_PROPERTY)
+            .and_then(|raw| raw.parse().ok())
+            .map(PolicyFingerprint);
+        let Some(policy) = policy else {
+            continue;
+        };
+
+        let blob = reader.blob(blob_metadata).await?;
+        let Some((field, metric, dimension)) = decode_vector_index(blob.data()) else {
+            continue;
+        };
+        let rows_path = path.strip_suffix(".puffin").map(|p| format!("{p}.parquet"));
+        let Some(rows_path) = rows_path else {
+            continue;
+        };
+        return Ok(Some((field, metric, dimension, policy, rows_path)));
+    }
+    Ok(None)
+}
+
+/// Read the Parquet rows a vector index stored, as `RecordBatch`es.
+///
+/// Called after [`read_vector_index`] locates the rows path. Returns `None`
+/// if the file is missing or unreadable — the caller discards the index.
+pub async fn read_vector_rows(
+    store: &Arc<dyn ObjectStore>,
+    rows_path: &str,
+) -> Option<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+    let path = ObjectPath::from(rows_path);
+    let reader =
+        datafusion::parquet::arrow::async_reader::ParquetObjectReader::new(Arc::clone(store), path);
+    let builder =
+        datafusion::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .ok()?;
+    let stream = builder.build().ok()?;
+    use futures::TryStreamExt;
+    stream.try_collect().await.ok()
+}
+
 /// The blob type for a saved workload.
 pub const QUARRY_WORKLOAD_V1: &str = "quarry-workload-v1";
 
@@ -1104,6 +1282,14 @@ pub struct Recovered {
     pub registry: Registry,
     /// What each recovered piece indexes, so the optimizer can refresh it.
     pub fields: std::collections::BTreeMap<DerivedId, FieldId>,
+    /// Stored rows for substituting kinds, keyed by their derived id.
+    ///
+    /// A vector index is metadata plus rows; the rows are recovered here so
+    /// the caller can `QuarryTable::store_rows` them before the index serves.
+    /// Kinds that need no rows (equality, bitmap, text, filter set) leave
+    /// this empty.
+    pub rows:
+        std::collections::BTreeMap<DerivedId, Vec<datafusion::arrow::record_batch::RecordBatch>>,
     /// Objects that are ours but unusable, and should be deleted.
     ///
     /// A stale hash version, a superseded snapshot, or corrupt bytes. Not an
@@ -1119,7 +1305,7 @@ pub struct Recovered {
 /// rule would refuse the rest anyway.
 pub async fn recover(
     file_io: &FileIO,
-    store: &dyn ObjectStore,
+    store: &Arc<dyn ObjectStore>,
     layout: &Layout,
     table: &TableId,
     known_snapshots: &[SnapshotId],
@@ -1191,7 +1377,30 @@ pub async fn recover(
                         kind,
                     ));
                 }
-                None => recovered.discarded.push(readable),
+                None => match read_vector_index(file_io, &readable).await? {
+                    Some((field, metric, dimension, policy, rows_path)) => {
+                        let Some(rows) = read_vector_rows(store, &rows_path).await else {
+                            recovered.discarded.push(readable);
+                            recovered.discarded.push(rows_path);
+                            continue;
+                        };
+                        let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+                        let id = super::index_id(table, field);
+                        recovered.fields.insert(id.clone(), field);
+                        recovered.rows.insert(id.clone(), rows);
+                        recovered.registry.register(Derived::new(
+                            id,
+                            Source {
+                                table: table.clone(),
+                                snapshot: at,
+                            },
+                            policy,
+                            bytes,
+                            Box::new(VectorIndex::new(field, metric, dimension, bytes)),
+                        ));
+                    }
+                    None => recovered.discarded.push(readable),
+                },
             }
         } else if let Some((found_table, _hash, at)) = layout.parse_filter_set(&path) {
             if &found_table != table {
@@ -1408,6 +1617,11 @@ impl Store {
         &self.layout
     }
 
+    /// The object store in use, for reading Parquet rows.
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
     /// Write an index and report where it went.
     pub async fn write(
         &self,
@@ -1454,6 +1668,19 @@ impl Store {
         write_text_index(&self.file_io, &self.layout, table, at, policy, text).await
     }
 
+    /// Persist a vector index: the rows as Parquet, the metadata as a Puffin
+    /// blob beside them.
+    pub async fn write_vector_index(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        policy: PolicyFingerprint,
+        vector: &VectorIndex,
+        rows: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> iceberg::Result<String> {
+        write_vector_index(&self.file_io, &self.layout, table, at, policy, vector, rows).await
+    }
+
     /// Rebuild a table's registry from storage.
     pub async fn recover(
         &self,
@@ -1462,7 +1689,7 @@ impl Store {
     ) -> iceberg::Result<Recovered> {
         recover(
             &self.file_io,
-            self.store.as_ref(),
+            &self.store,
             &self.layout,
             table,
             known_snapshots,
@@ -1559,6 +1786,7 @@ impl Store {
             if entry.kind != QUARRY_EQ_INDEX_V2
                 && entry.kind != QUARRY_BITMAP_V1
                 && entry.kind != QUARRY_TEXT_INDEX_V1
+                && entry.kind != QUARRY_VECTOR_INDEX_V1
             {
                 continue;
             }
@@ -1568,6 +1796,33 @@ impl Store {
             let Ok(field) = u32::try_from(field) else {
                 continue;
             };
+            if entry.kind == QUARRY_VECTOR_INDEX_V1 {
+                match read_vector_index(&self.file_io, &entry.path).await? {
+                    Some((field, metric, dimension, policy, rows_path)) => {
+                        let Some(rows) = read_vector_rows(&self.store, &rows_path).await else {
+                            recovered.discarded.push(entry.path);
+                            recovered.discarded.push(rows_path);
+                            continue;
+                        };
+                        let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+                        let id = super::index_id(table, field);
+                        recovered.fields.insert(id.clone(), field);
+                        recovered.rows.insert(id.clone(), rows);
+                        recovered.registry.register(Derived::new(
+                            id,
+                            Source {
+                                table: table.clone(),
+                                snapshot: at,
+                            },
+                            policy,
+                            bytes,
+                            Box::new(VectorIndex::new(field, metric, dimension, bytes)),
+                        ));
+                    }
+                    None => recovered.discarded.push(entry.path),
+                }
+                continue;
+            }
             let read = match read_index(&self.file_io, &entry.path, field).await? {
                 Some((index, policy)) => {
                     let bytes = index.bytes_estimate();

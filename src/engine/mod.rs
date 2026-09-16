@@ -53,9 +53,11 @@ pub use options::QuarryOptions;
 #[cfg(feature = "iceberg")]
 pub use persist::{
     Advertised, Layout, QUARRY_BITMAP_V1, QUARRY_EQ_INDEX_V2, QUARRY_FILTER_SET_V1,
-    QUARRY_PATH_PROPERTY, QUARRY_TEXT_INDEX_V1, QUARRY_WORKLOAD_V1, Recovered, Store, advertised,
-    discard, read_bitmap, read_filter_set, read_index, read_text_index, read_workload, recover,
-    write_bitmap, write_filter_set, write_index, write_manifest, write_text_index, write_workload,
+    QUARRY_PATH_PROPERTY, QUARRY_TEXT_INDEX_V1, QUARRY_VECTOR_INDEX_V1, QUARRY_WORKLOAD_V1,
+    Recovered, Store, advertised, discard, read_bitmap, read_filter_set, read_index,
+    read_text_index, read_vector_index, read_vector_rows, read_workload, recover, write_bitmap,
+    write_filter_set, write_index, write_manifest, write_text_index, write_vector_index,
+    write_workload,
 };
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
