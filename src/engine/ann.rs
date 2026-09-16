@@ -359,6 +359,8 @@ pub(crate) fn report(
         fingerprint: crate::workload::Fingerprint::of(query),
         plan: query.plan.clone(),
         aggregate: None,
+        // A top-k is not a text match; nothing here is one.
+        text: Vec::new(),
         nearest: Some(crate::workload::NearestAsk {
             table: table.table_id().clone(),
             nearest: ask.nearest.clone(),

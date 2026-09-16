@@ -123,6 +123,12 @@ pub struct ScanReport {
     /// Set only where the whole plan was visible, for the same reason
     /// `aggregate` is: the `ORDER BY` and `LIMIT` sit above the scan.
     pub nearest: Option<crate::workload::NearestAsk>,
+    /// Full-text fields this scan matched on.
+    ///
+    /// Unlike `aggregate` and `nearest`, a match *is* visible here: it is a
+    /// filter, so it is pushed into the scan. No plan-level rewrite is
+    /// needed for it, and none exists.
+    pub text: Vec<crate::workload::TextAsk>,
     /// The filters this scan ran, kept for the optimizer's proposals.
     ///
     /// Each is a [`FilterAsk`](crate::workload::FilterAsk): the canonical
@@ -151,6 +157,7 @@ impl ScanReport {
             fingerprint: self.fingerprint.clone(),
             aggregate: self.aggregate.clone(),
             nearest: self.nearest.clone(),
+            text: self.text.clone(),
             filters: self.filters.clone(),
             bytes_read,
             bytes_if_full_scan: self.bytes_if_full_scan,
@@ -804,6 +811,21 @@ impl QuarryTable {
             })
             .collect();
 
+        // Which text fields were matched on, for the optimizer's proposals.
+        // Read off the predicates the scan already translated, so nothing
+        // needs to re-parse the expressions.
+        let text: Vec<crate::workload::TextAsk> = query
+            .predicates
+            .iter()
+            .filter_map(|predicate| match predicate {
+                Predicate::Matches { field, .. } => Some(crate::workload::TextAsk {
+                    table: self.table.clone(),
+                    field: *field,
+                }),
+                _ => None,
+            })
+            .collect();
+
         // The unaided baseline, known exactly rather than estimated: every
         // live data file's size. Only available where sizes are known, which
         // is the Parquet path; an in-memory table reports zero and its
@@ -832,6 +854,7 @@ impl QuarryTable {
                 Some(ScanReport {
                     aggregate: None,
                     nearest: None,
+                    text: text.clone(),
                     filters: asks.clone(),
                     files_read: BTreeSet::new(),
                     scopes: BTreeMap::new(),
@@ -852,6 +875,7 @@ impl QuarryTable {
             } => Some(ScanReport {
                 aggregate: None,
                 nearest: None,
+                text: text.clone(),
                 filters: asks.clone(),
                 scopes: files.clone(),
                 files_read: files.into_keys().collect(),
@@ -871,6 +895,7 @@ impl QuarryTable {
             None => ScanReport {
                 aggregate: None,
                 nearest: None,
+                text,
                 filters: asks,
                 files_read: live,
                 scopes: BTreeMap::new(),

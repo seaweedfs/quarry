@@ -148,6 +148,39 @@ pub struct VectorProposal {
     pub ceiling_usd: f64,
 }
 
+/// What a full-text query asked, kept whole enough to propose an index.
+///
+/// Like [`NearestAsk`] and unlike [`AggregateAsk`], this carries **no
+/// literals** — only the field. One inverted index over a field serves every
+/// term, so the terms are not part of what is proposed, and the search
+/// strings a principal typed never reach the optimizer's bookkeeping.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TextAsk {
+    /// The table searched.
+    pub table: TableId,
+    /// The text field searched.
+    pub field: FieldId,
+}
+
+/// A text index worth building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextProposal {
+    /// The table it would be built on.
+    pub table: TableId,
+    /// What it would cover.
+    pub ask: TextAsk,
+    /// How many unaided queries asked for this.
+    pub queries: u64,
+    /// Bytes those queries read.
+    pub bytes_scanned: u64,
+    /// The most it could possibly have saved: every byte those queries moved.
+    ///
+    /// A ceiling in the same weak sense an index's is — a text index still
+    /// reads the files it admits — but it only gates building, where a bound
+    /// suffices and an estimate would merely pretend.
+    pub ceiling_usd: f64,
+}
+
 /// A cube worth building.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CubeProposal {
@@ -176,6 +209,11 @@ pub struct Observation {
     pub aggregate: Option<AggregateAsk>,
     /// What the query searched for, if it was a top-k nearest ask.
     pub nearest: Option<NearestAsk>,
+    /// Full-text fields the query matched on, if any.
+    ///
+    /// Plural because one query may match on several fields, and carrying no
+    /// terms — see [`TextAsk`].
+    pub text: Vec<TextAsk>,
     /// Bytes the query read.
     pub bytes_read: u64,
     /// Bytes a full scan of the queried snapshot would have read.
@@ -268,6 +306,9 @@ impl ForeignScan {
             // A foreign engine's sort expression is in its dialect, not
             // this one's distance functions — nothing to key an index by.
             nearest: None,
+            // Same for a match: another engine's full-text syntax is not
+            // `quarry_matches`, and its tokenizer is not this one's.
+            text: Vec::new(),
             bytes_read: self.bytes_read,
             bytes_if_full_scan,
             used: Vec::new(),
@@ -519,6 +560,8 @@ pub struct Workload {
     /// [`NearestAsk`] holds no query vector — so nothing keeps it in memory
     /// except that nothing persists it yet.
     by_nearest: BTreeMap<NearestAsk, Seen>,
+    /// Full-text asks, also literal-free for the same reason.
+    by_text: BTreeMap<TextAsk, Seen>,
 }
 
 impl Workload {
@@ -586,11 +629,37 @@ impl Workload {
             }
         }
 
+        // Which fields were matched on, kept before the loop consumes the
+        // asks: a filter on one of them is the text index's business, the
+        // same way an equality is the scalar index's.
+        let matched: BTreeSet<FieldId> = observation.text.iter().map(|ask| ask.field).collect();
+
+        for ask in observation.text {
+            let seen = self.by_text.entry(ask).or_default();
+            seen.queries += 1;
+            seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
+            seen.bytes_if_full_scan = seen
+                .bytes_if_full_scan
+                .saturating_add(observation.bytes_if_full_scan);
+            if !observation.used.is_empty() {
+                seen.helped += 1;
+            }
+        }
+
         // Filters an index can serve are its business; a filter set is
         // what remains for the ones it cannot.
+        //
+        // Both kinds of index count. An equality is a scalar index's, and a
+        // full-text match is a `TextIndex`'s — and the match matters more
+        // here, because a `quarry_matches` conjunct *is* a filter, so without
+        // this it would propose a filter set that caches one search string
+        // while the index that answers every search waits behind it for a
+        // free build slot.
         for ask in observation.filters {
             let eligible = match ask.filter.field {
-                Some(field) => !observation.fingerprint.probeable.contains(&field),
+                Some(field) => {
+                    !observation.fingerprint.probeable.contains(&field) && !matched.contains(&field)
+                }
                 None => true,
             };
             if !eligible {
@@ -665,6 +734,7 @@ impl Workload {
             by_ask: BTreeMap::new(),
             by_filter: BTreeMap::new(),
             by_nearest: BTreeMap::new(),
+            by_text: BTreeMap::new(),
         }
     }
 
@@ -796,6 +866,29 @@ impl Workload {
         proposals
     }
 
+    /// Text indexes worth building, most promising first.
+    ///
+    /// Same rule as the others: only unaided asks propose, grouped by the
+    /// field an index would cover rather than by query shape, since the terms
+    /// are not part of what is built.
+    pub fn text_proposals(&self, prices: &PriceTable, min_queries: u64) -> Vec<TextProposal> {
+        let mut proposals: Vec<TextProposal> = self
+            .by_text
+            .iter()
+            .filter(|(_, seen)| seen.queries.saturating_sub(seen.helped) >= min_queries)
+            .map(|(ask, seen)| TextProposal {
+                table: ask.table.clone(),
+                ask: ask.clone(),
+                queries: seen.queries,
+                bytes_scanned: seen.bytes_read,
+                ceiling_usd: seen.bytes_read as f64
+                    * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far),
+            })
+            .collect();
+        proposals.sort_by(|a, b| b.ceiling_usd.total_cmp(&a.ceiling_usd));
+        proposals
+    }
+
     /// Derived state that has not paid for itself over `horizon_days`.
     ///
     /// Compares what a piece has *measurably* saved against what keeping it
@@ -873,6 +966,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(fields)),
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: Vec::new(),
@@ -1019,6 +1113,7 @@ mod tests {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
                 aggregate: None,
                 nearest: None,
+                text: Vec::new(),
                 bytes_read: GB / 10,
                 bytes_if_full_scan: GB,
                 used: vec![DerivedId("idx".into())],
@@ -1042,6 +1137,7 @@ mod tests {
                 fingerprint: Fingerprint::of(&other),
                 aggregate: None,
                 nearest: None,
+                text: Vec::new(),
                 bytes_read: GB,
                 bytes_if_full_scan: GB,
                 used: Vec::new(),
@@ -1066,6 +1162,7 @@ mod tests {
             },
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used,
@@ -1090,6 +1187,53 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].ask.sql, "tenant_id > Int64(2)");
         assert_eq!(proposals[0].queries, 3);
+    }
+
+    #[test]
+    fn a_match_earns_a_text_index_rather_than_a_filter_set() {
+        // A `quarry_matches` conjunct *is* a filter, so both proposals would
+        // fire for one query. The text index is the right instrument — it
+        // answers every search of that field, where a filter set caches one
+        // search string — and with a single build slot per round, letting the
+        // set propose too means the index waits behind it.
+        let mut workload = Workload::new();
+        let mut observation = filtered(4, "quarry_matches(body, Utf8(\"error\"))", GB, Vec::new());
+        observation.text = vec![TextAsk {
+            table: table(),
+            field: 4,
+        }];
+        for _ in 0..3 {
+            workload.observe(observation.clone());
+        }
+
+        let prices = PriceTable::default();
+        assert!(
+            workload.filter_proposals(&prices, 2).is_empty(),
+            "the filter set stands aside"
+        );
+        let text = workload.text_proposals(&prices, 2);
+        assert_eq!(text.len(), 1);
+        assert_eq!(text[0].ask.field, 4);
+        assert_eq!(text[0].queries, 3);
+    }
+
+    #[test]
+    fn a_filter_on_a_field_nothing_matched_still_earns_a_set() {
+        // The other side of the rule above: a match on one field must not
+        // silence filter proposals on every other field of the query.
+        let mut workload = Workload::new();
+        let mut observation = filtered(9, "status > Int64(500)", GB, Vec::new());
+        observation.text = vec![TextAsk {
+            table: table(),
+            field: 4,
+        }];
+        for _ in 0..3 {
+            workload.observe(observation.clone());
+        }
+        assert_eq!(
+            workload.filter_proposals(&PriceTable::default(), 2).len(),
+            1
+        );
     }
 
     #[test]
@@ -1147,6 +1291,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: GB / 4,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("idx".into())],
@@ -1161,6 +1306,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: 2 * GB,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("idx".into())],
@@ -1224,6 +1370,7 @@ mod tests {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
                 aggregate: None,
                 nearest: None,
+                text: Vec::new(),
                 bytes_read: 0,
                 bytes_if_full_scan: GB,
                 used: vec![DerivedId("useful".into())],
@@ -1246,6 +1393,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: 0,
             bytes_if_full_scan: 1_000,
             used: vec![DerivedId("bloated".into())],
@@ -1264,6 +1412,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: 1,
             bytes_if_full_scan: GB,
             used: vec![DerivedId("a".into())],

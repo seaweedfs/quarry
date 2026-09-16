@@ -314,5 +314,6 @@ pub(crate) fn report(
                 filter_sql: filter_sql.clone(),
             }),
         nearest: None,
+        text: Vec::new(),
     }
 }

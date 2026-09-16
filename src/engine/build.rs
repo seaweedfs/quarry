@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::arrow::array::BooleanArray;
+use datafusion::arrow::array::{Array, BooleanArray};
 use datafusion::common::exec_err;
 use datafusion::common::{DFSchema, Result as DfResult};
 use datafusion::datasource::listing::PartitionedFile;
@@ -35,7 +35,7 @@ use crate::derived::{
     AggFunc, Aggregate, Derived, DerivedId, FieldId, Filter, Measure, Nearest, PolicyFingerprint,
     Source,
 };
-use crate::kinds::{Bitmap, FilterSet, Index, VectorIndex};
+use crate::kinds::{Bitmap, FilterSet, Index, TextIndex, VectorIndex};
 use crate::snapshot::FileId;
 use crate::workload::AggregateAsk;
 
@@ -739,6 +739,117 @@ pub async fn build_cube(
             batches,
         )),
     ))
+}
+
+/// Build an inverted index over `field` by reading that column and
+/// tokenizing it.
+///
+/// Reads only the indexed column, the same projection pushdown
+/// [`build_index`] gets. Tokens come from [`terms`](super::terms) — the
+/// function a probe uses — so the index answers the question the predicate
+/// asks rather than a similar one.
+///
+/// Null rows contribute nothing: `quarry_matches` is null for them, so no
+/// term can be sought in them.
+pub async fn build_text_index(
+    session: &Session,
+    table: &QuarryTable,
+    field: FieldId,
+) -> DfResult<TextIndex> {
+    let Some(column) = table.column_of(field) else {
+        return exec_err!("field {field} is not a column of this table");
+    };
+    let Some((url, files)) = table.parquet_files() else {
+        return exec_err!("an in-memory table has no objects to index");
+    };
+    let schema = datafusion::catalog::TableProvider::schema(table);
+    let Some((position, _)) = schema.column_with_name(column) else {
+        return exec_err!("column {column} is not in the table's schema");
+    };
+    // Checked here rather than left to fail per batch: a text index over a
+    // number would build empty and prune everything away.
+    if !matches!(
+        schema.field(position).data_type(),
+        datafusion::arrow::datatypes::DataType::Utf8
+            | datafusion::arrow::datatypes::DataType::LargeUtf8
+            | datafusion::arrow::datatypes::DataType::Utf8View
+    ) {
+        return exec_err!("column {column} is not text, so it has no terms to index");
+    }
+
+    let mut index = TextIndex::new(field);
+    for (file, size) in files {
+        let config = FileScanConfigBuilder::new(
+            url.clone(),
+            Arc::clone(&schema),
+            Arc::new(ParquetSource::default()),
+        )
+        .with_projection(Some(vec![position]))
+        .with_file(PartitionedFile::new(file.0.clone(), *size))
+        .build();
+        let batches = collect(
+            DataSourceExec::from_data_source(config),
+            session.context().task_ctx(),
+        )
+        .await?;
+
+        // One posting per term per file, however often the term recurs.
+        let mut seen = HashSet::new();
+        for batch in batches {
+            let text = super::text::strings_of(batch.column(0))?;
+            for row in 0..text.len() {
+                if text.is_null(row) {
+                    continue;
+                }
+                for term in super::text::terms(text.value(row)) {
+                    if seen.insert(term) {
+                        index.insert(term, file.clone());
+                    }
+                }
+            }
+        }
+    }
+    let bytes = index.encoded_len();
+    Ok(index.with_bytes(bytes))
+}
+
+/// A text index's id names the field it covers, so a rebuild replaces it.
+pub fn text_index_id(table: &crate::snapshot::TableId, field: FieldId) -> DerivedId {
+    DerivedId(format!("txt:{}:{field}", table.0))
+}
+
+/// Build the text index a proposal asked for, ready to register.
+///
+/// `None` when the index would admit every file for every term it holds —
+/// a field whose vocabulary is spread across all the files prunes nothing,
+/// and the postings are pure overhead. The same `NoAdvantage` judgement a
+/// useless filter set makes about itself.
+pub async fn build_proposed_text_index(
+    session: &Session,
+    table: &QuarryTable,
+    field: FieldId,
+    id: DerivedId,
+    policy: PolicyFingerprint,
+) -> DfResult<Option<Derived>> {
+    let index = build_text_index(session, table, field).await?;
+    let files = table.file_count() as usize;
+    let prunes_nothing = files > 1
+        && index.values() > 0
+        && index.postings().all(|(_, holding)| holding.len() >= files);
+    if prunes_nothing {
+        return Ok(None);
+    }
+    let bytes = index.bytes_estimate();
+    Ok(Some(Derived::new(
+        id,
+        Source {
+            table: table.table_id().clone(),
+            snapshot: table.snapshot(),
+        },
+        policy,
+        bytes,
+        Box::new(index),
+    )))
 }
 
 /// A vector index's id names what it covers, so the same ask rebuilds onto

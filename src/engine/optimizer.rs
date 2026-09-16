@@ -29,13 +29,13 @@ use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
 use crate::snapshot::{Commits, SnapshotId};
 use crate::workload::{
-    AggregateAsk, FilterAsk, NearestAsk, Observation, Policy, Proposal, Workload,
+    AggregateAsk, FilterAsk, NearestAsk, Observation, Policy, Proposal, TextAsk, Workload,
 };
 
 use super::{
     QuarryTable, Session, SharedRegistry, build_cube, build_proposed_filter_set,
-    build_proposed_index, build_vector_index, cube_id, estimate_overlap, filter_set_id, index_id,
-    parquet_bounds, vector_index_id,
+    build_proposed_index, build_proposed_text_index, build_vector_index, cube_id, estimate_overlap,
+    filter_set_id, index_id, parquet_bounds, text_index_id, vector_index_id,
 };
 
 /// A piece of derived state a round dropped, identified enough to delete it.
@@ -158,6 +158,8 @@ pub struct Optimizer {
     built_filters: BTreeMap<DerivedId, FilterAsk>,
     /// Same for vector indexes — the ask a rebuild re-reads the table for.
     built_vectors: BTreeMap<DerivedId, NearestAsk>,
+    /// Same for text indexes.
+    built_texts: BTreeMap<DerivedId, TextAsk>,
     /// What each build was expected to save, in dollars.
     ///
     /// Kept so a prediction can be held against the realized credit later:
@@ -202,6 +204,7 @@ impl Optimizer {
             built_cubes: BTreeMap::new(),
             built_filters: BTreeMap::new(),
             built_vectors: BTreeMap::new(),
+            built_texts: BTreeMap::new(),
             predicted: BTreeMap::new(),
             commits: Commits::new(),
             failed_at: BTreeMap::new(),
@@ -439,6 +442,14 @@ impl Optimizer {
                 }
             } else if let Some(ask) = self.built_vectors.get(&id) {
                 build_vector_index(session, table, &ask.nearest, id.clone()).await
+            } else if let Some(ask) = self.built_texts.get(&id) {
+                match build_proposed_text_index(session, table, ask.field, id.clone(), self.reader)
+                    .await
+                {
+                    Ok(None) => datafusion::common::exec_err!("the index prunes nothing"),
+                    Ok(Some(derived)) => Ok(derived),
+                    Err(e) => Err(e),
+                }
             } else {
                 continue;
             };
@@ -759,6 +770,75 @@ impl Optimizer {
             round.built.push(id);
         }
 
+        // 7. Text indexes: a repeated full-text match is worth an inverted
+        // index. Same gates as the rest.
+        for proposal in self
+            .workload
+            .text_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = text_index_id(&proposal.table, proposal.ask.field);
+            if existing.contains(&id) {
+                round.declined.push((id, Declined::AlreadyBuilt));
+                continue;
+            }
+            if round.built.len() >= self.policy.max_builds_per_round {
+                round.declined.push((id, Declined::RoundFull));
+                continue;
+            }
+            let proven = self.proven(&id);
+            if proven < 1.0
+                && proposal.ceiling_usd * proven
+                    <= table.live_bytes() as f64
+                        * self
+                            .prices
+                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+            {
+                round.declined.push((id, Declined::NotWorthIt));
+                continue;
+            }
+            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
+                continue;
+            }
+            let derived = match build_proposed_text_index(
+                session,
+                table,
+                proposal.ask.field,
+                id.clone(),
+                self.reader,
+            )
+            .await
+            {
+                Ok(Some(derived)) => derived,
+                Ok(None) => {
+                    // Every term is in every file, so the postings admit
+                    // everything. Not a failure to retry: the evidence says no.
+                    round.declined.push((id, Declined::NoAdvantage));
+                    continue;
+                }
+                Err(_) => {
+                    self.failed_at.insert(id.clone(), head);
+                    round.declined.push((id, Declined::BuildFailed));
+                    continue;
+                }
+            };
+            self.failed_at.remove(&id);
+            let held = self.registry.read().expect("registry lock").bytes();
+            if held + derived.bytes > self.policy.budget_bytes {
+                round.declined.push((id, Declined::OverBudget));
+                continue;
+            }
+            self.registry
+                .write()
+                .expect("registry lock")
+                .register(derived);
+            self.built_texts.insert(id.clone(), proposal.ask);
+            self.predicted.insert(id.clone(), proposal.ceiling_usd);
+            round.built.push(id);
+        }
+
         round
     }
 
@@ -828,6 +908,7 @@ impl Optimizer {
             .chain(self.built_cubes.keys())
             .chain(self.built_filters.keys())
             .chain(self.built_vectors.keys())
+            .chain(self.built_texts.keys())
             .filter(|id| registry.get(id).is_some())
             .filter(|id| {
                 let Some(derived) = registry.get(id) else {
@@ -884,6 +965,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query),
             aggregate: None,
             nearest: None,
+            text: Vec::new(),
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
             used: Vec::new(),

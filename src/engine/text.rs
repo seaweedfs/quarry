@@ -123,7 +123,7 @@ impl ScalarUDFImpl for Matches {
 }
 
 /// A string column, whichever of Arrow's string types it is.
-fn strings_of(array: &ArrayRef) -> DfResult<StringArray> {
+pub(crate) fn strings_of(array: &ArrayRef) -> DfResult<StringArray> {
     use datafusion::arrow::compute::cast;
 
     if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
