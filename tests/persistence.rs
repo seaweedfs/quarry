@@ -493,7 +493,7 @@ async fn a_restart_recovers_everything_and_destroys_nothing() {
             let report = served.last_scan().expect("scan");
             optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
         }
-        let round = optimizer.round(&session, &served).await;
+        let round = optimizer.build_recommended(&session, &served).await;
         assert_eq!(round.built.len(), 1, "built an index: {round:?}");
 
         // Queries now served by it, so it accrues credit.
@@ -563,14 +563,15 @@ async fn a_restart_recovers_everything_and_destroys_nothing() {
         .expect("register");
 
     // The first round after a restart must not destroy what it recovered.
-    let round = optimizer.round(&session, &served).await;
+    let built = optimizer.build_recommended(&session, &served).await;
     assert!(
-        round.retired.is_empty(),
-        "a recovered index that has paid for itself must be kept: {round:?}"
+        built.built.is_empty(),
+        "and it must not be built a second time: {built:?}"
     );
+    let retired = optimizer.retire_recommended(&session, &served).await;
     assert!(
-        round.built.is_empty(),
-        "and it must not be built a second time: {round:?}"
+        retired.retired.is_empty(),
+        "a recovered index that has paid for itself must be kept: {retired:?}"
     );
     assert_eq!(registry.read().expect("lock").len(), 1);
 
@@ -621,7 +622,7 @@ async fn a_cold_start_without_credits_still_does_not_delete() {
         .register("events", Arc::clone(&served))
         .expect("register");
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.retire_recommended(&session, &served).await;
     assert!(
         round.retired.is_empty(),
         "nothing may be retired on no evidence: {round:?}"

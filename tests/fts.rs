@@ -396,7 +396,7 @@ async fn repeated_matches_make_the_optimizer_build_the_index() {
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
 
-    let round = optimizer.round(&session, &table).await;
+    let round = optimizer.build_recommended(&session, &table).await;
     assert!(
         round
             .built

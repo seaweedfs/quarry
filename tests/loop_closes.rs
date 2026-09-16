@@ -396,7 +396,7 @@ async fn the_optimizer_runs_the_loop_on_its_own() {
     }
 
     // Round 1: it proposes, builds, and registers, by itself.
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "one index built: {round:?}");
     assert!(round.retired.is_empty());
     assert_eq!(registry.read().expect("lock").len(), 1);
@@ -420,13 +420,14 @@ async fn the_optimizer_runs_the_loop_on_its_own() {
     optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
 
     // Round 2: nothing left to do, and it does not rebuild what it made.
-    let round = optimizer.round(&session, &served).await;
-    assert!(round.built.is_empty(), "must not rebuild: {round:?}");
-    assert!(round.retired.is_empty(), "it is earning its keep");
+    let built = optimizer.build_recommended(&session, &served).await;
+    assert!(built.built.is_empty(), "must not rebuild: {built:?}");
+    let retired = optimizer.retire_recommended(&session, &served).await;
+    assert!(retired.retired.is_empty(), "it is earning its keep");
 }
 
 #[tokio::test]
-async fn an_advisory_optimizer_proposes_but_changes_nothing() {
+async fn an_advisory_optimizer_recommends_but_changes_nothing() {
     let fixture = fixture("loop_advisory");
     let sql = "SELECT * FROM events WHERE tenant_id = 1";
 
@@ -448,15 +449,17 @@ async fn an_advisory_optimizer_proposes_but_changes_nothing() {
 
     assert_eq!(optimizer.proposals().len(), 1, "it has an opinion");
 
-    let round = optimizer.round(&session, &served).await;
-    assert!(round.built.is_empty(), "advisory must not act");
-    assert_eq!(
-        round.declined,
-        vec![(
-            round.declined[0].0.clone(),
-            quarry::engine::Declined::Advisory
-        )],
+    let recommendations = optimizer.recommend(&session, &served).await;
+    assert!(
+        recommendations
+            .iter()
+            .any(|r| matches!(r, quarry::engine::Recommendation::Build(_))),
+        "it recommends a build"
     );
+
+    let round = optimizer.round(&session, &served).await;
+    assert!(round.built.is_empty(), "round only refreshes");
+    assert!(round.refreshed.is_empty(), "nothing to refresh");
     assert_eq!(registry.read().expect("lock").len(), 0);
 }
 
@@ -485,7 +488,7 @@ async fn a_budget_of_nothing_declines_the_build() {
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert!(round.built.is_empty());
     assert_eq!(
         round.declined.first().map(|(_, why)| *why),
@@ -545,7 +548,7 @@ async fn a_stale_index_is_refreshed_when_the_table_grows() {
             let report = served.last_scan().expect("scan");
             optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
         }
-        let round = optimizer.round(&session, &served).await;
+        let round = optimizer.build_recommended(&session, &served).await;
         assert_eq!(round.built.len(), 1, "built at snapshot 1: {round:?}");
     }
 
@@ -639,7 +642,14 @@ async fn a_small_append_does_not_trigger_a_rebuild() {
             let report = served.last_scan().expect("scan");
             optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
         }
-        assert_eq!(optimizer.round(&session, &served).await.built.len(), 1);
+        assert_eq!(
+            optimizer
+                .build_recommended(&session, &served)
+                .await
+                .built
+                .len(),
+            1
+        );
     }
 
     // A handful of rows against four files of five hundred: well inside the
@@ -880,7 +890,7 @@ async fn the_gate_refuses_an_index_the_format_makes_redundant() {
     // It still wants an index — the shape goes unaided — and refuses anyway.
     assert_eq!(optimizer.proposals().len(), 1, "the shape is unaided");
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert!(round.built.is_empty(), "must not build: {round:?}");
     assert_eq!(
         round.declined.first().map(|(_, why)| *why),
@@ -922,7 +932,7 @@ async fn the_gate_allows_an_index_the_format_cannot_replace() {
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "should build: {round:?}");
 }
 
@@ -964,7 +974,7 @@ async fn the_gate_reads_bounds_from_parquet_footers_without_a_catalog() {
 
     // The footers say each file holds one tenant, so the format already
     // prunes and an index adds nothing. A judgement, not a shrug.
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert!(round.built.is_empty());
     assert_eq!(
         round.declined.first().map(|(_, why)| *why),
@@ -1008,7 +1018,7 @@ async fn a_field_whose_bounds_have_no_distance_yields_no_evidence() {
         "string bounds have no comparable width"
     );
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert!(round.built.is_empty());
     assert_eq!(
         round.declined.first().map(|(_, why)| *why),
@@ -1287,7 +1297,7 @@ async fn the_best_candidate_is_built_not_the_one_with_the_biggest_ceiling() {
         .register("events", Arc::clone(&served))
         .expect("register");
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "one build allowed: {round:?}");
     assert_eq!(
         round.built[0],
@@ -1385,7 +1395,7 @@ async fn another_engines_traffic_alone_justifies_an_index() {
         .register("events", Arc::clone(&served))
         .expect("register");
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(
         round.built.len(),
         1,
@@ -1470,7 +1480,7 @@ async fn a_failed_rebuild_waits_for_the_table_to_move() {
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "built: {round:?}");
 
     // The table grows, and then the build is made impossible: one live file
@@ -1558,7 +1568,7 @@ async fn a_retired_index_is_not_built_again() {
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "built: {round:?}");
     let id = round.built[0].clone();
 
@@ -1569,7 +1579,7 @@ async fn a_retired_index_is_not_built_again() {
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.retire_recommended(&session, &served).await;
     assert!(
         round.retired.iter().any(|retired| retired.id == id),
         "an index that served nothing is retired: {round:?}"
@@ -1582,7 +1592,7 @@ async fn a_retired_index_is_not_built_again() {
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert!(
         round
             .declined
@@ -1633,7 +1643,7 @@ async fn a_build_records_what_it_expected_so_calibration_can_judge_it() {
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     let id = round.built[0].clone();
 
     assert!(
@@ -1686,7 +1696,7 @@ async fn a_commit_notification_retries_a_build_the_unchanged_table_suppressed() 
         let report = served.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "built: {round:?}");
 
     // The table grows to 2 and the build is made impossible. The failure is
@@ -1921,7 +1931,7 @@ async fn the_loop_builds_a_filter_set_for_an_unindexable_filter() {
     }
 
     // PROPOSE + BUILD: the filter's own build, not a fixture's.
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert_eq!(round.built.len(), 1, "one filter set built: {round:?}");
     assert!(
         round.built[0].0.starts_with("fset:"),
@@ -1983,7 +1993,7 @@ async fn a_filter_that_passes_everything_is_declined() {
         optimizer.observe(report.observation(report.bytes_planned(&fixture.sizes)));
     }
 
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     assert!(round.built.is_empty(), "nothing worth building: {round:?}");
     assert!(
         round

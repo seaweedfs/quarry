@@ -475,7 +475,7 @@ async fn a_built_index_is_keyed_on_what_it_covers_not_on_the_k() {
         let report = table.last_scan().expect("scan");
         optimizer.observe(report.observation(report.bytes_if_full_scan));
     }
-    let built = optimizer.round(&session, &table).await;
+    let built = optimizer.build_recommended(&session, &table).await;
     assert_eq!(built.built.len(), 1, "{built:?}");
 
     // It serves at the snapshot it was built for.
@@ -568,7 +568,7 @@ async fn repeated_top_k_searches_make_the_optimizer_build_the_index() {
         optimizer.observe(report.observation(report.bytes_if_full_scan));
     }
 
-    let round = optimizer.round(&session, &table).await;
+    let round = optimizer.build_recommended(&session, &table).await;
     assert_eq!(
         round.built.len(),
         1,
@@ -609,7 +609,7 @@ async fn one_index_serves_every_k() {
         optimizer.observe(report.observation(report.bytes_if_full_scan));
     }
 
-    let round = optimizer.round(&session, &table).await;
+    let round = optimizer.build_recommended(&session, &table).await;
     assert_eq!(round.built.len(), 1, "one index, not one per k: {round:?}");
 
     // Both k's are served by it.

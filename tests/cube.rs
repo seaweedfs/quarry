@@ -395,7 +395,7 @@ async fn repeated_asks_make_the_optimizer_build_the_cube() {
         assert!(report.used.is_empty(), "nothing to serve it yet");
     }
 
-    let round = optimizer.round(&session, &table).await;
+    let round = optimizer.build_recommended(&session, &table).await;
     assert_eq!(round.built.len(), 1, "the ask earned a cube");
 
     let rows = session
@@ -639,7 +639,7 @@ async fn count_distinct_asks_make_the_optimizer_build_a_sketch() {
         optimizer.observe(report.observation(1024));
     }
 
-    let round = optimizer.round(&session, &table).await;
+    let round = optimizer.build_recommended(&session, &table).await;
     assert_eq!(round.built.len(), 1, "the ask earned a cube: {round:?}");
 
     // Still exact by default: the built cube holds estimates, and the

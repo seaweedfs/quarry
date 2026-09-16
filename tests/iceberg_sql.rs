@@ -488,7 +488,7 @@ async fn the_gate_judges_a_real_iceberg_table_for_itself() {
     // This fixture holds one tenant per file with disjoint ranges, so the
     // format already prunes and the honest answer is to refuse. Whichever way
     // it goes, it must be a judgement rather than a shrug.
-    let round = optimizer.round(&session, &served).await;
+    let round = optimizer.build_recommended(&session, &served).await;
     let reason = round.declined.first().map(|(_, why)| *why);
     assert_ne!(
         reason,
