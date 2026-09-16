@@ -40,7 +40,7 @@ pub use build::{
     build_bitmap, build_cube, build_filter_set, build_index, build_join_hash,
     build_proposed_filter_set, build_proposed_index, build_proposed_text_index, build_text_index,
     build_vector_index, columns, cube_id, estimate_overlap, filter_set_id, index_id, join_hash_id,
-    parquet_bounds, text_index_id, vector_index_id,
+    join_hash_id_from, parquet_bounds, text_index_id, vector_index_id,
 };
 pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
@@ -54,11 +54,11 @@ pub use options::QuarryOptions;
 #[cfg(feature = "iceberg")]
 pub use persist::{
     Advertised, Layout, QUARRY_BITMAP_V1, QUARRY_EQ_INDEX_V2, QUARRY_FILTER_SET_V1,
-    QUARRY_PATH_PROPERTY, QUARRY_TEXT_INDEX_V1, QUARRY_VECTOR_INDEX_V1, QUARRY_WORKLOAD_V1,
-    Recovered, Store, advertised, discard, read_bitmap, read_filter_set, read_index,
-    read_text_index, read_vector_index, read_vector_rows, read_workload, recover, write_bitmap,
-    write_filter_set, write_index, write_manifest, write_text_index, write_vector_index,
-    write_workload,
+    QUARRY_JOIN_HASH_V1, QUARRY_PATH_PROPERTY, QUARRY_TEXT_INDEX_V1, QUARRY_VECTOR_INDEX_V1,
+    QUARRY_WORKLOAD_V1, Recovered, Store, advertised, discard, read_bitmap, read_filter_set,
+    read_index, read_join_hash, read_text_index, read_vector_index, read_vector_rows,
+    read_workload, recover, write_bitmap, write_filter_set, write_index, write_join_hash,
+    write_manifest, write_text_index, write_vector_index, write_workload,
 };
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};

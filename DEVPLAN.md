@@ -2069,3 +2069,21 @@ returns the rows through `Recovered::rows` so the caller can
 A metadata blob whose rows are missing is discarded, not partially
 recovered — the kind would falsely advertise a substituting index. A
 stale snapshot is discarded the same way as every other kind.
+
+## Phase 38 — Join hash persistence `[x]`
+
+`JoinHash` is the same shape as `VectorIndex` — metadata plus stored rows —
+but keyed by the join shape `(keys, columns)` rather than a single field.
+A new `quarry-join-hash-v1` blob type carries the two field-id sets; the
+build-side rows are written as Parquet at a companion path, and recovery
+requires both.
+
+The path scheme is `{prefix}/{table}/jh-{hash}/{snapshot}.puffin` where
+`hash` is the same stable hash `join_hash_id` computes — so a recovered
+piece lands on the same `DerivedId` the optimizer would build onto, and
+`reclaim` can reconstruct the path from the `DerivedId` alone.
+
+Recovery discards a metadata blob whose rows are missing (a substituting
+kind with no rows would falsely advertise itself), and discards both
+files for a snapshot the table no longer retains. `Store::reclaim`
+deletes both the `.puffin` and `.parquet` when a join hash is retired.

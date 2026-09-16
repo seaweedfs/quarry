@@ -70,7 +70,7 @@ use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
 use crate::derived::{Derived, DerivedId, FieldId, Filter, Metric, PolicyFingerprint, Source};
-use crate::kinds::{Bitmap, FilterSet, Index, TextIndex, VectorIndex};
+use crate::kinds::{Bitmap, FilterSet, Index, JoinHash, TextIndex, VectorIndex};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
 use crate::stable_hash::HASH_VERSION;
@@ -97,6 +97,12 @@ pub const QUARRY_TEXT_INDEX_V1: &str = "quarry-text-index-v1";
 /// columnar format. The Puffin blob carries only what recovery needs to
 /// reconstruct the kind and find the rows.
 pub const QUARRY_VECTOR_INDEX_V1: &str = "quarry-vector-index-v1";
+
+/// The blob type for a saved join hash's metadata. Like the vector index,
+/// the build-side rows are written as Parquet at a companion path — see
+/// `Layout::join_hash_rows_path` — and the Puffin blob carries only the
+/// join keys and covered columns recovery needs to reconstruct the kind.
+pub const QUARRY_JOIN_HASH_V1: &str = "quarry-join-hash-v1";
 
 /// The blob property holding the canonical filter text a filter set answers.
 const FILTER_TEXT_PROPERTY: &str = "quarry.filter";
@@ -146,6 +152,27 @@ impl Layout {
     /// together and share the `(table, field, snapshot)` identity.
     pub fn vector_rows_path(&self, table: &TableId, field: FieldId, at: SnapshotId) -> String {
         format!("{}/{}/{}/{}.parquet", self.prefix, table.0, field, at.0)
+    }
+
+    /// Where a join hash's metadata belongs — keyed by the join shape's
+    /// stable hash, not a single field, because the join shape (keys +
+    /// columns) is the identity.
+    pub fn join_hash_path(&self, table: &TableId, id_hash: u64, at: SnapshotId) -> String {
+        format!(
+            "{}/{}/jh-{:016x}/{}.puffin",
+            self.prefix, table.0, id_hash, at.0
+        )
+    }
+
+    /// Where a join hash's rows belong, as Parquet.
+    ///
+    /// Distinct from [`join_hash_path`](Self::join_hash_path) by extension,
+    /// the same convention as `vector_rows_path`.
+    pub fn join_hash_rows_path(&self, table: &TableId, id_hash: u64, at: SnapshotId) -> String {
+        format!(
+            "{}/{}/jh-{:016x}/{}.parquet",
+            self.prefix, table.0, id_hash, at.0
+        )
     }
 
     /// Where one filter set belongs — keyed by the filter's hash, not a
@@ -231,6 +258,24 @@ impl Layout {
         let mut segments = path.rsplit('/');
         let snapshot = segments.next()?.strip_suffix(".puffin")?.parse().ok()?;
         let hash = segments.next()?.strip_prefix("fset-")?.parse().ok()?;
+        let table = segments.next()?;
+        if table.is_empty() {
+            return None;
+        }
+        Some((TableId(table.to_owned()), hash, SnapshotId(snapshot)))
+    }
+
+    /// Recover `(table, id_hash, snapshot)` from a
+    /// [`Layout::join_hash_path`].
+    ///
+    /// Like [`parse_filter_set`](Self::parse_filter_set), the hash is not the
+    /// identity itself — the keys and columns inside the blob are — but the
+    /// segment lets listing route the read. The caller reconstructs the
+    /// `DerivedId` from `(table, id_hash)`.
+    pub fn parse_join_hash(&self, path: &str) -> Option<(TableId, u64, SnapshotId)> {
+        let mut segments = path.rsplit('/');
+        let snapshot = segments.next()?.strip_suffix(".puffin")?.parse().ok()?;
+        let hash = u64::from_str_radix(segments.next()?.strip_prefix("jh-")?, 16).ok()?;
         let table = segments.next()?;
         if table.is_empty() {
             return None;
@@ -560,6 +605,38 @@ fn decode_vector_index(bytes: &[u8]) -> Option<(FieldId, Metric, u32)> {
         return None;
     }
     Some((field, metric, dimension))
+}
+
+/// Encode a join hash's metadata: the join keys and covered columns.
+///
+/// The rows themselves are Parquet, written separately; this is only what
+/// recovery needs to reconstruct the kind.
+fn encode_join_hash(hash: &JoinHash) -> Vec<u8> {
+    let (keys, columns) = hash.covers();
+    let mut out = Vec::new();
+    put_fields(&mut out, keys);
+    put_fields(&mut out, columns);
+    out
+}
+
+/// Read join hash metadata back, or `None` if the bytes are not well-formed.
+fn decode_join_hash(bytes: &[u8]) -> Option<(BTreeSet<FieldId>, BTreeSet<FieldId>)> {
+    let mut cursor = Cursor { bytes, at: 0 };
+    let keys = cursor.fields()?;
+    let columns = cursor.fields()?;
+    if cursor.at != bytes.len() {
+        return None;
+    }
+    Some((keys, columns))
+}
+
+/// Extract the stable hash from a join hash's `DerivedId` (`jh:<table>:<hex>`),
+/// so `reclaim` can reconstruct the blob path without carrying a separate
+/// field through `Retired`.
+fn parse_join_hash_id(id: &DerivedId) -> Option<u64> {
+    let s = id.0.strip_prefix("jh:")?;
+    let hash = s.rsplit_once(':')?.1;
+    u64::from_str_radix(hash, 16).ok()
 }
 
 struct Cursor<'a> {
@@ -1072,6 +1149,136 @@ pub async fn read_vector_rows(
     stream.try_collect().await.ok()
 }
 
+/// Write a join hash: the rows as Parquet, then the metadata as a Puffin
+/// blob beside them.
+///
+/// Same contract as [`write_vector_index`]: the Parquet file is the bulk of
+/// the index — the build-side rows the kind substitutes for the scan. The
+/// Puffin blob carries only the join keys and covered columns recovery
+/// needs to reconstruct the kind, plus the policy and hash version.
+///
+/// The path key is the same stable hash [`super::build::join_hash_id_from`]
+/// computes, so the blob lands where recovery and `reclaim` look for it.
+///
+/// Returns the Puffin metadata path; the rows path is derived from it by
+/// swapping `.puffin` for `.parquet`.
+pub async fn write_join_hash(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    policy: PolicyFingerprint,
+    hash: &JoinHash,
+    rows: &[datafusion::arrow::record_batch::RecordBatch],
+) -> iceberg::Result<String> {
+    let (keys, columns) = hash.covers();
+    let id = super::build::join_hash_id_from(table, keys, columns);
+    let id_hash = parse_join_hash_id(&id).ok_or_else(|| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!("join hash id {id:?} does not carry a hash"),
+        )
+    })?;
+    let rows_path = layout.join_hash_rows_path(table, id_hash, at);
+    let meta_path = layout.join_hash_path(table, id_hash, at);
+
+    // Parquet rows first; the Puffin metadata is the registry entry, and a
+    // recovered metadata blob whose rows are absent is discarded.
+    let schema = rows
+        .first()
+        .ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                format!("join hash for {table:?} id {id_hash:016x} has no rows"),
+            )
+        })?
+        .schema();
+    let mut buffer = Vec::new();
+    let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)?;
+    for batch in rows {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    file_io
+        .new_output(&rows_path)?
+        .write(bytes::Bytes::from(buffer))
+        .await?;
+
+    let output = file_io.new_output(&meta_path)?;
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_JOIN_HASH_V1.to_owned())
+                .fields(Vec::new())
+                .snapshot_id(at.0)
+                .sequence_number(0)
+                .data(encode_join_hash(hash))
+                .properties(HashMap::from([
+                    (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
+                    (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                ]))
+                .build(),
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(meta_path)
+}
+
+/// Read a join hash's metadata blob, returning the keys, columns, policy,
+/// and the path to its Parquet rows.
+///
+/// `None` for wrong type, wrong hash version, missing policy, or bytes that
+/// do not decode exactly — same discipline as every other kind.
+pub async fn read_join_hash(
+    file_io: &FileIO,
+    path: &str,
+) -> iceberg::Result<
+    Option<(
+        BTreeSet<FieldId>,
+        BTreeSet<FieldId>,
+        PolicyFingerprint,
+        String,
+    )>,
+> {
+    if !is_plausible_puffin(file_io, path).await? {
+        return Ok(None);
+    }
+    let reader = PuffinReader::new(file_io.new_input(path)?);
+    let metadata = reader.file_metadata().await?;
+
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_JOIN_HASH_V1 {
+            continue;
+        }
+        let properties = blob_metadata.properties();
+        if properties.get(HASH_VERSION_PROPERTY).map(String::as_str)
+            != Some(&HASH_VERSION.to_string())
+        {
+            continue;
+        }
+        let policy = properties
+            .get(POLICY_PROPERTY)
+            .and_then(|raw| raw.parse().ok())
+            .map(PolicyFingerprint);
+        let Some(policy) = policy else {
+            continue;
+        };
+
+        let blob = reader.blob(blob_metadata).await?;
+        let Some((keys, columns)) = decode_join_hash(blob.data()) else {
+            continue;
+        };
+        let rows_path = path.strip_suffix(".puffin").map(|p| format!("{p}.parquet"));
+        let Some(rows_path) = rows_path else {
+            continue;
+        };
+        return Ok(Some((keys, columns, policy, rows_path)));
+    }
+    Ok(None)
+}
+
 /// The blob type for a saved workload.
 pub const QUARRY_WORKLOAD_V1: &str = "quarry-workload-v1";
 
@@ -1428,6 +1635,43 @@ pub async fn recover(
                 }
                 None => recovered.discarded.push(readable),
             }
+        } else if let Some((found_table, id_hash, at)) = layout.parse_join_hash(&path) {
+            if &found_table != table {
+                continue;
+            }
+            let readable = layout.join_hash_path(table, id_hash, at);
+            let rows_path = layout.join_hash_rows_path(table, id_hash, at);
+            if !known_snapshots.contains(&at) {
+                recovered.discarded.push(readable);
+                recovered.discarded.push(rows_path);
+                continue;
+            }
+            match read_join_hash(file_io, &readable).await? {
+                Some((keys, columns, policy, _rows_path)) => {
+                    let Some(rows) = read_vector_rows(store, &rows_path).await else {
+                        recovered.discarded.push(readable);
+                        recovered.discarded.push(rows_path);
+                        continue;
+                    };
+                    let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+                    let id = super::join_hash_id_from(table, &keys, &columns);
+                    recovered.rows.insert(id.clone(), rows);
+                    recovered.registry.register(Derived::new(
+                        id,
+                        Source {
+                            table: table.clone(),
+                            snapshot: at,
+                        },
+                        policy,
+                        bytes,
+                        Box::new(JoinHash::covering(keys, columns, bytes)),
+                    ));
+                }
+                None => {
+                    recovered.discarded.push(readable);
+                    recovered.discarded.push(rows_path);
+                }
+            }
         }
     }
     Ok(recovered)
@@ -1681,6 +1925,21 @@ impl Store {
         write_vector_index(&self.file_io, &self.layout, table, at, policy, vector, rows).await
     }
 
+    /// Write a join hash down: rows as Parquet, metadata as a Puffin blob.
+    ///
+    /// The path key is derived from the join shape the hash covers, so the
+    /// blob lands where recovery and `reclaim` look for it.
+    pub async fn write_join_hash(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        policy: PolicyFingerprint,
+        hash: &JoinHash,
+        rows: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> iceberg::Result<String> {
+        write_join_hash(&self.file_io, &self.layout, table, at, policy, hash, rows).await
+    }
+
     /// Rebuild a table's registry from storage.
     pub async fn recover(
         &self,
@@ -1777,6 +2036,40 @@ impl Store {
                             policy,
                             bytes,
                             Box::new(set),
+                        ));
+                    }
+                    None => recovered.discarded.push(entry.path),
+                }
+                continue;
+            }
+            if entry.kind == QUARRY_JOIN_HASH_V1 {
+                match read_join_hash(&self.file_io, &entry.path).await? {
+                    Some((keys, columns, policy, _rows_path)) => {
+                        let rows_path = entry
+                            .path
+                            .strip_suffix(".puffin")
+                            .map(|p| format!("{p}.parquet"));
+                        let Some(rows_path) = rows_path else {
+                            recovered.discarded.push(entry.path);
+                            continue;
+                        };
+                        let Some(rows) = read_vector_rows(&self.store, &rows_path).await else {
+                            recovered.discarded.push(entry.path);
+                            recovered.discarded.push(rows_path);
+                            continue;
+                        };
+                        let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+                        let id = super::join_hash_id_from(table, &keys, &columns);
+                        recovered.rows.insert(id.clone(), rows);
+                        recovered.registry.register(Derived::new(
+                            id,
+                            Source {
+                                table: table.clone(),
+                                snapshot: at,
+                            },
+                            policy,
+                            bytes,
+                            Box::new(JoinHash::covering(keys, columns, bytes)),
                         ));
                     }
                     None => recovered.discarded.push(entry.path),
@@ -1891,13 +2184,15 @@ impl Store {
         table: &TableId,
         retired: &[super::optimizer::Retired],
     ) -> iceberg::Result<usize> {
-        let paths: Vec<String> = retired
-            .iter()
-            .filter_map(|r| {
-                r.field
-                    .map(|field| self.layout.index_path(table, field, r.at))
-            })
-            .collect();
+        let mut paths = Vec::new();
+        for r in retired {
+            if let Some(field) = r.field {
+                paths.push(self.layout.index_path(table, field, r.at));
+            } else if let Some(id_hash) = parse_join_hash_id(&r.id) {
+                paths.push(self.layout.join_hash_path(table, id_hash, r.at));
+                paths.push(self.layout.join_hash_rows_path(table, id_hash, r.at));
+            }
+        }
         discard(&self.file_io, &paths).await
     }
 

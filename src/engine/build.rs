@@ -874,6 +874,20 @@ pub fn join_hash_id(table: &crate::snapshot::TableId, ask: &crate::workload::Joi
     DerivedId(format!("jh:{}:{:016x}", table.0, hasher.finish()))
 }
 
+/// Reconstruct a join hash's id from the recovered keys and columns —
+/// the same hash [`join_hash_id`] computes from a `JoinAsk`, so a
+/// recovered piece lands on the same id the optimizer would build onto.
+pub fn join_hash_id_from(
+    table: &crate::snapshot::TableId,
+    keys: &std::collections::BTreeSet<crate::derived::FieldId>,
+    columns: &std::collections::BTreeSet<crate::derived::FieldId>,
+) -> DerivedId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = crate::stable_hash::StableHasher::new();
+    (table.clone(), keys.clone(), columns.clone()).hash(&mut hasher);
+    DerivedId(format!("jh:{}:{:016x}", table.0, hasher.finish()))
+}
+
 /// Build the vector index `ask` proposes: the table's rows, held where a
 /// distance can be computed against them without reading object storage.
 ///

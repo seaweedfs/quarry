@@ -30,9 +30,9 @@ use quarry::derived::PolicyFingerprint;
 use quarry::derived::{Decision, Plan, Predicate, Query, Rewrite, Scope};
 use quarry::engine::{
     Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_bitmap,
-    build_filter_set, build_index, filter_set_id, hash_scalar, index_id, read_bitmap,
-    read_filter_set, read_index, read_text_index, read_vector_index, read_vector_rows, shared,
-    write_index,
+    build_filter_set, build_index, filter_set_id, hash_scalar, index_id, join_hash_id_from,
+    read_bitmap, read_filter_set, read_index, read_join_hash, read_text_index, read_vector_index,
+    read_vector_rows, shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -1419,5 +1419,218 @@ async fn a_vector_index_from_a_stale_snapshot_is_discarded() {
         recovered.discarded.len(),
         1,
         "the stale vector index metadata is discarded"
+    );
+}
+
+/// A join hash — metadata plus its Parquet rows — written and read back,
+/// then recovered by listing alone.
+#[tokio::test]
+async fn a_join_hash_survives_being_written_and_read_back() {
+    use quarry::kinds::JoinHash;
+
+    let fixture = fixture("persist_join_hash");
+    let (file_io, store) = stacks(&fixture);
+
+    const KEY: u32 = 4;
+    const COLUMN: u32 = 7;
+    let keys = BTreeSet::from([KEY]);
+    let columns = BTreeSet::from([KEY, COLUMN]);
+
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .expect("batch");
+
+    let hash = JoinHash::covering(keys.clone(), columns.clone(), 4096);
+    let meta_path = store
+        .write_join_hash(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &hash,
+            std::slice::from_ref(&batch),
+        )
+        .await
+        .expect("write");
+
+    // Read the metadata back.
+    let (read_keys, read_columns, policy, rows_path) = read_join_hash(&file_io, &meta_path)
+        .await
+        .expect("read")
+        .expect("a usable join hash");
+    assert_eq!(read_keys, keys);
+    assert_eq!(read_columns, columns);
+    assert_eq!(policy, POLICY);
+
+    // Read the rows back.
+    let rows = read_vector_rows(store.store(), &rows_path)
+        .await
+        .expect("rows");
+    assert_eq!(rows.len(), 1, "one batch recovered");
+    assert_eq!(rows[0].num_rows(), 3, "three rows recovered");
+    assert_eq!(rows[0].schema(), schema(), "schema preserved");
+
+    // A restart finds it and registers it with rows under the stable id.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = join_hash_id_from(&events(), &keys, &columns);
+    let derived = recovered.registry.get(&id).expect("registered");
+    assert_eq!(derived.source.snapshot, SnapshotId(1));
+    assert_eq!(derived.policy, POLICY);
+    let recovered_rows = recovered.rows.get(&id).expect("rows recovered");
+    assert_eq!(recovered_rows.len(), 1, "one batch in recovered rows");
+    assert_eq!(
+        recovered_rows[0].num_rows(),
+        3,
+        "three rows in recovered rows"
+    );
+}
+
+/// A join hash from a snapshot the table no longer retains is discarded —
+/// both the metadata blob and its rows.
+#[tokio::test]
+async fn a_join_hash_from_a_stale_snapshot_is_discarded() {
+    use quarry::kinds::JoinHash;
+
+    let fixture = fixture("persist_join_hash_stale");
+    let (_, store) = stacks(&fixture);
+
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+    )
+    .expect("batch");
+
+    let hash = JoinHash::covering([TENANT_FIELD], [TENANT_FIELD, 7], 64);
+    store
+        .write_join_hash(&events(), SnapshotId(1), POLICY, &hash, &[batch])
+        .await
+        .expect("write");
+
+    // Recover with no known snapshots — everything is stale.
+    let recovered = store.recover(&events(), &[]).await.expect("recover");
+    assert!(
+        recovered.registry.is_empty(),
+        "stale join hash must not be registered"
+    );
+    assert_eq!(
+        recovered.discarded.len(),
+        2,
+        "both the metadata blob and its rows are discarded"
+    );
+}
+
+/// A join hash whose metadata decodes but whose rows are missing is
+/// discarded — a substituting kind with no rows must not be registered.
+#[tokio::test]
+async fn a_join_hash_with_missing_rows_is_discarded() {
+    use quarry::kinds::JoinHash;
+
+    let fixture = fixture("persist_join_hash_orphan");
+    let (file_io, store) = stacks(&fixture);
+
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+    )
+    .expect("batch");
+
+    let hash = JoinHash::covering([TENANT_FIELD], [TENANT_FIELD, 7], 64);
+    let meta_path = store
+        .write_join_hash(&events(), SnapshotId(1), POLICY, &hash, &[batch])
+        .await
+        .expect("write");
+
+    // Delete the rows, leave the metadata — a crash between the two writes
+    // leaves exactly this shape.
+    let rows_path = meta_path.replace(".puffin", ".parquet");
+    file_io.delete(&rows_path).await.expect("delete rows");
+
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    assert!(
+        recovered.registry.is_empty(),
+        "a join hash without its rows must not be registered"
+    );
+    assert!(
+        recovered.rows.is_empty(),
+        "and no rows should be attached either"
+    );
+    assert_eq!(
+        recovered.discarded.len(),
+        2,
+        "both the metadata and the absent rows path are offered for deletion"
+    );
+}
+
+/// A join hash advertised by a published manifest is recovered the same
+/// way — metadata plus rows, no listing.
+#[tokio::test]
+async fn a_published_join_hash_recovers() {
+    use quarry::engine::QUARRY_JOIN_HASH_V1;
+    use quarry::kinds::JoinHash;
+
+    let fixture = fixture("persist_join_hash_manifest");
+    let (_, store) = stacks(&fixture);
+
+    let keys = BTreeSet::from([TENANT_FIELD]);
+    let columns = BTreeSet::from([TENANT_FIELD, 7]);
+
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .expect("batch");
+
+    let hash = JoinHash::covering(keys.clone(), columns.clone(), 64);
+    let meta_path = store
+        .write_join_hash(&events(), SnapshotId(1), POLICY, &hash, &[batch])
+        .await
+        .expect("write");
+
+    // Publish a manifest advertising the join hash blob.
+    let stats = store
+        .manifest(
+            &events(),
+            SnapshotId(1),
+            &[Advertised {
+                kind: QUARRY_JOIN_HASH_V1.to_owned(),
+                fields: Vec::new(),
+                path: meta_path.clone(),
+                properties: HashMap::new(),
+            }],
+            None,
+        )
+        .await
+        .expect("manifest");
+
+    let recovered = store
+        .recover_published(&events(), &stats, &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = join_hash_id_from(&events(), &keys, &columns);
+    let derived = recovered.registry.get(&id).expect("registered");
+    assert_eq!(derived.source.snapshot, SnapshotId(1));
+    assert_eq!(derived.policy, POLICY);
+    assert!(
+        recovered.rows.contains_key(&id),
+        "rows recovered via manifest"
     );
 }
