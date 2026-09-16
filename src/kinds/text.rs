@@ -214,6 +214,7 @@ mod tests {
             predicates,
             aggregate: None,
             nearest: None,
+            join: None,
             approximate: false,
         }
     }

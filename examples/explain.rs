@@ -102,6 +102,7 @@ fn main() {
         }],
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
 

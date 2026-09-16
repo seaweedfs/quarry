@@ -365,5 +365,6 @@ pub(crate) fn report(
             table: table.table_id().clone(),
             nearest: ask.nearest.clone(),
         }),
+        join: None,
     }
 }

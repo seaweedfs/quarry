@@ -21,13 +21,13 @@ use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
 use crate::snapshot::{Commits, SnapshotId, TableId};
 use crate::workload::{
-    AggregateAsk, FilterAsk, NearestAsk, Observation, Policy, Proposal, TextAsk, Workload,
+    AggregateAsk, FilterAsk, JoinAsk, NearestAsk, Observation, Policy, Proposal, TextAsk, Workload,
 };
 
 use super::{
-    QuarryTable, Session, SharedRegistry, build_cube, build_proposed_filter_set,
+    QuarryTable, Session, SharedRegistry, build_cube, build_join_hash, build_proposed_filter_set,
     build_proposed_index, build_proposed_text_index, build_vector_index, cube_id, estimate_overlap,
-    filter_set_id, index_id, parquet_bounds, text_index_id, vector_index_id,
+    filter_set_id, index_id, join_hash_id, parquet_bounds, text_index_id, vector_index_id,
 };
 
 /// A piece of derived state a round dropped, identified enough to delete it.
@@ -150,6 +150,11 @@ pub enum BuildKind {
         /// The text ask the index serves.
         ask: TextAsk,
     },
+    /// A join hash: the build-side rows of a join, sorted by the join key.
+    JoinHash {
+        /// The join ask the hash serves.
+        ask: JoinAsk,
+    },
 }
 
 /// A recommendation to build a piece of derived state, with the cost
@@ -249,6 +254,8 @@ pub struct Optimizer {
     built_vectors: BTreeMap<DerivedId, NearestAsk>,
     /// Same for text indexes.
     built_texts: BTreeMap<DerivedId, TextAsk>,
+    /// Same for join hashes — the ask a rebuild re-reads the table for.
+    built_joins: BTreeMap<DerivedId, JoinAsk>,
     /// What each build was expected to save, in dollars.
     ///
     /// Kept so a prediction can be held against the realized credit later:
@@ -294,6 +301,7 @@ impl Optimizer {
             built_filters: BTreeMap::new(),
             built_vectors: BTreeMap::new(),
             built_texts: BTreeMap::new(),
+            built_joins: BTreeMap::new(),
             predicted: BTreeMap::new(),
             commits: Commits::new(),
             failed_at: BTreeMap::new(),
@@ -647,6 +655,33 @@ impl Optimizer {
             }));
         }
 
+        // Join hash proposals.
+        for proposal in self
+            .workload
+            .join_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = join_hash_id(&proposal.table, &proposal.ask);
+            if existing.contains(&id) {
+                continue;
+            }
+            let expected = proposal.ceiling_usd * self.proven(&id);
+            recommendations.push(Recommendation::Build(BuildRecommendation {
+                id,
+                kind: BuildKind::JoinHash {
+                    ask: proposal.ask.clone(),
+                },
+                table: proposal.table.clone(),
+                queries: proposal.queries,
+                bytes_scanned: proposal.bytes_scanned,
+                ceiling_usd: proposal.ceiling_usd,
+                expected_savings_usd: expected,
+                build_cost_usd,
+            }));
+        }
+
         recommendations
     }
 
@@ -734,6 +769,9 @@ impl Optimizer {
                     Err(e) => Err(e),
                 }
             }
+            BuildKind::JoinHash { ask } => {
+                build_join_hash(session, table, ask, rec.id.clone()).await
+            }
         };
 
         let derived = match derived {
@@ -771,6 +809,9 @@ impl Optimizer {
             }
             BuildKind::Text { ask } => {
                 self.built_texts.insert(rec.id.clone(), ask.clone());
+            }
+            BuildKind::JoinHash { ask } => {
+                self.built_joins.insert(rec.id.clone(), ask.clone());
             }
         }
         self.predicted
@@ -923,6 +964,8 @@ impl Optimizer {
                     Ok(Some(derived)) => Ok(derived),
                     Err(e) => Err(e),
                 }
+            } else if let Some(ask) = self.built_joins.get(&id) {
+                build_join_hash(session, table, ask, id.clone()).await
             } else {
                 continue;
             };
@@ -1059,12 +1102,14 @@ mod tests {
             predicates: vec![Predicate::Eq { field, value: 1 }],
             aggregate: None,
             nearest: None,
+            join: None,
             approximate: false,
         };
         Observation {
             fingerprint: Fingerprint::of(&query),
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: bytes,
             bytes_if_full_scan: bytes,

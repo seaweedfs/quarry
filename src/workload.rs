@@ -162,6 +162,44 @@ pub struct TextAsk {
     pub field: FieldId,
 }
 
+/// What a join asked of a table as its build side, kept whole enough to
+/// propose a join hash.
+///
+/// Like [`NearestAsk`] and [`TextAsk`], this carries **no literals** — only
+/// the join keys and the columns the join reads from this side. One join hash
+/// over `(table, keys, columns)` serves every join with that shape, so the
+/// probe-side values are not part of what is proposed, which also means this
+/// is safe to persist, though nothing does yet.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JoinAsk {
+    /// The table on the build side of the join.
+    pub table: TableId,
+    /// The join key fields on this side.
+    pub keys: BTreeSet<FieldId>,
+    /// All columns the join reads from this side: join keys plus whatever
+    /// else the join carries through.
+    pub columns: BTreeSet<FieldId>,
+}
+
+/// A join hash worth building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinProposal {
+    /// The table it would be built on.
+    pub table: TableId,
+    /// What it would cover.
+    pub ask: JoinAsk,
+    /// How many unaided queries asked for this.
+    pub queries: u64,
+    /// Bytes those queries read.
+    pub bytes_scanned: u64,
+    /// The most it could possibly have saved: every byte those queries moved.
+    ///
+    /// A join hash replaces the build-side scan, so this is the I/O the build
+    /// side would have read — an upper bound, since the hash's own storage
+    /// and build are not in it.
+    pub ceiling_usd: f64,
+}
+
 /// A text index worth building.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextProposal {
@@ -209,6 +247,8 @@ pub struct Observation {
     pub aggregate: Option<AggregateAsk>,
     /// What the query searched for, if it was a top-k nearest ask.
     pub nearest: Option<NearestAsk>,
+    /// What the query joined on, if it was the build side of a join.
+    pub join: Option<JoinAsk>,
     /// Full-text fields the query matched on, if any.
     ///
     /// Plural because one query may match on several fields, and carrying no
@@ -306,6 +346,8 @@ impl ForeignScan {
             // A foreign engine's sort expression is in its dialect, not
             // this one's distance functions — nothing to key an index by.
             nearest: None,
+            // Same for a join: another engine's join shape is not this one's.
+            join: None,
             // Same for a match: another engine's full-text syntax is not
             // `quarry_matches`, and its tokenizer is not this one's.
             text: Vec::new(),
@@ -555,6 +597,9 @@ pub struct Workload {
     by_nearest: BTreeMap<NearestAsk, Seen>,
     /// Full-text asks, also literal-free for the same reason.
     by_text: BTreeMap<TextAsk, Seen>,
+    /// Join asks, also literal-free — keys and columns only, no probe-side
+    /// values.
+    by_join: BTreeMap<JoinAsk, Seen>,
 }
 
 impl Workload {
@@ -629,6 +674,21 @@ impl Workload {
 
         for ask in observation.text {
             let seen = self.by_text.entry(ask).or_default();
+            seen.queries += 1;
+            seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
+            seen.bytes_if_full_scan = seen
+                .bytes_if_full_scan
+                .saturating_add(observation.bytes_if_full_scan);
+            if !observation.used.is_empty() {
+                seen.helped += 1;
+            }
+        }
+
+        // A join ask names the build-side table and its join keys. One join
+        // hash over (table, keys, columns) serves every join with that shape,
+        // so the probe side is not part of what is proposed.
+        if let Some(ask) = observation.join {
+            let seen = self.by_join.entry(ask).or_default();
             seen.queries += 1;
             seen.bytes_read = seen.bytes_read.saturating_add(observation.bytes_read);
             seen.bytes_if_full_scan = seen
@@ -728,6 +788,7 @@ impl Workload {
             by_filter: BTreeMap::new(),
             by_nearest: BTreeMap::new(),
             by_text: BTreeMap::new(),
+            by_join: BTreeMap::new(),
         }
     }
 
@@ -882,6 +943,28 @@ impl Workload {
         proposals
     }
 
+    /// Join hashes worth building, most promising first.
+    ///
+    /// Same rule as the others: only unaided asks propose, grouped by the
+    /// (table, keys, columns) shape a join hash would cover.
+    pub fn join_proposals(&self, prices: &PriceTable, min_queries: u64) -> Vec<JoinProposal> {
+        let mut proposals: Vec<JoinProposal> = self
+            .by_join
+            .iter()
+            .filter(|(_, seen)| seen.queries.saturating_sub(seen.helped) >= min_queries)
+            .map(|(ask, seen)| JoinProposal {
+                table: ask.table.clone(),
+                ask: ask.clone(),
+                queries: seen.queries,
+                bytes_scanned: seen.bytes_read,
+                ceiling_usd: seen.bytes_read as f64
+                    * prices.byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far),
+            })
+            .collect();
+        proposals.sort_by(|a, b| b.ceiling_usd.total_cmp(&a.ceiling_usd));
+        proposals
+    }
+
     /// Derived state that has not paid for itself over `horizon_days`.
     ///
     /// Compares what a piece has *measurably* saved against what keeping it
@@ -950,6 +1033,7 @@ mod tests {
                 .collect(),
             aggregate: None,
             nearest: None,
+            join: None,
             approximate: false,
         }
     }
@@ -959,6 +1043,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(fields)),
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
@@ -1105,6 +1190,7 @@ mod tests {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
                 aggregate: None,
                 nearest: None,
+                join: None,
                 text: Vec::new(),
                 bytes_read: GB / 10,
                 bytes_if_full_scan: GB,
@@ -1129,6 +1215,7 @@ mod tests {
                 fingerprint: Fingerprint::of(&other),
                 aggregate: None,
                 nearest: None,
+                join: None,
                 text: Vec::new(),
                 bytes_read: GB,
                 bytes_if_full_scan: GB,
@@ -1154,6 +1241,7 @@ mod tests {
             },
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: bytes,
             bytes_if_full_scan: bytes,
@@ -1283,6 +1371,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: GB / 4,
             bytes_if_full_scan: GB,
@@ -1298,6 +1387,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: 2 * GB,
             bytes_if_full_scan: GB,
@@ -1362,6 +1452,7 @@ mod tests {
                 fingerprint: Fingerprint::of(&query_on(&[4])),
                 aggregate: None,
                 nearest: None,
+                join: None,
                 text: Vec::new(),
                 bytes_read: 0,
                 bytes_if_full_scan: GB,
@@ -1385,6 +1476,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: 0,
             bytes_if_full_scan: 1_000,
@@ -1404,6 +1496,7 @@ mod tests {
             fingerprint: Fingerprint::of(&query_on(&[4])),
             aggregate: None,
             nearest: None,
+            join: None,
             text: Vec::new(),
             bytes_read: 1,
             bytes_if_full_scan: GB,

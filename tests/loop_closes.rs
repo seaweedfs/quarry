@@ -1330,12 +1330,14 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         predicates: vec![Predicate::Eq { field, value: 1 }],
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
     Observation {
         fingerprint: Fingerprint::of(&query),
         aggregate: None,
         nearest: None,
+        join: None,
         text: Vec::new(),
         bytes_read: bytes,
         bytes_if_full_scan: bytes,
@@ -1815,6 +1817,7 @@ async fn a_low_cardinality_field_earns_a_row_level_bitmap() {
         }],
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
     match derived.may_serve(&query, &graph) {
@@ -1873,6 +1876,7 @@ async fn a_high_cardinality_field_earns_a_file_level_index() {
         }],
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
     match derived.may_serve(&query, &graph) {

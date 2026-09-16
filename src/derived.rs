@@ -502,6 +502,14 @@ pub struct Query {
     /// plan — the `Sort` and `Limit` are not visible to `TableProvider::scan`
     /// — so it is populated only by a caller that can see the whole plan.
     pub nearest: Option<Nearest>,
+    /// The join key fields, if this scan is the build side of a join.
+    ///
+    /// Like [`Query::aggregate`] and [`Query::nearest`], the join sits above
+    /// the scan in the logical plan, so this is populated only by a caller
+    /// that can see the whole plan — never by `TableProvider::scan`. Its
+    /// absence means "no join was visible", which a [`JoinHash`](crate::kinds::JoinHash)
+    /// treats as not-a-match rather than as "plain scan".
+    pub join: Option<BTreeSet<FieldId>>,
     /// Whether the session accepts an approximate answer to an exact ask.
     ///
     /// `false` means a stored estimate may serve only a query that asked for
@@ -1150,6 +1158,7 @@ mod tests {
             }],
             aggregate: None,
             nearest: None,
+            join: None,
             approximate: false,
         }
     }

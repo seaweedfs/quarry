@@ -1035,6 +1035,7 @@ async fn a_bitmap_survives_being_written_and_read_back() {
         }],
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
     match derived.may_serve(&query, &fixture_dir.graph) {
@@ -1136,6 +1137,7 @@ async fn a_filter_set_survives_being_written_and_read_back() {
         predicates: Vec::new(),
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
     match derived.may_serve(&query, &fixture_dir.graph) {
@@ -1202,6 +1204,7 @@ async fn a_text_index_round_trips_and_recovers() {
         }],
         aggregate: None,
         nearest: None,
+        join: None,
         approximate: false,
     };
     match derived.may_serve(&query, &fixture.graph) {
@@ -1316,7 +1319,13 @@ async fn a_vector_index_round_trips_and_recovers() {
 
     let vector = VectorIndex::new(EMBEDDING, Metric::L2, DIM as u32, 4096);
     let meta_path = store
-        .write_vector_index(&events(), SnapshotId(1), POLICY, &vector, std::slice::from_ref(&batch))
+        .write_vector_index(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &vector,
+            std::slice::from_ref(&batch),
+        )
         .await
         .expect("write");
 

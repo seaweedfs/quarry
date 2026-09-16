@@ -123,6 +123,7 @@ mod tests {
             predicates: Vec::new(),
             aggregate: None,
             nearest,
+            join: None,
             approximate: false,
         }
     }

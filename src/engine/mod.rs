@@ -25,6 +25,7 @@ mod distance;
 mod hll;
 #[cfg(feature = "iceberg")]
 mod iceberg_table;
+mod join;
 mod materialized;
 mod optimizer;
 mod options;
@@ -36,10 +37,10 @@ mod table;
 mod text;
 
 pub use build::{
-    build_bitmap, build_cube, build_filter_set, build_index, build_proposed_filter_set,
-    build_proposed_index, build_proposed_text_index, build_text_index, build_vector_index, columns,
-    cube_id, estimate_overlap, filter_set_id, index_id, parquet_bounds, text_index_id,
-    vector_index_id,
+    build_bitmap, build_cube, build_filter_set, build_index, build_join_hash,
+    build_proposed_filter_set, build_proposed_index, build_proposed_text_index, build_text_index,
+    build_vector_index, columns, cube_id, estimate_overlap, filter_set_id, index_id, join_hash_id,
+    parquet_bounds, text_index_id, vector_index_id,
 };
 pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]

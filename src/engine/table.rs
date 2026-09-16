@@ -123,6 +123,11 @@ pub struct ScanReport {
     /// Set only where the whole plan was visible, for the same reason
     /// `aggregate` is: the `ORDER BY` and `LIMIT` sit above the scan.
     pub nearest: Option<crate::workload::NearestAsk>,
+    /// What the query joined on, if this scan was the build side of a join.
+    ///
+    /// Set only where the whole plan was visible, for the same reason
+    /// `aggregate` and `nearest` are: the `Join` sits above the scan.
+    pub join: Option<crate::workload::JoinAsk>,
     /// Full-text fields this scan matched on.
     ///
     /// Unlike `aggregate` and `nearest`, a match *is* visible here: it is a
@@ -157,6 +162,7 @@ impl ScanReport {
             fingerprint: self.fingerprint.clone(),
             aggregate: self.aggregate.clone(),
             nearest: self.nearest.clone(),
+            join: self.join.clone(),
             text: self.text.clone(),
             filters: self.filters.clone(),
             bytes_read,
@@ -614,6 +620,7 @@ impl QuarryTable {
             predicates: self.predicates(filters),
             aggregate: Some(aggregate),
             nearest: None,
+            join: None,
             approximate,
         })
     }
@@ -657,6 +664,46 @@ impl QuarryTable {
             predicates: self.predicates(filters),
             aggregate: None,
             nearest: Some(nearest.clone()),
+            join: None,
+            approximate,
+        })
+    }
+
+    /// The join query `keys` over `filters` asks of this table, as a build
+    /// side.
+    ///
+    /// The counterpart of [`QuarryTable::nearest_query`] for the join shape.
+    /// `keys` are the join key fields on this side; `projected` is whatever
+    /// the plan reads from this side (join keys plus any other columns the
+    /// join carries through). A plan is required, because substitution
+    /// matches on identity.
+    pub fn join_query(
+        &self,
+        keys: &BTreeSet<FieldId>,
+        projected: &BTreeSet<FieldId>,
+        filters: &[Expr],
+        approximate: bool,
+    ) -> Option<Query> {
+        let plan = Plan::new(
+            projected.clone(),
+            filters.iter().map(|expr| self.canonical_filter(expr)),
+        );
+        let plan_hash = {
+            let mut hasher = StableHasher::new();
+            (plan.clone(), keys.clone()).hash(&mut hasher);
+            hasher.finish()
+        };
+        Some(Query {
+            table: self.table.clone(),
+            snapshot: self.snapshot,
+            policy: self.policy,
+            plan_hash,
+            plan: Some(plan),
+            projected: projected.clone(),
+            predicates: self.predicates(filters),
+            aggregate: None,
+            nearest: None,
+            join: Some(keys.clone()),
             approximate,
         })
     }
@@ -790,6 +837,7 @@ impl QuarryTable {
             predicates: self.predicates(filters),
             aggregate: None,
             nearest: None,
+            join: None,
             approximate,
         };
         let fingerprint = Fingerprint::of(&query);
@@ -854,6 +902,7 @@ impl QuarryTable {
                 Some(ScanReport {
                     aggregate: None,
                     nearest: None,
+                    join: None,
                     text: text.clone(),
                     filters: asks.clone(),
                     files_read: BTreeSet::new(),
@@ -875,6 +924,7 @@ impl QuarryTable {
             } => Some(ScanReport {
                 aggregate: None,
                 nearest: None,
+                join: None,
                 text: text.clone(),
                 filters: asks.clone(),
                 scopes: files.clone(),
@@ -895,6 +945,7 @@ impl QuarryTable {
             None => ScanReport {
                 aggregate: None,
                 nearest: None,
+                join: None,
                 text,
                 filters: asks,
                 files_read: live,

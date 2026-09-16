@@ -147,6 +147,7 @@ mod tests {
             predicates: vec![Predicate::Eq { field: 4, value: 9 }],
             aggregate: None,
             nearest: None,
+            join: None,
             approximate: false,
         }
     }

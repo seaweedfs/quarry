@@ -223,6 +223,16 @@ impl Session {
                 .collect()
                 .await;
         }
+        // Vectors, then joins: a top-k over a join is served by the vector
+        // index if one covers it. A join rewrite swaps the build-side scan,
+        // which a vector rewrite would also try to do — they cannot both
+        // fire on the same side.
+        let (rewritten, served) = super::join::rewrite(&plan, approximate)?;
+        if served.is_some() {
+            return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
+                .collect()
+                .await;
+        }
         let rows = df.collect().await?;
         // A top-k no index could serve still reports the ask: the scan saw
         // only `nearest: None`, and the optimizer proposes what it can see.
@@ -232,6 +242,15 @@ impl Session {
                     table: ask.table.table_id().clone(),
                     nearest: ask.nearest.clone(),
                 });
+                ask.table.note_scan(report);
+            }
+        }
+        // A join no hash could serve still reports the ask: the build-side
+        // scan saw only `join: None`, and the optimizer proposes what it
+        // can see.
+        if let Some(ask) = super::join::first_ask(&plan) {
+            if let Some(mut report) = ask.table.last_scan() {
+                report.join = Some(super::join::ask_of_workload(&ask));
                 ask.table.note_scan(report);
             }
         }

@@ -35,7 +35,7 @@ use crate::derived::{
     AggFunc, Aggregate, Derived, DerivedId, FieldId, Filter, Measure, Nearest, PolicyFingerprint,
     Source,
 };
-use crate::kinds::{Bitmap, FilterSet, Index, TextIndex, VectorIndex};
+use crate::kinds::{Bitmap, FilterSet, Index, JoinHash, TextIndex, VectorIndex};
 use crate::snapshot::FileId;
 use crate::workload::AggregateAsk;
 
@@ -864,6 +864,16 @@ pub fn vector_index_id(table: &crate::snapshot::TableId, nearest: &Nearest) -> D
     ))
 }
 
+/// The id for a join hash — the canonical (table, keys, columns), hashed
+/// stably. The same join shape rebuilds onto the same id rather than
+/// accumulating beside it.
+pub fn join_hash_id(table: &crate::snapshot::TableId, ask: &crate::workload::JoinAsk) -> DerivedId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = crate::stable_hash::StableHasher::new();
+    (table.clone(), ask.keys.clone(), ask.columns.clone()).hash(&mut hasher);
+    DerivedId(format!("jh:{}:{:016x}", table.0, hasher.finish()))
+}
+
 /// Build the vector index `ask` proposes: the table's rows, held where a
 /// distance can be computed against them without reading object storage.
 ///
@@ -930,6 +940,82 @@ pub async fn build_vector_index(
             nearest.field,
             nearest.metric,
             nearest.dimension,
+            bytes,
+        )),
+    ))
+}
+
+/// Build the join hash `ask` proposes: the build-side rows, sorted by the
+/// join key and held where a hash join reads them locally instead of from
+/// object storage.
+///
+/// Like the vector index, the build is a read of the whole table — the one
+/// build that cannot be cheaper than the scan it replaces. The trade a
+/// repeated join makes: it reads the build side *once* at build time and
+/// sorts it, instead of reading it from object storage on every query.
+pub async fn build_join_hash(
+    session: &Session,
+    table: &Arc<QuarryTable>,
+    ask: &crate::workload::JoinAsk,
+    id: DerivedId,
+) -> DfResult<Derived> {
+    // Through the session's context, not `Session::sql`: the point is to read
+    // the table, not to be answered by a hash that already exists.
+    let source = format!("__quarry_jh_{}", id.0.replace(':', "_"));
+    session
+        .context()
+        .register_table(
+            source.as_str(),
+            Arc::clone(table) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    // Read only the columns the join needs, in the order the table's schema
+    // defines them. Sorting by the join key happens after the read.
+    let schema = datafusion::catalog::TableProvider::schema(table.as_ref());
+    let column_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            let fid = table.field_id_of(f.name())?;
+            ask.columns.contains(&fid).then(|| f.name().to_owned())
+        })
+        .collect();
+    let select = column_names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let batches = if select.is_empty() {
+        Vec::new()
+    } else {
+        session
+            .context()
+            .sql(&format!("SELECT {select} FROM {source}"))
+            .await?
+            .collect()
+            .await?
+    };
+    session
+        .context()
+        .deregister_table(source.as_str())
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+    let bytes = batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    table.store_rows(id.clone(), batches);
+    Ok(Derived::new(
+        id,
+        Source {
+            table: table.table_id().clone(),
+            snapshot: table.snapshot(),
+        },
+        table.policy(),
+        bytes,
+        Box::new(JoinHash::covering(
+            ask.keys.iter().copied(),
+            ask.columns.iter().copied(),
             bytes,
         )),
     ))

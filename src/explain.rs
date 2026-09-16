@@ -275,6 +275,7 @@ mod tests {
             }],
             aggregate: None,
             nearest: None,
+            join: None,
             approximate: false,
         }
     }
