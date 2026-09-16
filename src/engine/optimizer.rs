@@ -1104,6 +1104,7 @@ mod tests {
             nearest: None,
             join: None,
             approximate: false,
+            stale: false,
         };
         Observation {
             fingerprint: Fingerprint::of(&query),

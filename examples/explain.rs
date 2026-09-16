@@ -104,6 +104,7 @@ fn main() {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
 
     println!("Derived state built at snapshot 810, never rebuilt.\n");

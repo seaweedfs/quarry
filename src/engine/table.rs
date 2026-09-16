@@ -93,6 +93,14 @@ pub struct ScanReport {
     /// asked `approx_distinct`, or asked `count(distinct)` with the
     /// session's `quarry.approximate` opt-in. Never set by omission.
     pub approximate: bool,
+    /// Whether the served answer may miss rows added since the derived state
+    /// was built.
+    ///
+    /// `true` only when a non-unionable substitute served despite the table
+    /// having grown, because the session's `quarry.stale` opt-in allowed it.
+    /// The answer is fast but incomplete; a caller that needs completeness
+    /// should treat this as a miss and re-run with `quarry.stale` off.
+    pub stale: bool,
     /// Identity of the plan that was looked up.
     ///
     /// A caller wanting to *store* this query's result needs the same key the
@@ -582,6 +590,7 @@ impl QuarryTable {
         aggr: &[Expr],
         filters: &[Expr],
         approximate: bool,
+        stale: bool,
     ) -> Option<Query> {
         let group_by = group
             .iter()
@@ -622,6 +631,7 @@ impl QuarryTable {
             nearest: None,
             join: None,
             approximate,
+            stale,
         })
     }
 
@@ -636,6 +646,7 @@ impl QuarryTable {
         nearest: &crate::derived::Nearest,
         filters: &[Expr],
         approximate: bool,
+        stale: bool,
     ) -> Option<Query> {
         // Every column: a substituted top-k returns rows, and the projection
         // above the limit may ask for any of them.
@@ -666,6 +677,7 @@ impl QuarryTable {
             nearest: Some(nearest.clone()),
             join: None,
             approximate,
+            stale,
         })
     }
 
@@ -683,6 +695,7 @@ impl QuarryTable {
         projected: &BTreeSet<FieldId>,
         filters: &[Expr],
         approximate: bool,
+        stale: bool,
     ) -> Option<Query> {
         let plan = Plan::new(
             projected.clone(),
@@ -705,6 +718,7 @@ impl QuarryTable {
             nearest: None,
             join: Some(keys.clone()),
             approximate,
+            stale,
         })
     }
 
@@ -819,6 +833,7 @@ impl QuarryTable {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         approximate: bool,
+        stale: bool,
     ) -> ScanReport {
         let live: BTreeSet<FileId> = self
             .graph
@@ -839,6 +854,7 @@ impl QuarryTable {
             nearest: None,
             join: None,
             approximate,
+            stale,
         };
         let fingerprint = Fingerprint::of(&query);
 
@@ -895,6 +911,7 @@ impl QuarryTable {
             |d| materialized.contains_key(&d.id),
         ) {
             Composed::Substitute(candidate) => {
+                let stale = candidate.decision.is_stale();
                 let also_scanned = match candidate.decision {
                     Decision::UseWith { also_scan, .. } => also_scan,
                     _ => BTreeSet::new(),
@@ -911,6 +928,7 @@ impl QuarryTable {
                     also_scanned,
                     substituted: true,
                     approximate: false,
+                    stale,
                     plan_hash,
                     bytes_if_full_scan,
                     fingerprint: fingerprint.clone(),
@@ -933,6 +951,7 @@ impl QuarryTable {
                 also_scanned: residual,
                 substituted: false,
                 approximate: false,
+                stale: false,
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint: fingerprint.clone(),
@@ -954,6 +973,7 @@ impl QuarryTable {
                 also_scanned: BTreeSet::new(),
                 substituted: false,
                 approximate: false,
+                stale: false,
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint,
@@ -1107,7 +1127,12 @@ impl TableProvider for QuarryTable {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let report = self.plan_files(projection, filters, super::options::approximate(state));
+        let report = self.plan_files(
+            projection,
+            filters,
+            super::options::approximate(state),
+            super::options::stale(state),
+        );
 
         // Stored rows first when substituting, then whatever files the rule
         // says must still be read. Concatenating the two is only valid

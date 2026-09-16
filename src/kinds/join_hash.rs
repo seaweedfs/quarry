@@ -133,6 +133,7 @@ mod tests {
             nearest: None,
             join,
             approximate: false,
+            stale: false,
         }
     }
 

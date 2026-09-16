@@ -236,9 +236,9 @@ fn distance_of(expr: &Expr) -> Option<(String, Metric)> {
 }
 
 /// The [`Query`] an [`Ask`] reduces to — the identity a vector index matches.
-pub(crate) fn query_of(ask: &Ask, approximate: bool) -> Option<Query> {
+pub(crate) fn query_of(ask: &Ask, approximate: bool, stale: bool) -> Option<Query> {
     ask.table
-        .nearest_query(&ask.nearest, &ask.filters, approximate)
+        .nearest_query(&ask.nearest, &ask.filters, approximate, stale)
 }
 
 /// Rewrite `plan` to read a vector index wherever one is admissible.
@@ -247,10 +247,12 @@ pub(crate) fn query_of(ask: &Ask, approximate: bool) -> Option<Query> {
 pub(crate) fn rewrite(
     plan: &LogicalPlan,
     approximate: bool,
+    stale: bool,
 ) -> DfResult<(LogicalPlan, Option<DerivedId>)> {
     // Recognised at the `Limit`, but rewritten at the leaf — so the shape is
     // checked once and then the source is swapped where it lives.
-    let Some(source) = first_ask(plan).and_then(|ask| stored_source(&ask, approximate)) else {
+    let Some(source) = first_ask(plan).and_then(|ask| stored_source(&ask, approximate, stale))
+    else {
         return Ok((plan.clone(), None));
     };
     let (source, id) = source;
@@ -287,9 +289,10 @@ pub(crate) fn rewrite(
 fn stored_source(
     ask: &Ask,
     approximate: bool,
+    stale: bool,
 ) -> Option<(Arc<dyn datafusion::logical_expr::TableSource>, DerivedId)> {
     let table = ask.table;
-    let query = query_of(ask, approximate)?;
+    let query = query_of(ask, approximate, stale)?;
     let (id, decision) = table
         .registry()
         .read()
@@ -354,6 +357,7 @@ pub(crate) fn report(
         also_scanned: Default::default(),
         substituted: true,
         approximate: false,
+        stale: false,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),

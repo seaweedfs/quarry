@@ -121,9 +121,9 @@ pub(crate) fn first_ask(plan: &LogicalPlan, approximate: bool) -> Option<Ask<'_>
 }
 
 /// The [`Query`] an [`Ask`] reduces to — the identity a cube matches on.
-pub(crate) fn query_of(ask: &Ask) -> Option<Query> {
+pub(crate) fn query_of(ask: &Ask, stale: bool) -> Option<Query> {
     ask.table
-        .aggregate_query(ask.group, ask.aggr, &ask.filters, ask.approximate)
+        .aggregate_query(ask.group, ask.aggr, &ask.filters, ask.approximate, stale)
 }
 
 /// Rewrite `plan` to read a cube wherever one is admissible.
@@ -134,6 +134,7 @@ pub(crate) fn query_of(ask: &Ask) -> Option<Query> {
 pub(crate) fn rewrite(
     plan: &LogicalPlan,
     approximate: bool,
+    stale: bool,
 ) -> DfResult<(LogicalPlan, Option<DerivedId>)> {
     let mut served = None;
     let rewritten = plan
@@ -145,7 +146,7 @@ pub(crate) fn rewrite(
             let Some(ask) = ask_of(&node, approximate) else {
                 return Ok(Transformed::no(node));
             };
-            match substitute(&ask) {
+            match substitute(&ask, stale) {
                 Some(Ok((subtree, id))) => {
                     served = Some(id);
                     Ok(Transformed::yes(subtree))
@@ -159,9 +160,9 @@ pub(crate) fn rewrite(
 }
 
 /// The rewritten subtree for `ask`, if the rule admits a cube for it.
-fn substitute(ask: &Ask) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
+fn substitute(ask: &Ask, stale: bool) -> Option<DfResult<(LogicalPlan, DerivedId)>> {
     let table = ask.table;
-    let query = query_of(ask)?;
+    let query = query_of(ask, stale)?;
     let (id, decision) = table
         .registry()
         .read()
@@ -299,6 +300,7 @@ pub(crate) fn report(
         also_scanned: Default::default(),
         substituted: true,
         approximate,
+        stale: false,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),

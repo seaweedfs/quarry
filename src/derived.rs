@@ -516,6 +516,15 @@ pub struct Query {
     /// one. `true` — `SET quarry.approximate` — lets stored approximate
     /// state answer exact expressions too, like `count(distinct)`.
     pub approximate: bool,
+    /// Whether the session accepts a stale substitute when new data has been
+    /// added since it was built.
+    ///
+    /// `false` means a non-unionable substitute (a vector index, a join hash)
+    /// is rejected when the table has grown, and the query reads the table —
+    /// correct but slower. `true` — `SET quarry.stale` — lets the stored rows
+    /// serve as-is, which is fast but may miss rows added since the index was
+    /// built. Only additive staleness is covered: a delete still rejects.
+    pub stale: bool,
 }
 
 impl Query {
@@ -728,6 +737,14 @@ pub enum Decision {
         /// Files to read alongside it.
         also_scan: BTreeSet<FileId>,
     },
+    /// Apply the rewrite even though files were added since it was built,
+    /// accepting that those rows are missed.
+    ///
+    /// Only returned for a non-unionable substitute when the session's
+    /// `quarry.stale` opt-in allowed it, and only for additive staleness —
+    /// a delete still rejects. The caller marks the answer as stale so a
+    /// caller that needs completeness can re-run without the opt-in.
+    UseStale(Rewrite),
     /// Scan the table.
     Reject(Reason),
 }
@@ -736,6 +753,11 @@ impl Decision {
     /// Whether the derived state may be used at all.
     pub fn is_admitted(&self) -> bool {
         !matches!(self, Decision::Reject(_))
+    }
+    /// Whether the answer may miss rows added since the derived state was
+    /// built.
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Decision::UseStale(_))
     }
 }
 
@@ -923,6 +945,14 @@ impl Derived {
             return Decision::Use(rewrite);
         }
         if !rewrite.can_union_residual() {
+            // A non-unionable substitute cannot be read alongside the added
+            // files — but if the session opts in, the stored rows may serve
+            // as-is, accepting that rows added since are missed. Only
+            // additive staleness: a delete still rejects, because serving
+            // rows that should not exist is fabrication, not staleness.
+            if query.stale && diff.is_purely_additive() {
+                return Decision::UseStale(rewrite);
+            }
             return Decision::Reject(Reason::ResidualNotUnionable);
         }
         Decision::UseWith {
@@ -1160,6 +1190,7 @@ mod tests {
             nearest: None,
             join: None,
             approximate: false,
+            stale: false,
         }
     }
 
@@ -1284,6 +1315,156 @@ mod tests {
                 .may_serve(&query_at(s(811)), &g)
                 .is_admitted(),
             "a table-shaped result tolerates the same append"
+        );
+    }
+
+    #[test]
+    fn a_stale_opt_in_serves_a_non_unionable_substitute_despite_an_append() {
+        // The same aggregate that `an_aggregated_result_is_refused_once_rows_are_added`
+        // refuses — a non-unionable substitute over an appended-to table — is
+        // served when the query opts in to stale answers, accepting that the
+        // rows added since are missed.
+        #[derive(Debug)]
+        struct FakeAggregate;
+
+        impl Kind for FakeAggregate {
+            fn name(&self) -> &'static str {
+                "aggregate"
+            }
+            fn matches(&self, _query: &Query) -> Option<Rewrite> {
+                Some(Rewrite::Substitute {
+                    unionable: false,
+                    rollup: None,
+                })
+            }
+            fn cost(&self, _prices: &PriceTable) -> Cost {
+                Cost::ZERO
+            }
+            fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+                Refreshed::NeedsRebuild
+            }
+        }
+
+        let aggregate = Derived::new(
+            DerivedId("cube".into()),
+            Source {
+                table: t(),
+                snapshot: s(810),
+            },
+            POLICY,
+            32,
+            Box::new(FakeAggregate),
+        );
+
+        let g = appends();
+        let mut q = query_at(s(811));
+        q.stale = true;
+
+        // The opt-in serves the stale aggregate rather than rejecting it.
+        assert_eq!(
+            aggregate.may_serve(&q, &g),
+            Decision::UseStale(Rewrite::Substitute {
+                unionable: false,
+                rollup: None,
+            })
+        );
+        assert!(aggregate.may_serve(&q, &g).is_stale());
+    }
+
+    #[test]
+    fn a_stale_opt_in_does_not_survive_a_delete() {
+        // A delete is subtractive, not stale: serving rows that should not
+        // exist is fabrication, not staleness. The opt-in does not override
+        // that.
+        #[derive(Debug)]
+        struct FakeAggregate;
+
+        impl Kind for FakeAggregate {
+            fn name(&self) -> &'static str {
+                "aggregate"
+            }
+            fn matches(&self, _query: &Query) -> Option<Rewrite> {
+                Some(Rewrite::Substitute {
+                    unionable: false,
+                    rollup: None,
+                })
+            }
+            fn cost(&self, _prices: &PriceTable) -> Cost {
+                Cost::ZERO
+            }
+            fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+                Refreshed::NeedsRebuild
+            }
+        }
+
+        let aggregate = Derived::new(
+            DerivedId("cube".into()),
+            Source {
+                table: t(),
+                snapshot: s(810),
+            },
+            POLICY,
+            32,
+            Box::new(FakeAggregate),
+        );
+
+        // 811 deletes rows from "a" without adding or removing any file.
+        let g = SnapshotGraph::new()
+            .with(Snapshot::root(s(810)).with_clean_file(f("a")))
+            .with(Snapshot::child_of(s(811), s(810)).with_file(f("a"), DeleteState(7)));
+
+        let mut q = query_at(s(811));
+        q.stale = true;
+
+        // The opt-in does not override a subtractive change.
+        assert_eq!(
+            aggregate.may_serve(&q, &g),
+            Decision::Reject(Reason::SubtractiveChange)
+        );
+    }
+
+    #[test]
+    fn a_stale_opt_in_off_still_rejects_a_non_unionable_substitute() {
+        // The default — `stale: false` — still rejects a non-unionable
+        // substitute over an appended-to table. The opt-in is opt-in.
+        #[derive(Debug)]
+        struct FakeAggregate;
+
+        impl Kind for FakeAggregate {
+            fn name(&self) -> &'static str {
+                "aggregate"
+            }
+            fn matches(&self, _query: &Query) -> Option<Rewrite> {
+                Some(Rewrite::Substitute {
+                    unionable: false,
+                    rollup: None,
+                })
+            }
+            fn cost(&self, _prices: &PriceTable) -> Cost {
+                Cost::ZERO
+            }
+            fn refresh(&mut self, _diff: &Diff) -> Refreshed {
+                Refreshed::NeedsRebuild
+            }
+        }
+
+        let aggregate = Derived::new(
+            DerivedId("cube".into()),
+            Source {
+                table: t(),
+                snapshot: s(810),
+            },
+            POLICY,
+            32,
+            Box::new(FakeAggregate),
+        );
+
+        let g = appends();
+        let q = query_at(s(811)); // stale: false by default
+
+        assert_eq!(
+            aggregate.may_serve(&q, &g),
+            Decision::Reject(Reason::ResidualNotUnionable)
         );
     }
 

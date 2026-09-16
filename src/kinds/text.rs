@@ -216,6 +216,7 @@ mod tests {
             nearest: None,
             join: None,
             approximate: false,
+            stale: false,
         }
     }
 

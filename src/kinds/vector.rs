@@ -125,6 +125,7 @@ mod tests {
             nearest,
             join: None,
             approximate: false,
+            stale: false,
         }
     }
 

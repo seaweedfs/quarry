@@ -1332,6 +1332,7 @@ fn observation_on(field: u32, bytes: u64) -> quarry::workload::Observation {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
     Observation {
         fingerprint: Fingerprint::of(&query),
@@ -1819,6 +1820,7 @@ async fn a_low_cardinality_field_earns_a_row_level_bitmap() {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
     match derived.may_serve(&query, &graph) {
         Decision::Use(Rewrite::Prune { files }) => {
@@ -1878,6 +1880,7 @@ async fn a_high_cardinality_field_earns_a_file_level_index() {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
     match derived.may_serve(&query, &graph) {
         Decision::Use(Rewrite::Prune { files }) => {

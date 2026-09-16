@@ -1037,6 +1037,7 @@ async fn a_bitmap_survives_being_written_and_read_back() {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
     match derived.may_serve(&query, &fixture_dir.graph) {
         Decision::Use(Rewrite::Prune { files }) => {
@@ -1139,6 +1140,7 @@ async fn a_filter_set_survives_being_written_and_read_back() {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
     match derived.may_serve(&query, &fixture_dir.graph) {
         Decision::Use(Rewrite::Prune { files }) => {
@@ -1206,6 +1208,7 @@ async fn a_text_index_round_trips_and_recovers() {
         nearest: None,
         join: None,
         approximate: false,
+        stale: false,
     };
     match derived.may_serve(&query, &fixture.graph) {
         Decision::Use(Rewrite::Prune { files }) => {

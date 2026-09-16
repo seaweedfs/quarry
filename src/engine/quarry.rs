@@ -208,7 +208,8 @@ impl Session {
         let df = self.ctx.sql(sql).await?;
         let plan = df.logical_plan().clone();
         let approximate = super::options::approximate_of(self.ctx.state().config().options());
-        let (rewritten, served) = super::cube::rewrite(&plan, approximate)?;
+        let stale = super::options::stale_of(self.ctx.state().config().options());
+        let (rewritten, served) = super::cube::rewrite(&plan, approximate, stale)?;
         if served.is_some() {
             return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
                 .collect()
@@ -217,7 +218,7 @@ impl Session {
         // Cubes first, then vectors: an aggregate over a top-k is served by
         // the cube if one covers it, and a cube's rewrite leaves no shape a
         // vector index would recognise. They cannot both fire.
-        let (rewritten, served) = super::ann::rewrite(&plan, approximate)?;
+        let (rewritten, served) = super::ann::rewrite(&plan, approximate, stale)?;
         if served.is_some() {
             return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
                 .collect()
@@ -227,7 +228,7 @@ impl Session {
         // index if one covers it. A join rewrite swaps the build-side scan,
         // which a vector rewrite would also try to do — they cannot both
         // fire on the same side.
-        let (rewritten, served) = super::join::rewrite(&plan, approximate)?;
+        let (rewritten, served) = super::join::rewrite(&plan, approximate, stale)?;
         if served.is_some() {
             return datafusion::dataframe::DataFrame::new(self.ctx.state(), rewritten)
                 .collect()
@@ -258,7 +259,7 @@ impl Session {
         // itself saw only `aggregate: None`, and the optimizer can only
         // propose what it can see.
         if let Some(ask) = super::cube::first_ask(&plan, approximate) {
-            if let Some(query) = super::cube::query_of(&ask) {
+            if let Some(query) = super::cube::query_of(&ask, false) {
                 if let Some(mut report) = ask.table.last_scan() {
                     report.aggregate =
                         query.aggregate.zip(query.plan.clone()).map(|(spec, plan)| {
