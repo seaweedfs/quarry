@@ -182,7 +182,7 @@ pub struct BuildRecommendation {
     ///
     /// For indexes this uses [`Spread`]-based advantage; for cubes, filter
     /// sets, and vector indexes it falls back to the ceiling. Scaled by
-    /// [`Optimizer::proven`] when prior builds exist.
+    /// the optimizer's realized-to-predicted ratio when prior builds exist.
     pub expected_savings_usd: f64,
     /// What one build costs: a full scan of the table, priced.
     pub build_cost_usd: f64,
