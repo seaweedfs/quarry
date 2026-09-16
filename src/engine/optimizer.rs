@@ -1,25 +1,17 @@
-//! The thing that runs the loop without being asked.
+//! Collects usage stats, recommends derived state to build or retire, and
+//! refreshes state that has fallen behind.
 //!
-//! Every step existed already — observe, propose, build, measure, retire —
-//! and a caller had to sequence them. This owns the sequence, and owns the
-//! two pieces of state the sequence needs: what queries asked for, and what
-//! has been built.
+//! The optimizer does not build or retire automatically. It observes
+//! workload through [`observe`](Optimizer::observe), produces structured
+//! recommendations with cost analysis through [`recommend`](Optimizer::recommend),
+//! and the caller acts on them explicitly through [`build`](Optimizer::build),
+//! [`build_recommended`](Optimizer::build_recommended),
+//! [`retire`](Optimizer::retire), or [`retire_recommended`](Optimizer::retire_recommended).
 //!
-//! # Order within a round, and why it is that order
-//!
-//! ```text
-//! 1. retire first    frees budget, so a useful index is not refused
-//!                    because a useless one is occupying the space
-//! 2. then build      cheapest-first is wrong here; most-at-stake first,
-//!                    which is the order proposals already come in
-//! 3. budget after    an index's size is not knowable until it is built,
-//!                    so the ceiling is enforced on what was produced
-//!                    rather than on a guess
-//! ```
-//!
-//! Step 3 is the same distinction drawn everywhere else in this crate:
-//! estimation informs, enforcement decides. A build that turns out too large
-//! for the remaining budget is discarded rather than kept and apologised for.
+//! What `round` does automatically is refresh: rebuilding state that has
+//! fallen too far behind the table's current snapshot. This is correctness
+//! maintenance, not optimization — a stale piece is still correct but helps
+//! less and less, so it is rebuilt in place.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -27,7 +19,7 @@ use std::sync::Arc;
 use crate::cost::PriceTable;
 use crate::derived::{DerivedId, FieldId, PolicyFingerprint};
 use crate::layout::Spread;
-use crate::snapshot::{Commits, SnapshotId};
+use crate::snapshot::{Commits, SnapshotId, TableId};
 use crate::workload::{
     AggregateAsk, FilterAsk, NearestAsk, Observation, Policy, Proposal, TextAsk, Workload,
 };
@@ -84,8 +76,6 @@ impl Round {
 /// Why a proposal was not acted on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Declined {
-    /// The policy forbids acting.
-    Advisory,
     /// Something already covers this.
     AlreadyBuilt,
     /// Building it would exceed the byte budget.
@@ -130,6 +120,105 @@ pub struct Calibration {
     pub realized_usd: f64,
     /// Queries it has served.
     pub queries: u64,
+}
+
+/// What kind of derived state a build recommendation targets.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BuildKind {
+    /// A scalar equality index on one field.
+    Index {
+        /// The field the index hashes.
+        field: FieldId,
+    },
+    /// An aggregate cube.
+    Cube {
+        /// The aggregate the cube materializes.
+        ask: AggregateAsk,
+    },
+    /// A cached filter result set.
+    FilterSet {
+        /// The filter whose result set is cached.
+        ask: FilterAsk,
+    },
+    /// A flat vector index for top-k search.
+    Vector {
+        /// The nearest-neighbour ask the index serves.
+        ask: NearestAsk,
+    },
+    /// An inverted text index.
+    Text {
+        /// The text ask the index serves.
+        ask: TextAsk,
+    },
+}
+
+/// A recommendation to build a piece of derived state, with the cost
+/// analysis that justifies it.
+///
+/// The optimizer produces these from observed workload but does not act on
+/// them. The caller reviews the expected savings against the build cost and
+/// decides which to build — explicitly, through [`Optimizer::build`] or
+/// [`Optimizer::build_recommended`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuildRecommendation {
+    /// The id the built state would have.
+    pub id: DerivedId,
+    /// What kind of state to build, and the ask that identifies it.
+    pub kind: BuildKind,
+    /// The table it would be built on.
+    pub table: TableId,
+    /// How many unaided queries asked for this shape.
+    pub queries: u64,
+    /// Bytes those queries scanned.
+    pub bytes_scanned: u64,
+    /// The most this could possibly save — assumes perfect pruning.
+    pub ceiling_usd: f64,
+    /// What it is expected to save, scaled by measured evidence.
+    ///
+    /// For indexes this uses [`Spread`]-based advantage; for cubes, filter
+    /// sets, and vector indexes it falls back to the ceiling. Scaled by
+    /// [`Optimizer::proven`] when prior builds exist.
+    pub expected_savings_usd: f64,
+    /// What one build costs: a full scan of the table, priced.
+    pub build_cost_usd: f64,
+}
+
+/// A recommendation to retire a piece of derived state that has not paid off.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetireRecommendation {
+    /// What would be dropped.
+    pub id: DerivedId,
+    /// The field it indexed, if the optimizer knows.
+    pub field: Option<FieldId>,
+    /// The snapshot it was built from.
+    pub at: SnapshotId,
+    /// What it measurably saved, in dollars.
+    pub realized_savings_usd: f64,
+    /// How many queries it served.
+    pub queries_served: u64,
+}
+
+/// What the optimizer recommends, without acting.
+///
+/// Builds and retirements are recommendations; refresh stays automatic
+/// because it is correctness maintenance, not optimization. The caller
+/// approves each action explicitly.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Recommendation {
+    /// Build a new piece of derived state.
+    Build(BuildRecommendation),
+    /// Retire a piece that has not paid for itself.
+    Retire(RetireRecommendation),
+}
+
+impl Recommendation {
+    /// The id of the derived state this recommendation concerns.
+    pub fn id(&self) -> &DerivedId {
+        match self {
+            Recommendation::Build(b) => &b.id,
+            Recommendation::Retire(r) => &r.id,
+        }
+    }
 }
 
 /// Watches a table, and keeps its derived state worth having.
@@ -353,72 +442,457 @@ impl Optimizer {
             .proposals(&self.prices, self.policy.min_queries)
     }
 
-    /// Run one round against `table`.
+    /// What the optimizer recommends, without acting.
     ///
-    /// Retires first, then builds, enforcing the byte budget on what was
-    /// actually produced. Reports what it declined and why, whether or not it
-    /// was allowed to act.
-    pub async fn round(&mut self, session: &Session, table: &Arc<QuarryTable>) -> Round {
-        let mut round = Round::default();
-        let proposals = self.proposals();
+    /// Produces build and retire recommendations with cost analysis: expected
+    /// savings, build cost, and ceiling for builds; realized savings and
+    /// queries served for retirements. The caller reviews these and explicitly
+    /// calls [`build`](Self::build) or [`retire`](Self::retire) on the ones it
+    /// approves — or [`build_recommended`](Self::build_recommended) and
+    /// [`retire_recommended`](Self::retire_recommended) for all of them.
+    ///
+    /// Build recommendations are ordered by expected savings, most first.
+    /// Retire recommendations are unordered.
+    pub async fn recommend(
+        &self,
+        session: &Session,
+        table: &Arc<QuarryTable>,
+    ) -> Vec<Recommendation> {
+        let mut recommendations = Vec::new();
 
-        // The newest position the table is known to have reached: the pushed
-        // commit when there is one, what the table says otherwise. A commit
-        // the graph cannot relate reduces to the table's own snapshot.
-        let head = self
-            .commits
+        // Retire recommendations: state that has not paid for itself.
+        if self.workload.observed() >= self.policy.retire_after_queries {
+            let registry = self.registry.read().expect("registry lock");
+            for id in self
+                .workload
+                .retirements(&registry, &self.prices, self.policy.horizon_days)
+            {
+                let Some(derived) = registry.get(&id) else {
+                    continue;
+                };
+                let seen = self.workload.credited(&id);
+                let realized_usd = seen
+                    .map(|s| {
+                        s.bytes_saved() as f64
+                            * self
+                                .prices
+                                .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
+                    })
+                    .unwrap_or(0.0);
+                recommendations.push(Recommendation::Retire(RetireRecommendation {
+                    field: self.built.get(&id).copied(),
+                    at: derived.source.snapshot,
+                    queries_served: seen.map(|s| s.helped).unwrap_or(0),
+                    realized_savings_usd: realized_usd,
+                    id,
+                }));
+            }
+        }
+
+        // Build recommendations: the same proposals round() would act on,
+        // with the same evidence and proven scaling, but returned rather than
+        // built.
+        let existing: BTreeSet<DerivedId> = self
+            .registry
+            .read()
+            .expect("registry lock")
+            .ids()
+            .into_iter()
+            .collect();
+
+        let build_cost_usd = table.live_bytes() as f64
+            * self
+                .prices
+                .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far);
+
+        // Index proposals — ranked by expected savings with evidence.
+        let mut ranked: Vec<(BuildRecommendation, f64)> = Vec::new();
+        for proposal in self.proposals() {
+            let id = index_id(&proposal.table, proposal.field);
+            if existing.contains(&id) {
+                continue;
+            }
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let spread = self.evidence(session, table, proposal.field).await;
+            let expected = spread
+                .map(|s| proposal.expected_usd(&s, &self.prices))
+                .unwrap_or(proposal.ceiling_usd)
+                * self.proven(&id);
+            ranked.push((
+                BuildRecommendation {
+                    id,
+                    kind: BuildKind::Index {
+                        field: proposal.field,
+                    },
+                    table: proposal.table.clone(),
+                    queries: proposal.queries,
+                    bytes_scanned: proposal.bytes_scanned,
+                    ceiling_usd: proposal.ceiling_usd,
+                    expected_savings_usd: expected,
+                    build_cost_usd,
+                },
+                expected,
+            ));
+        }
+        ranked.sort_by(|(_, a), (_, b)| b.total_cmp(a));
+        recommendations.extend(ranked.into_iter().map(|(r, _)| Recommendation::Build(r)));
+
+        // Cube proposals.
+        for proposal in self
+            .workload
+            .cube_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = cube_id(&proposal.table, &proposal.ask);
+            if existing.contains(&id) {
+                continue;
+            }
+            let expected = proposal.ceiling_usd * self.proven(&id);
+            recommendations.push(Recommendation::Build(BuildRecommendation {
+                id,
+                kind: BuildKind::Cube {
+                    ask: proposal.ask.clone(),
+                },
+                table: proposal.table.clone(),
+                queries: proposal.queries,
+                bytes_scanned: proposal.bytes_scanned,
+                ceiling_usd: proposal.ceiling_usd,
+                expected_savings_usd: expected,
+                build_cost_usd,
+            }));
+        }
+
+        // Filter set proposals.
+        for proposal in self
+            .workload
+            .filter_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = filter_set_id(&proposal.table, &proposal.ask.filter);
+            if existing.contains(&id) {
+                continue;
+            }
+            let expected = proposal.ceiling_usd * self.proven(&id);
+            recommendations.push(Recommendation::Build(BuildRecommendation {
+                id,
+                kind: BuildKind::FilterSet {
+                    ask: proposal.ask.clone(),
+                },
+                table: proposal.table.clone(),
+                queries: proposal.queries,
+                bytes_scanned: proposal.bytes_scanned,
+                ceiling_usd: proposal.ceiling_usd,
+                expected_savings_usd: expected,
+                build_cost_usd,
+            }));
+        }
+
+        // Vector proposals.
+        for proposal in self
+            .workload
+            .vector_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = vector_index_id(&proposal.table, &proposal.ask.nearest);
+            if existing.contains(&id) {
+                continue;
+            }
+            let expected = proposal.ceiling_usd * self.proven(&id);
+            recommendations.push(Recommendation::Build(BuildRecommendation {
+                id,
+                kind: BuildKind::Vector {
+                    ask: proposal.ask.clone(),
+                },
+                table: proposal.table.clone(),
+                queries: proposal.queries,
+                bytes_scanned: proposal.bytes_scanned,
+                ceiling_usd: proposal.ceiling_usd,
+                expected_savings_usd: expected,
+                build_cost_usd,
+            }));
+        }
+
+        // Text proposals.
+        for proposal in self
+            .workload
+            .text_proposals(&self.prices, self.policy.min_queries)
+        {
+            if proposal.table != *table.table_id() {
+                continue;
+            }
+            let id = text_index_id(&proposal.table, proposal.ask.field);
+            if existing.contains(&id) {
+                continue;
+            }
+            let expected = proposal.ceiling_usd * self.proven(&id);
+            recommendations.push(Recommendation::Build(BuildRecommendation {
+                id,
+                kind: BuildKind::Text {
+                    ask: proposal.ask.clone(),
+                },
+                table: proposal.table.clone(),
+                queries: proposal.queries,
+                bytes_scanned: proposal.bytes_scanned,
+                ceiling_usd: proposal.ceiling_usd,
+                expected_savings_usd: expected,
+                build_cost_usd,
+            }));
+        }
+
+        recommendations
+    }
+
+    /// Build one piece of derived state from a recommendation.
+    ///
+    /// The caller picks a [`BuildRecommendation`] from [`recommend`](Self::recommend)
+    /// and passes it here. Returns the id on success, or the reason it was
+    /// declined. Checks the byte budget on what was actually produced, since
+    /// an index's size is not knowable before building it.
+    pub async fn build(
+        &mut self,
+        session: &Session,
+        table: &Arc<QuarryTable>,
+        rec: &BuildRecommendation,
+    ) -> Result<DerivedId, Declined> {
+        let head = self.head(table);
+
+        if self
+            .registry
+            .read()
+            .expect("registry lock")
+            .get(&rec.id)
+            .is_some()
+        {
+            return Err(Declined::AlreadyBuilt);
+        }
+        if self.failed_at.get(&rec.id).is_some_and(|at| *at >= head) {
+            return Err(Declined::BuildFailed);
+        }
+
+        // A build whose own evidence says it will not pay the scan it costs is
+        // declined rather than re-tried. Only measured under-prediction
+        // triggers this — a first-time proposal is judged by its estimate
+        // alone, where `proven` is 1.0.
+        if self.proven(&rec.id) < 1.0 && rec.expected_savings_usd <= rec.build_cost_usd {
+            return Err(Declined::NotWorthIt);
+        }
+
+        let derived = match &rec.kind {
+            BuildKind::Index { field } => {
+                // The gate: would this beat what the file format prunes for
+                // free? Asked before building, because the answer is usually
+                // no, and building first and measuring after means paying for
+                // the build and the storage to learn it was pointless.
+                if self.policy.min_index_advantage_pct > 0.0 {
+                    let spread = self.evidence(session, table, *field).await;
+                    match spread {
+                        None => return Err(Declined::NoEvidence),
+                        Some(spread)
+                            if spread.index_advantage_pct()
+                                < self.policy.min_index_advantage_pct =>
+                        {
+                            return Err(Declined::NoAdvantage);
+                        }
+                        Some(_) => {}
+                    }
+                }
+                build_proposed_index(session, table, *field, rec.id.clone(), self.reader).await
+            }
+            BuildKind::Cube { ask } => build_cube(session, table, ask, rec.id.clone()).await,
+            BuildKind::FilterSet { ask } => {
+                match build_proposed_filter_set(session, table, ask, rec.id.clone(), self.reader)
+                    .await
+                {
+                    Ok(Some(d)) => Ok(d),
+                    Ok(None) => return Err(Declined::NoAdvantage),
+                    Err(e) => Err(e),
+                }
+            }
+            BuildKind::Vector { ask } => {
+                build_vector_index(session, table, &ask.nearest, rec.id.clone()).await
+            }
+            BuildKind::Text { ask } => {
+                match build_proposed_text_index(
+                    session,
+                    table,
+                    ask.field,
+                    rec.id.clone(),
+                    self.reader,
+                )
+                .await
+                {
+                    Ok(Some(d)) => Ok(d),
+                    Ok(None) => return Err(Declined::NoAdvantage),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        let derived = match derived {
+            Ok(d) => d,
+            Err(_) => {
+                self.failed_at.insert(rec.id.clone(), head);
+                return Err(Declined::BuildFailed);
+            }
+        };
+        self.failed_at.remove(&rec.id);
+
+        let held = self.registry.read().expect("registry lock").bytes();
+        if held + derived.bytes > self.policy.budget_bytes {
+            return Err(Declined::OverBudget);
+        }
+
+        self.registry
+            .write()
+            .expect("registry lock")
+            .register(derived);
+
+        // Record what was built so refresh and retirement can find it.
+        match &rec.kind {
+            BuildKind::Index { field } => {
+                self.built.insert(rec.id.clone(), *field);
+            }
+            BuildKind::Cube { ask } => {
+                self.built_cubes.insert(rec.id.clone(), ask.clone());
+            }
+            BuildKind::FilterSet { ask } => {
+                self.built_filters.insert(rec.id.clone(), ask.clone());
+            }
+            BuildKind::Vector { ask } => {
+                self.built_vectors.insert(rec.id.clone(), ask.clone());
+            }
+            BuildKind::Text { ask } => {
+                self.built_texts.insert(rec.id.clone(), ask.clone());
+            }
+        }
+        self.predicted
+            .insert(rec.id.clone(), rec.expected_savings_usd);
+        Ok(rec.id.clone())
+    }
+
+    /// Build all recommended state, respecting budget and `max_builds_per_round`.
+    ///
+    /// Calls [`recommend`](Self::recommend) and acts on every build
+    /// recommendation, in ranked order. Returns a [`Round`] with what was built
+    /// and what was declined.
+    pub async fn build_recommended(
+        &mut self,
+        session: &Session,
+        table: &Arc<QuarryTable>,
+    ) -> Round {
+        let mut round = Round::default();
+        let recommendations = self.recommend(session, table).await;
+
+        for rec in recommendations {
+            let Recommendation::Build(rec) = rec else {
+                continue;
+            };
+            if round.built.len() >= self.policy.max_builds_per_round {
+                round.declined.push((rec.id.clone(), Declined::RoundFull));
+                continue;
+            }
+            match self.build(session, table, &rec).await {
+                Ok(id) => round.built.push(id),
+                Err(reason) => round.declined.push((rec.id.clone(), reason)),
+            }
+        }
+        round
+    }
+
+    /// Retire one piece of derived state by id.
+    ///
+    /// Returns the [`Retired`] record so the caller can reclaim storage.
+    pub fn retire(&mut self, id: &DerivedId) -> Option<Retired> {
+        let snapshot = {
+            let registry = self.registry.read().expect("registry lock");
+            registry.get(id).map(|d| d.source.snapshot)
+        };
+        let snapshot = snapshot?;
+        let retired = Retired {
+            field: self.built.get(id).copied(),
+            at: snapshot,
+            id: id.clone(),
+        };
+        if self
+            .registry
+            .write()
+            .expect("registry lock")
+            .remove(id)
+            .is_some()
+        {
+            self.built.remove(id);
+            self.built_cubes.remove(id);
+            self.built_filters.remove(id);
+            self.built_vectors.remove(id);
+            self.built_texts.remove(id);
+            // The prediction is kept, not dropped: it is the evidence that the
+            // next round's `NotWorthIt` check needs. A retired piece served
+            // nothing, so `proven` reads it as zero, and a proposal that
+            // returns is declined rather than rebuilt — without spending a
+            // scan to relearn what the last build already proved.
+            Some(retired)
+        } else {
+            None
+        }
+    }
+
+    /// Retire all state the optimizer recommends retiring.
+    ///
+    /// Returns a [`Round`] with what was retired.
+    pub async fn retire_recommended(
+        &mut self,
+        session: &Session,
+        table: &Arc<QuarryTable>,
+    ) -> Round {
+        let mut round = Round::default();
+        let recommendations = self.recommend(session, table).await;
+
+        for rec in recommendations {
+            let Recommendation::Retire(rec) = rec else {
+                continue;
+            };
+            if let Some(retired) = self.retire(&rec.id) {
+                round.retired.push(retired);
+            }
+        }
+        round
+    }
+
+    /// The newest snapshot the table is known to have reached.
+    fn head(&self, table: &QuarryTable) -> SnapshotId {
+        self.commits
             .drain()
             .get(table.table_id())
             .copied()
             .filter(|moved| table.graph().get(*moved).is_some())
-            .unwrap_or_else(|| table.snapshot());
+            .unwrap_or_else(|| table.snapshot())
+    }
 
-        if !self.policy.auto_optimize {
-            for proposal in &proposals {
-                round.declined.push((
-                    index_id(&proposal.table, proposal.field),
-                    Declined::Advisory,
-                ));
-            }
-            return round;
-        }
+    /// Run one maintenance round against `table`.
+    ///
+    /// Refreshes derived state that has fallen too far behind the table's
+    /// current snapshot. This is correctness maintenance, not optimization:
+    /// a stale piece is still *correct* (the rule reads residual files
+    /// alongside it) but it helps less and less, so it is rebuilt in place.
+    ///
+    /// Builds and retirements are **not** done here. The optimizer collects
+    /// usage stats and produces recommendations through [`recommend`](Self::recommend);
+    /// the caller acts on them explicitly through [`build`](Self::build),
+    /// [`build_recommended`](Self::build_recommended),
+    /// [`retire`](Self::retire), or [`retire_recommended`](Self::retire_recommended).
+    pub async fn round(&mut self, session: &Session, table: &Arc<QuarryTable>) -> Round {
+        let mut round = Round::default();
+        let head = self.head(table);
 
-        // 1. Retire, so freed bytes are available to what follows.
-        //
-        // Held off until enough queries have been seen to judge by.
-        // Retirement asks what a piece has measurably saved and reads nothing
-        // as a reason to delete, which is right once traffic has run and
-        // wrong immediately after a restart, when a recovered index has
-        // served nothing yet. The asymmetry decides it: rebuilding a deleted
-        // index costs a scan, keeping a useless one another round costs
-        // almost nothing.
-        let retire = if self.workload.observed() < self.policy.retire_after_queries {
-            Vec::new()
-        } else {
-            let registry = self.registry.read().expect("registry lock");
-            self.workload
-                .retirements(&registry, &self.prices, self.policy.horizon_days)
-        };
-        if !retire.is_empty() {
-            let mut registry = self.registry.write().expect("registry lock");
-            for id in retire {
-                // Read before removing: the caller needs the field and the
-                // snapshot to find the blob, and both live on the entry.
-                let Some(derived) = registry.get(&id) else {
-                    continue;
-                };
-                let retired = Retired {
-                    field: self.built.get(&id).copied(),
-                    at: derived.source.snapshot,
-                    id,
-                };
-                if registry.remove(&retired.id).is_some() {
-                    round.retired.push(retired);
-                }
-            }
-        }
-
-        // 2. Refresh what the table has moved out from under.
+        // Refresh what the table has moved out from under.
         //
         // Not reachable through proposals: the stale piece is still serving
         // queries, so its shape counts as helped and nothing asks for it
@@ -426,7 +900,6 @@ impl Optimizer {
         // once saved, which is why retirement does not catch it either.
         for id in self.stale(table, head) {
             if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
-                // Already failed on the newest known table state.
                 continue;
             }
             let rebuilt = if let Some(&field) = self.built.get(&id) {
@@ -459,384 +932,11 @@ impl Optimizer {
                 continue;
             };
             self.failed_at.remove(&id);
-            // Replaced only once the replacement exists, so a failed rebuild
-            // leaves the stale-but-correct piece in place rather than nothing.
             self.registry
                 .write()
                 .expect("registry lock")
                 .register(derived);
             round.refreshed.push(id);
-        }
-
-        // 3. Build, most at stake first.
-        let existing: BTreeSet<DerivedId> = self
-            .registry
-            .read()
-            .expect("registry lock")
-            .ids()
-            .into_iter()
-            .collect();
-
-        // Cheap refusals first, then evidence, then rank, then build. The
-        // order matters: `max_builds_per_round` used to be applied while
-        // walking proposals in `ceiling_usd` order, which measurement showed
-        // to be 1775x wrong on one regime and unbounded on another — so with
-        // the default of one build per round, a round could build the worst
-        // candidate and decline the best as `RoundFull`.
-        let mut ranked: Vec<(Proposal, f64)> = Vec::new();
-        for proposal in proposals {
-            let id = index_id(&proposal.table, proposal.field);
-
-            if existing.contains(&id) {
-                // A freshly built index has not served a query yet, so the
-                // workload would keep proposing it. Checking by id is what
-                // stops a round from rebuilding what the last one made.
-                round.declined.push((id, Declined::AlreadyBuilt));
-                continue;
-            }
-
-            // Would this beat what the file format prunes for free? Asked
-            // before building, because the answer is usually no, and because
-            // building first and measuring after means paying for the build
-            // and the storage to learn it was pointless.
-            let spread = self.evidence(session, table, proposal.field).await;
-            if self.policy.min_index_advantage_pct > 0.0 {
-                match spread {
-                    None => {
-                        round.declined.push((id, Declined::NoEvidence));
-                        continue;
-                    }
-                    Some(spread)
-                        if spread.index_advantage_pct() < self.policy.min_index_advantage_pct =>
-                    {
-                        round.declined.push((id, Declined::NoAdvantage));
-                        continue;
-                    }
-                    Some(_) => {}
-                }
-            }
-
-            // Ranked by what it is expected to save, not by the ceiling.
-            // Without evidence there is nothing to scale the ceiling by, which
-            // only happens when the policy does not require evidence.
-            let expected = spread
-                .map(|spread| proposal.expected_usd(&spread, &self.prices))
-                .unwrap_or(proposal.ceiling_usd)
-                * self.proven(&id);
-            ranked.push((proposal, expected));
-        }
-
-        ranked.sort_by(|(left, one), (right, other)| {
-            other
-                .total_cmp(one)
-                .then_with(|| left.field.cmp(&right.field))
-        });
-
-        for (proposal, expected) in ranked {
-            let id = index_id(&proposal.table, proposal.field);
-            if round.built.len() >= self.policy.max_builds_per_round {
-                round.declined.push((id, Declined::RoundFull));
-                continue;
-            }
-
-            // Building costs a scan; a build whose own evidence says it will
-            // not pay that back is declined rather than re-tried. Only
-            // measured under-prediction triggers this — a first-time proposal
-            // is judged by its estimate alone.
-            if self.proven(&id) < 1.0
-                && expected
-                    <= table.live_bytes() as f64
-                        * self
-                            .prices
-                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
-            {
-                round.declined.push((id, Declined::NotWorthIt));
-                continue;
-            }
-
-            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
-                continue;
-            }
-            let built =
-                build_proposed_index(session, table, proposal.field, id.clone(), self.reader).await;
-
-            let Ok(derived) = built else {
-                self.failed_at.insert(id.clone(), head);
-                round.declined.push((id, Declined::BuildFailed));
-                continue;
-            };
-            self.failed_at.remove(&id);
-
-            // The ceiling, applied to what was produced. An index's size
-            // cannot be known before building it, so this is the only honest
-            // place to check.
-            let held = self.registry.read().expect("registry lock").bytes();
-            if held + derived.bytes > self.policy.budget_bytes {
-                round.declined.push((id, Declined::OverBudget));
-                continue;
-            }
-
-            self.registry
-                .write()
-                .expect("registry lock")
-                .register(derived);
-            self.built.insert(id.clone(), proposal.field);
-            self.predicted.insert(id.clone(), expected);
-            round.built.push(id);
-        }
-
-        // 4. Cubes: an aggregate asked often enough is worth materialising.
-        for proposal in self
-            .workload
-            .cube_proposals(&self.prices, self.policy.min_queries)
-        {
-            if proposal.table != *table.table_id() {
-                continue;
-            }
-            let id = cube_id(&proposal.table, &proposal.ask);
-            if existing.contains(&id) {
-                round.declined.push((id, Declined::AlreadyBuilt));
-                continue;
-            }
-            if round.built.len() >= self.policy.max_builds_per_round {
-                round.declined.push((id, Declined::RoundFull));
-                continue;
-            }
-            // Same gate as indexes: a ceiling scaled by how the last build of
-            // this ask proved out, against the scan a rebuild costs. A cube's
-            // prediction is a bound rather than an estimate, but a served
-            // cube replaces the whole scan, so realized lands close to it.
-            let proven = self.proven(&id);
-            if proven < 1.0
-                && proposal.ceiling_usd * proven
-                    <= table.live_bytes() as f64
-                        * self
-                            .prices
-                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
-            {
-                round.declined.push((id, Declined::NotWorthIt));
-                continue;
-            }
-            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
-                continue;
-            }
-            let derived = match build_cube(session, table, &proposal.ask, id.clone()).await {
-                Ok(derived) => derived,
-                Err(_) => {
-                    self.failed_at.insert(id.clone(), head);
-                    round.declined.push((id, Declined::BuildFailed));
-                    continue;
-                }
-            };
-            self.failed_at.remove(&id);
-            let held = self.registry.read().expect("registry lock").bytes();
-            if held + derived.bytes > self.policy.budget_bytes {
-                round.declined.push((id, Declined::OverBudget));
-                continue;
-            }
-            self.registry
-                .write()
-                .expect("registry lock")
-                .register(derived);
-            self.built_cubes.insert(id.clone(), proposal.ask);
-            self.predicted.insert(id.clone(), proposal.ceiling_usd);
-            round.built.push(id);
-        }
-
-        // 5. Filter sets: a repeated filter nothing else serves is worth
-        // caching. Same gates as cubes — the ceiling bounds the build, and
-        // `proven` demotes what already failed to pay for itself.
-        for proposal in self
-            .workload
-            .filter_proposals(&self.prices, self.policy.min_queries)
-        {
-            if proposal.table != *table.table_id() {
-                continue;
-            }
-            let id = filter_set_id(&proposal.table, &proposal.ask.filter);
-            if existing.contains(&id) {
-                round.declined.push((id, Declined::AlreadyBuilt));
-                continue;
-            }
-            if round.built.len() >= self.policy.max_builds_per_round {
-                round.declined.push((id, Declined::RoundFull));
-                continue;
-            }
-            let proven = self.proven(&id);
-            if proven < 1.0
-                && proposal.ceiling_usd * proven
-                    <= table.live_bytes() as f64
-                        * self
-                            .prices
-                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
-            {
-                round.declined.push((id, Declined::NotWorthIt));
-                continue;
-            }
-            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
-                continue;
-            }
-            let derived = match build_proposed_filter_set(
-                session,
-                table,
-                &proposal.ask,
-                id.clone(),
-                self.reader,
-            )
-            .await
-            {
-                Ok(Some(derived)) => derived,
-                Ok(None) => {
-                    // Admits every row — the set would store the table to
-                    // save nothing. Not a failure to retry: the evidence
-                    // itself says no.
-                    round.declined.push((id, Declined::NoAdvantage));
-                    continue;
-                }
-                Err(_) => {
-                    self.failed_at.insert(id.clone(), head);
-                    round.declined.push((id, Declined::BuildFailed));
-                    continue;
-                }
-            };
-            self.failed_at.remove(&id);
-            let held = self.registry.read().expect("registry lock").bytes();
-            if held + derived.bytes > self.policy.budget_bytes {
-                round.declined.push((id, Declined::OverBudget));
-                continue;
-            }
-            self.registry
-                .write()
-                .expect("registry lock")
-                .register(derived);
-            self.built_filters.insert(id.clone(), proposal.ask);
-            self.predicted.insert(id.clone(), proposal.ceiling_usd);
-            round.built.push(id);
-        }
-
-        // 6. Vector indexes: a repeated top-k search is worth holding the
-        // rows for. Same gates as cubes and filter sets.
-        for proposal in self
-            .workload
-            .vector_proposals(&self.prices, self.policy.min_queries)
-        {
-            if proposal.table != *table.table_id() {
-                continue;
-            }
-            let id = vector_index_id(&proposal.table, &proposal.ask.nearest);
-            if existing.contains(&id) {
-                round.declined.push((id, Declined::AlreadyBuilt));
-                continue;
-            }
-            if round.built.len() >= self.policy.max_builds_per_round {
-                round.declined.push((id, Declined::RoundFull));
-                continue;
-            }
-            let proven = self.proven(&id);
-            if proven < 1.0
-                && proposal.ceiling_usd * proven
-                    <= table.live_bytes() as f64
-                        * self
-                            .prices
-                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
-            {
-                round.declined.push((id, Declined::NotWorthIt));
-                continue;
-            }
-            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
-                continue;
-            }
-            let derived =
-                match build_vector_index(session, table, &proposal.ask.nearest, id.clone()).await {
-                    Ok(derived) => derived,
-                    Err(_) => {
-                        self.failed_at.insert(id.clone(), head);
-                        round.declined.push((id, Declined::BuildFailed));
-                        continue;
-                    }
-                };
-            self.failed_at.remove(&id);
-            let held = self.registry.read().expect("registry lock").bytes();
-            if held + derived.bytes > self.policy.budget_bytes {
-                round.declined.push((id, Declined::OverBudget));
-                continue;
-            }
-            self.registry
-                .write()
-                .expect("registry lock")
-                .register(derived);
-            self.built_vectors.insert(id.clone(), proposal.ask);
-            self.predicted.insert(id.clone(), proposal.ceiling_usd);
-            round.built.push(id);
-        }
-
-        // 7. Text indexes: a repeated full-text match is worth an inverted
-        // index. Same gates as the rest.
-        for proposal in self
-            .workload
-            .text_proposals(&self.prices, self.policy.min_queries)
-        {
-            if proposal.table != *table.table_id() {
-                continue;
-            }
-            let id = text_index_id(&proposal.table, proposal.ask.field);
-            if existing.contains(&id) {
-                round.declined.push((id, Declined::AlreadyBuilt));
-                continue;
-            }
-            if round.built.len() >= self.policy.max_builds_per_round {
-                round.declined.push((id, Declined::RoundFull));
-                continue;
-            }
-            let proven = self.proven(&id);
-            if proven < 1.0
-                && proposal.ceiling_usd * proven
-                    <= table.live_bytes() as f64
-                        * self
-                            .prices
-                            .byte_usd(crate::cost::Tier::Hot, crate::place::Distance::Far)
-            {
-                round.declined.push((id, Declined::NotWorthIt));
-                continue;
-            }
-            if self.failed_at.get(&id).is_some_and(|at| *at >= head) {
-                continue;
-            }
-            let derived = match build_proposed_text_index(
-                session,
-                table,
-                proposal.ask.field,
-                id.clone(),
-                self.reader,
-            )
-            .await
-            {
-                Ok(Some(derived)) => derived,
-                Ok(None) => {
-                    // Every term is in every file, so the postings admit
-                    // everything. Not a failure to retry: the evidence says no.
-                    round.declined.push((id, Declined::NoAdvantage));
-                    continue;
-                }
-                Err(_) => {
-                    self.failed_at.insert(id.clone(), head);
-                    round.declined.push((id, Declined::BuildFailed));
-                    continue;
-                }
-            };
-            self.failed_at.remove(&id);
-            let held = self.registry.read().expect("registry lock").bytes();
-            if held + derived.bytes > self.policy.budget_bytes {
-                round.declined.push((id, Declined::OverBudget));
-                continue;
-            }
-            self.registry
-                .write()
-                .expect("registry lock")
-                .register(derived);
-            self.built_texts.insert(id.clone(), proposal.ask);
-            self.predicted.insert(id.clone(), proposal.ceiling_usd);
-            round.built.push(id);
         }
 
         round
@@ -994,16 +1094,12 @@ mod tests {
     }
 
     #[test]
-    fn a_round_reports_what_it_would_have_done() {
-        // Advisory: no session or table is needed, because nothing is built.
+    fn recommend_reports_what_could_be_built() {
         let mut optimizer = optimizer(Policy::ADVISORY.with_min_queries(1));
         optimizer.observe(observation("events", 4, 1_000_000));
 
-        // `round` needs a session to build; advisory returns before that, so
-        // the declined list is checkable without one.
         let proposals = optimizer.proposals();
         assert_eq!(proposals.len(), 1);
-        assert!(!optimizer.policy().auto_optimize);
     }
 
     #[test]

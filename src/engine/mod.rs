@@ -45,7 +45,10 @@ pub use cache::{CacheStats, RangeCache};
 #[cfg(feature = "iceberg")]
 pub use iceberg_table::{arrow_schema, field_ids, table_from_catalog, table_from_iceberg};
 pub use materialized::{MaterializedResult, Rollup, hash_plan};
-pub use optimizer::{Declined, Optimizer, Retired, Round};
+pub use optimizer::{
+    BuildKind, BuildRecommendation, Calibration, Declined, Optimizer, Recommendation,
+    RetireRecommendation, Retired, Round,
+};
 pub use options::QuarryOptions;
 #[cfg(feature = "iceberg")]
 pub use persist::{

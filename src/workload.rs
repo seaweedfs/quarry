@@ -444,18 +444,13 @@ impl Proposal {
 /// The design's user surface is one table property and one number:
 ///
 /// ```sql
-/// ALTER TABLE events SET (auto_optimize = true, optimize_budget_pct = 5);
+/// ALTER TABLE events SET (optimize_budget_pct = 5);
 /// ```
 ///
 /// so this is deliberately small. Everything here is a ceiling or a threshold;
 /// none of it is a hint the optimizer may ignore.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Policy {
-    /// Whether the optimizer may act at all.
-    ///
-    /// When false a round still *reports* what it would do, so advisory and
-    /// automatic modes share one code path and one set of decisions.
-    pub auto_optimize: bool,
     /// Most bytes of derived state to keep for this table.
     pub budget_bytes: u64,
     /// Queries of a shape before it justifies building anything.
@@ -503,9 +498,8 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Observe and report, but change nothing.
+    /// Observe and recommend, but change nothing.
     pub const ADVISORY: Policy = Policy {
-        auto_optimize: false,
         budget_bytes: 0,
         min_queries: 10,
         horizon_days: 30.0,
@@ -515,10 +509,9 @@ impl Policy {
         min_index_advantage_pct: 10.0,
     };
 
-    /// Act, keeping derived state under `budget_bytes`.
+    /// Allow builds up to `budget_bytes`.
     pub fn automatic(budget_bytes: u64) -> Self {
         Policy {
-            auto_optimize: true,
             budget_bytes,
             ..Policy::ADVISORY
         }
@@ -1042,7 +1035,6 @@ mod tests {
     #[test]
     fn a_budget_percentage_is_of_the_table() {
         let policy = Policy::automatic_pct(100 * GB, 5.0);
-        assert!(policy.auto_optimize);
         assert_eq!(policy.budget_bytes, 5 * GB);
     }
 
