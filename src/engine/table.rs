@@ -62,6 +62,33 @@ pub fn hash_scalar(value: &ScalarValue) -> u64 {
     StableHasher::of(value)
 }
 
+/// How stale a served answer is.
+///
+/// Reported by [`ScanReport::stale`] when the `quarry.stale` opt-in let a
+/// non-unionable substitute serve despite the table having grown. The fields
+/// let a caller judge how far behind the build snapshot the answer is, and
+/// whether the miss is worth a re-run without the opt-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Staleness {
+    /// The snapshot the derived state was built from.
+    ///
+    /// The answer covers this snapshot exactly; everything added after it is
+    /// missed.
+    pub built_at: SnapshotId,
+    /// Files added since `built_at` that were not scanned.
+    ///
+    /// The rows in these files are what the stale answer may miss. Empty
+    /// would mean the answer is complete, which contradicts `Some` on the
+    /// report — but the field is kept for clarity.
+    pub missed_files: BTreeSet<FileId>,
+    /// Bytes in `missed_files`, if their sizes are known.
+    ///
+    /// `0` for an in-memory table whose file sizes are not tracked; the file
+    /// count is still meaningful. For Parquet-backed tables this is the sum
+    /// of the missed files' sizes, the same figure `bytes_if_full_scan` uses.
+    pub missed_bytes: u64,
+}
+
 /// What the rule decided for the most recent scan.
 ///
 /// Recorded so a caller can see the decision after the fact — the same
@@ -93,14 +120,15 @@ pub struct ScanReport {
     /// asked `approx_distinct`, or asked `count(distinct)` with the
     /// session's `quarry.approximate` opt-in. Never set by omission.
     pub approximate: bool,
-    /// Whether the served answer may miss rows added since the derived state
-    /// was built.
+    /// How stale the served answer is, if at all.
     ///
-    /// `true` only when a non-unionable substitute served despite the table
-    /// having grown, because the session's `quarry.stale` opt-in allowed it.
-    /// The answer is fast but incomplete; a caller that needs completeness
-    /// should treat this as a miss and re-run with `quarry.stale` off.
-    pub stale: bool,
+    /// `None` when the answer is complete. `Some` only when a non-unionable
+    /// substitute served despite the table having grown, because the
+    /// session's `quarry.stale` opt-in allowed it — the answer is fast but
+    /// may miss rows in the files added since the index was built. A caller
+    /// that needs completeness should treat this as a miss and re-run with
+    /// `quarry.stale` off.
+    pub stale: Option<Staleness>,
     /// Identity of the plan that was looked up.
     ///
     /// A caller wanting to *store* this query's result needs the same key the
@@ -911,7 +939,23 @@ impl QuarryTable {
             |d| materialized.contains_key(&d.id),
         ) {
             Composed::Substitute(candidate) => {
-                let stale = candidate.decision.is_stale();
+                let stale = match &candidate.decision {
+                    Decision::UseStale { missed, .. } => {
+                        let built_at = candidate.derived.source.snapshot;
+                        let missed_bytes = match &self.files {
+                            Files::Parquet { sizes, .. } => {
+                                missed.iter().filter_map(|f| sizes.get(f)).sum()
+                            }
+                            Files::Memory(_) => 0,
+                        };
+                        Some(Staleness {
+                            built_at,
+                            missed_files: missed.clone(),
+                            missed_bytes,
+                        })
+                    }
+                    _ => None,
+                };
                 let also_scanned = match candidate.decision {
                     Decision::UseWith { also_scan, .. } => also_scan,
                     _ => BTreeSet::new(),
@@ -951,7 +995,7 @@ impl QuarryTable {
                 also_scanned: residual,
                 substituted: false,
                 approximate: false,
-                stale: false,
+                stale: None,
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint: fingerprint.clone(),
@@ -973,7 +1017,7 @@ impl QuarryTable {
                 also_scanned: BTreeSet::new(),
                 substituted: false,
                 approximate: false,
-                stale: false,
+                stale: None,
                 plan_hash,
                 bytes_if_full_scan,
                 fingerprint,

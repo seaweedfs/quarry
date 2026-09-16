@@ -69,7 +69,7 @@ pub fn compose<'a>(
     for candidate in candidates {
         let (rewrite, also_scan) = match &candidate.decision {
             Decision::Use(rewrite) => (rewrite, None),
-            Decision::UseStale(rewrite) => (rewrite, None),
+            Decision::UseStale { rewrite, .. } => (rewrite, None),
             Decision::UseWith { rewrite, also_scan } => (rewrite, Some(also_scan)),
             Decision::Reject(_) => continue,
         };

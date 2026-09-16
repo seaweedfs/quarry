@@ -118,7 +118,7 @@ impl Explain {
                     };
                     let rewrite = match &candidate.decision {
                         Decision::Use(rewrite) => rewrite.clone(),
-                        Decision::UseStale(rewrite) => rewrite.clone(),
+                        Decision::UseStale { rewrite, .. } => rewrite.clone(),
                         Decision::UseWith { rewrite, .. } => rewrite.clone(),
                         Decision::Reject(_) => unreachable!("candidates are admitted"),
                     };
@@ -145,7 +145,7 @@ impl Explain {
                             built_at: p.derived.source.snapshot,
                             rewrite: match &p.decision {
                                 Decision::Use(rewrite) => rewrite.clone(),
-                                Decision::UseStale(rewrite) => rewrite.clone(),
+                                Decision::UseStale { rewrite, .. } => rewrite.clone(),
                                 Decision::UseWith { rewrite, .. } => rewrite.clone(),
                                 Decision::Reject(_) => unreachable!("candidates are admitted"),
                             },

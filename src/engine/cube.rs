@@ -300,7 +300,7 @@ pub(crate) fn report(
         also_scanned: Default::default(),
         substituted: true,
         approximate,
-        stale: false,
+        stale: None,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),

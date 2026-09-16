@@ -744,7 +744,13 @@ pub enum Decision {
     /// `quarry.stale` opt-in allowed it, and only for additive staleness —
     /// a delete still rejects. The caller marks the answer as stale so a
     /// caller that needs completeness can re-run without the opt-in.
-    UseStale(Rewrite),
+    UseStale {
+        /// The rewrite to apply.
+        rewrite: Rewrite,
+        /// Files added since the build that were not scanned — the rows the
+        /// stale answer may miss. Reported so the caller can judge how stale.
+        missed: BTreeSet<FileId>,
+    },
     /// Scan the table.
     Reject(Reason),
 }
@@ -757,7 +763,7 @@ impl Decision {
     /// Whether the answer may miss rows added since the derived state was
     /// built.
     pub fn is_stale(&self) -> bool {
-        matches!(self, Decision::UseStale(_))
+        matches!(self, Decision::UseStale { .. })
     }
 }
 
@@ -951,7 +957,10 @@ impl Derived {
             // additive staleness: a delete still rejects, because serving
             // rows that should not exist is fabrication, not staleness.
             if query.stale && diff.is_purely_additive() {
-                return Decision::UseStale(rewrite);
+                return Decision::UseStale {
+                    rewrite,
+                    missed: diff.added.clone(),
+                };
             }
             return Decision::Reject(Reason::ResidualNotUnionable);
         }
@@ -1363,10 +1372,13 @@ mod tests {
         // The opt-in serves the stale aggregate rather than rejecting it.
         assert_eq!(
             aggregate.may_serve(&q, &g),
-            Decision::UseStale(Rewrite::Substitute {
-                unionable: false,
-                rollup: None,
-            })
+            Decision::UseStale {
+                rewrite: Rewrite::Substitute {
+                    unionable: false,
+                    rollup: None,
+                },
+                missed: BTreeSet::from([f("b")]),
+            }
         );
         assert!(aggregate.may_serve(&q, &g).is_stale());
     }

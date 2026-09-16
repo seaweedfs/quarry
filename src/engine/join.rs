@@ -315,7 +315,7 @@ fn report(table: &QuarryTable, query: &Query, used: &DerivedId, ask: &Ask<'_>) -
         also_scanned: Default::default(),
         substituted: true,
         approximate: false,
-        stale: false,
+        stale: None,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),
