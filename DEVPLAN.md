@@ -2050,9 +2050,22 @@ blob type, even though they share the `(table, field, snapshot)` path.
 Malformed, truncated, or trailing data is discarded rather than
 partially recovered — a partial text index under-selects files.
 
-`VectorIndex` persistence is deliberately not implemented. The kind
-holds only metadata (field, metric, dimension), while the actual rows
-are stored in memory by `QuarryTable`. Persisting metadata without rows
-would falsely advertise a substituting index that has nothing to serve.
-A correct implementation would need to persist the rows or trigger a
-rebuild on recovery; neither is done yet.
+## Phase 37 — Vector index persistence `[x]`
+
+`VectorIndex` is metadata plus rows: the kind holds field, metric, and
+dimension, while the actual rows live in memory under `QuarryTable`. A
+correct persistence must save both, or recovery would register a kind
+that claims to substitute but has nothing to serve.
+
+The rows are written as Parquet — Arrow's native columnar format — at a
+companion path beside the Puffin metadata blob. The blob
+(`quarry-vector-index-v1`) carries only the field, metric, and
+dimension; the rows path is derived from the metadata path by swapping
+`.puffin` for `.parquet`. Recovery reads both, reconstructs the kind
+with the correct in-memory byte count from the recovered rows, and
+returns the rows through `Recovered::rows` so the caller can
+`QuarryTable::store_rows` them before the index serves.
+
+A metadata blob whose rows are missing is discarded, not partially
+recovered — the kind would falsely advertise a substituting index. A
+stale snapshot is discarded the same way as every other kind.
