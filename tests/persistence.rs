@@ -31,7 +31,7 @@ use quarry::derived::{Decision, Plan, Predicate, Query, Rewrite, Scope};
 use quarry::engine::{
     Advertised, Layout, Optimizer, Quarry, QuarryTable, Retired, Store, advertised, build_bitmap,
     build_filter_set, build_index, filter_set_id, hash_scalar, index_id, read_bitmap,
-    read_filter_set, read_index, shared, write_index,
+    read_filter_set, read_index, read_text_index, shared, write_index,
 };
 use quarry::registry::Registry;
 use quarry::snapshot::{FileId, Snapshot, SnapshotGraph, SnapshotId, TableId};
@@ -1146,4 +1146,131 @@ async fn a_filter_set_survives_being_written_and_read_back() {
         }
         other => panic!("expected the recovered filter set to serve, got {other:?}"),
     }
+}
+
+/// A text index round-trips through storage and survives a restart.
+#[tokio::test]
+async fn a_text_index_round_trips_and_recovers() {
+    let fixture = fixture("persist_text");
+    let (file_io, store) = stacks(&fixture);
+
+    const BODY: u32 = 7;
+    let [a, b, c] = fixture.files.clone().try_into().expect("three files");
+    let built = quarry::kinds::TextIndex::new(BODY)
+        .with(100, a.clone())
+        .with(100, b.clone())
+        .with(200, b.clone())
+        .with(200, c.clone())
+        .with(300, a.clone());
+
+    let path = store
+        .write_text_index(&events(), SnapshotId(1), POLICY, &built)
+        .await
+        .expect("write");
+    let (read, policy) = read_text_index(&file_io, &path, BODY)
+        .await
+        .expect("read")
+        .expect("a usable text index");
+    assert_eq!(policy, POLICY);
+    assert_eq!(read.field(), BODY);
+    assert_eq!(
+        read.postings().collect::<Vec<_>>(),
+        built.postings().collect::<Vec<_>>(),
+        "postings round-trip exactly"
+    );
+    assert!(read.bytes_estimate() > 0, "recovered bytes set from blob");
+
+    // A restart finds it and serves a conjunctive search.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = index_id(&events(), BODY);
+    let derived = recovered.registry.get(&id).expect("registered");
+
+    let query = Query {
+        table: events(),
+        snapshot: SnapshotId(1),
+        policy: POLICY,
+        plan_hash: 0,
+        plan: None,
+        projected: BTreeSet::from([BODY]),
+        predicates: vec![Predicate::Matches {
+            field: BODY,
+            terms: vec![100, 200],
+        }],
+        aggregate: None,
+        nearest: None,
+        approximate: false,
+    };
+    match derived.may_serve(&query, &fixture.graph) {
+        Decision::Use(Rewrite::Prune { files }) => {
+            // Terms 100 and 200 intersect to file b only.
+            assert_eq!(files.len(), 1, "intersection prunes to one file: {files:?}");
+        }
+        other => panic!("expected the recovered text index to serve, got {other:?}"),
+    }
+}
+
+/// A text index built from a snapshot the table no longer retains is
+/// discarded during recovery, not registered as usable.
+#[tokio::test]
+async fn a_text_index_from_a_stale_snapshot_is_discarded() {
+    let fixture = fixture("persist_text_stale");
+    let (_, store) = stacks(&fixture);
+
+    const BODY: u32 = 7;
+    let built = quarry::kinds::TextIndex::new(BODY)
+        .with(100, fixture.files[0].clone())
+        .with(200, fixture.files[1].clone());
+
+    store
+        .write_text_index(&events(), SnapshotId(1), POLICY, &built)
+        .await
+        .expect("write");
+
+    // Recover with no known snapshots — everything is stale.
+    let recovered = store.recover(&events(), &[]).await.expect("recover");
+    assert!(
+        recovered.registry.is_empty(),
+        "stale text index must not be registered"
+    );
+    assert_eq!(
+        recovered.discarded.len(),
+        1,
+        "the stale text index is recorded as discarded"
+    );
+}
+
+/// Trailing bytes after a valid text index are rejected, not partially
+/// recovered — a partial text index under-selects files.
+#[tokio::test]
+async fn a_text_index_with_trailing_bytes_is_rejected() {
+    let fixture = fixture("persist_text_trailing");
+    let (file_io, store) = stacks(&fixture);
+
+    const BODY: u32 = 7;
+    let built = quarry::kinds::TextIndex::new(BODY)
+        .with(100, fixture.files[0].clone())
+        .with(200, fixture.files[1].clone());
+
+    let path = store
+        .write_text_index(&events(), SnapshotId(1), POLICY, &built)
+        .await
+        .expect("write");
+
+    // Append junk after the Puffin file — the footer is at the end, so this
+    // simulates trailing corruption.
+    let raw = fs::read(&path).expect("read");
+    let mut corrupted = raw.clone();
+    corrupted.extend_from_slice(&[0xFF; 16]);
+    fs::write(&path, &corrupted).expect("corrupt");
+
+    assert!(
+        read_text_index(&file_io, &path, BODY)
+            .await
+            .expect("read")
+            .is_none(),
+        "trailing bytes must be refused, not partially recovered"
+    );
 }

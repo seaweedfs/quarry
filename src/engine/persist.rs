@@ -70,7 +70,7 @@ use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
 use crate::derived::{Derived, DerivedId, FieldId, Filter, PolicyFingerprint, Source};
-use crate::kinds::{Bitmap, FilterSet, Index};
+use crate::kinds::{Bitmap, FilterSet, Index, TextIndex};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
 use crate::stable_hash::HASH_VERSION;
@@ -87,6 +87,9 @@ pub const QUARRY_BITMAP_V1: &str = "quarry-bitmap-v1";
 
 /// The blob type for a persisted filter set.
 pub const QUARRY_FILTER_SET_V1: &str = "quarry-filter-set-v1";
+
+/// The blob type for a persisted text index.
+pub const QUARRY_TEXT_INDEX_V1: &str = "quarry-text-index-v1";
 
 /// The blob property holding the canonical filter text a filter set answers.
 const FILTER_TEXT_PROPERTY: &str = "quarry.filter";
@@ -448,6 +451,72 @@ fn decode_filter_set(filter: Filter, bytes: &[u8]) -> Option<FilterSet> {
     Some(set)
 }
 
+/// Serialise a text index's postings: the path table, then
+/// `term → files`. Same shape as [`encode`], because the postings are
+/// structurally identical — a hash to a file set.
+fn encode_text_index(text: &TextIndex) -> Vec<u8> {
+    let paths: Vec<&FileId> = text
+        .postings()
+        .flat_map(|(_, files)| files.iter())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let number_of: BTreeMap<&FileId, u32> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (*file, index as u32))
+        .collect();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for file in &paths {
+        let bytes = file.0.as_bytes();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    out.extend_from_slice(&(text.values() as u64).to_le_bytes());
+    for (term, files) in text.postings() {
+        out.extend_from_slice(&term.to_le_bytes());
+        out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for file in files {
+            out.extend_from_slice(&number_of[file].to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Read text postings back, or `None` if the bytes are not well-formed.
+///
+/// Same discipline as [`decode`]: any inconsistency is `None`, because a
+/// partial text index under-selects files and that is the wrong direction.
+fn decode_text_index(field: FieldId, bytes: &[u8]) -> Option<TextIndex> {
+    let mut cursor = Cursor { bytes, at: 0 };
+
+    let path_count = cursor.u32()?;
+    let mut paths = Vec::with_capacity(path_count.min(1 << 16) as usize);
+    for _ in 0..path_count {
+        let len = cursor.u32()? as usize;
+        paths.push(FileId(String::from_utf8(cursor.take(len)?.to_vec()).ok()?));
+    }
+
+    let terms = cursor.u64()?;
+    let mut text = TextIndex::new(field);
+    for _ in 0..terms {
+        let term = cursor.u64()?;
+        let files = cursor.u32()?;
+        for _ in 0..files {
+            let file = paths.get(cursor.u32()? as usize)?;
+            text.insert(term, file.clone());
+        }
+    }
+
+    if cursor.at != bytes.len() {
+        return None;
+    }
+    Some(text)
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -747,6 +816,84 @@ pub async fn read_filter_set(
     Ok(None)
 }
 
+/// Write a text index to storage as a Puffin blob — [`write_index`]'s
+/// contract verbatim, only the blob type and postings differ.
+///
+/// A text index shares the `(table, field, snapshot)` path with equality
+/// indexes and bitmaps: one field gets one accelerator, whichever shape it
+/// took. Recovery distinguishes them by blob type.
+pub async fn write_text_index(
+    file_io: &FileIO,
+    layout: &Layout,
+    table: &TableId,
+    at: SnapshotId,
+    policy: PolicyFingerprint,
+    text: &TextIndex,
+) -> iceberg::Result<String> {
+    let path = layout.index_path(table, text.field(), at);
+    let output = file_io.new_output(&path)?;
+
+    let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
+    writer
+        .add(
+            Blob::builder()
+                .r#type(QUARRY_TEXT_INDEX_V1.to_owned())
+                .fields(vec![text.field() as i32])
+                .snapshot_id(at.0)
+                .sequence_number(0)
+                .data(encode_text_index(text))
+                .properties(HashMap::from([
+                    (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
+                    (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                ]))
+                .build(),
+            CompressionCodec::None,
+        )
+        .await?;
+    writer.close().await?;
+    Ok(path)
+}
+
+/// Read one text index back, with [`read_index`]'s refusals: wrong type,
+/// wrong hash version, or bytes that do not decode exactly are all `None`.
+pub async fn read_text_index(
+    file_io: &FileIO,
+    path: &str,
+    field: FieldId,
+) -> iceberg::Result<Option<(TextIndex, PolicyFingerprint)>> {
+    if !is_plausible_puffin(file_io, path).await? {
+        return Ok(None);
+    }
+    let reader = PuffinReader::new(file_io.new_input(path)?);
+    let metadata = reader.file_metadata().await?;
+
+    for blob_metadata in metadata.blobs() {
+        if blob_metadata.blob_type() != QUARRY_TEXT_INDEX_V1 {
+            continue;
+        }
+        let properties = blob_metadata.properties();
+        if properties.get(HASH_VERSION_PROPERTY).map(String::as_str)
+            != Some(&HASH_VERSION.to_string())
+        {
+            continue;
+        }
+        let policy = properties
+            .get(POLICY_PROPERTY)
+            .and_then(|raw| raw.parse().ok())
+            .map(PolicyFingerprint);
+        let Some(policy) = policy else {
+            continue;
+        };
+
+        let blob = reader.blob(blob_metadata).await?;
+        if let Some(text) = decode_text_index(field, blob.data()) {
+            let bytes = blob.data().len() as u64;
+            return Ok(Some((text.with_bytes(bytes), policy)));
+        }
+    }
+    Ok(None)
+}
+
 /// The blob type for a saved workload.
 pub const QUARRY_WORKLOAD_V1: &str = "quarry-workload-v1";
 
@@ -1016,7 +1163,17 @@ pub async fn recover(
                             policy,
                         ))
                     }
-                    None => None,
+                    None => match read_text_index(file_io, &readable, field).await? {
+                        Some((text, policy)) => {
+                            let bytes = text.bytes_estimate();
+                            Some((
+                                Box::new(text) as Box<dyn crate::derived::Kind>,
+                                bytes,
+                                policy,
+                            ))
+                        }
+                        None => None,
+                    },
                 },
             };
             match read {
@@ -1286,6 +1443,17 @@ impl Store {
         write_filter_set(&self.file_io, &self.layout, table, at, policy, set).await
     }
 
+    /// Persist a text index beside the table it indexes.
+    pub async fn write_text_index(
+        &self,
+        table: &TableId,
+        at: SnapshotId,
+        policy: PolicyFingerprint,
+        text: &TextIndex,
+    ) -> iceberg::Result<String> {
+        write_text_index(&self.file_io, &self.layout, table, at, policy, text).await
+    }
+
     /// Rebuild a table's registry from storage.
     pub async fn recover(
         &self,
@@ -1388,7 +1556,10 @@ impl Store {
                 }
                 continue;
             }
-            if entry.kind != QUARRY_EQ_INDEX_V2 && entry.kind != QUARRY_BITMAP_V1 {
+            if entry.kind != QUARRY_EQ_INDEX_V2
+                && entry.kind != QUARRY_BITMAP_V1
+                && entry.kind != QUARRY_TEXT_INDEX_V1
+            {
                 continue;
             }
             let Some(&field) = entry.fields.first() else {
@@ -1415,7 +1586,17 @@ impl Store {
                             policy,
                         ))
                     }
-                    None => None,
+                    None => match read_text_index(&self.file_io, &entry.path, field).await? {
+                        Some((text, policy)) => {
+                            let bytes = text.bytes_estimate();
+                            Some((
+                                Box::new(text) as Box<dyn crate::derived::Kind>,
+                                bytes,
+                                policy,
+                            ))
+                        }
+                        None => None,
+                    },
                 },
             };
             match read {
