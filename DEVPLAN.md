@@ -774,11 +774,15 @@ FTS / vector / spatial       Vector landed: `quarry_l2_distance` /
                              `quarry_cosine_distance` give the shape, and
                              a flat `VectorIndex` serves
                              `ORDER BY distance LIMIT k` exactly. FTS
-                             still needs a MATCH predicate variant;
-                             spatial needs its own. Sketch aggregates
-                             landed: HLL states serve `approx_distinct`
-                             unconditionally and `count(distinct)` under
-                             the session's `quarry.approximate` opt-in
+                             landed: `quarry_matches(col, 'text')` is a
+                             pruning `Predicate::Matches`, a shared
+                             tokenizer defines a term, and `TextIndex`
+                             intersects postings — the optimizer builds it
+                             from repeated matches. Spatial needs its own.
+                             Sketch aggregates landed: HLL states serve
+                             `approx_distinct` unconditionally and
+                             `count(distinct)` under the session's
+                             `quarry.approximate` opt-in
 join accelerators            need a repeated-join workload to justify
 SegmentDirectory             pays only once the registry is observed
                              probing hundreds of pieces per query
