@@ -959,14 +959,13 @@ pub async fn build_vector_index(
     ))
 }
 
-/// Build the join hash `ask` proposes: the build-side rows, sorted by the
-/// join key and held where a hash join reads them locally instead of from
-/// object storage.
+/// Build the join hash `ask` proposes: the build-side rows, held where a
+/// hash join reads them locally instead of from object storage.
 ///
 /// Like the vector index, the build is a read of the whole table — the one
 /// build that cannot be cheaper than the scan it replaces. The trade a
-/// repeated join makes: it reads the build side *once* at build time and
-/// sorts it, instead of reading it from object storage on every query.
+/// repeated join makes: it reads the build side *once* at build time,
+/// instead of reading it from object storage on every query.
 pub async fn build_join_hash(
     session: &Session,
     table: &Arc<QuarryTable>,
@@ -984,7 +983,7 @@ pub async fn build_join_hash(
         )
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     // Read only the columns the join needs, in the order the table's schema
-    // defines them. Sorting by the join key happens after the read.
+    // defines them.
     let schema = datafusion::catalog::TableProvider::schema(table.as_ref());
     let column_names: Vec<String> = schema
         .fields()

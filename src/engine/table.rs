@@ -36,6 +36,23 @@ use crate::stable_hash::StableHasher;
 use crate::workload::{Fingerprint, Observation};
 use object_store::path::Path as ObjectPath;
 
+/// Persisted rows a substitute can read lazily.
+///
+/// Beside `materialized` rather than inside it: `materialized` holds bytes
+/// already paid for in memory, while this holds only where the bytes are —
+/// the rows stream through the object store into the operator that consumes
+/// them instead of being buffered whole first.
+#[derive(Debug, Clone)]
+pub struct RowFiles {
+    /// The store the files live on.
+    pub url: ObjectStoreUrl,
+    /// Each file's object path and length in bytes.
+    pub files: Vec<(String, u64)>,
+    /// The schema the rows were written with — a subset of the table's, in
+    /// table-column order.
+    pub schema: SchemaRef,
+}
+
 /// A registry several things can hold at once.
 ///
 /// A plain `RwLock`: planning takes a read guard and never awaits while
@@ -262,6 +279,12 @@ pub struct QuarryTable {
     /// be used, and the engine knows *how* to read it. Neither has to know the
     /// other's types.
     materialized: Mutex<BTreeMap<DerivedId, Vec<RecordBatch>>>,
+    /// Persisted rows a substitute can scan lazily, keyed by its id.
+    ///
+    /// Checked before `materialized`: a registered file streams through the
+    /// store at exec time, while materialized rows sit in memory beside the
+    /// operator that consumes them.
+    row_files: Mutex<BTreeMap<DerivedId, RowFiles>>,
     last_scan: Mutex<Option<ScanReport>>,
     /// Per-group row counts for Parquet files already opened.
     ///
@@ -298,6 +321,7 @@ impl QuarryTable {
             prices: PriceTable::default(),
             field_bounds: BTreeMap::new(),
             materialized: Mutex::new(BTreeMap::new()),
+            row_files: Mutex::new(BTreeMap::new()),
             last_scan: Mutex::new(None),
             row_groups: Mutex::new(BTreeMap::new()),
         }
@@ -570,6 +594,14 @@ impl QuarryTable {
         }
     }
 
+    /// The known sizes of `files`, summed — `0` where sizes are untracked.
+    pub(crate) fn bytes_of(&self, files: &BTreeSet<FileId>) -> u64 {
+        match &self.files {
+            Files::Parquet { sizes, .. } => files.iter().filter_map(|file| sizes.get(file)).sum(),
+            Files::Memory(_) => 0,
+        }
+    }
+
     /// This table's identity.
     pub fn table_id(&self) -> &TableId {
         &self.table
@@ -596,6 +628,45 @@ impl QuarryTable {
             .lock()
             .expect("materialized")
             .insert(id, batches);
+    }
+
+    /// Record where `id`'s rows were persisted, so a substitute can stream
+    /// them instead of holding them.
+    ///
+    /// Also drops any in-memory copy: the files serve the same rows, and
+    /// keeping both would pay for the memory without paying less for the
+    /// read.
+    pub fn store_row_files(&self, id: DerivedId, rows: RowFiles) {
+        self.row_files
+            .lock()
+            .expect("row files")
+            .insert(id.clone(), rows);
+        self.materialized.lock().expect("materialized").remove(&id);
+    }
+
+    /// A source over `id`'s persisted rows, and the schema they were written
+    /// with — `None` if none were registered.
+    ///
+    /// The provider is a Parquet scan: the rows stream into the plan that
+    /// consumes them instead of being materialized beside it.
+    pub(crate) fn row_file_source(
+        &self,
+        id: &DerivedId,
+    ) -> Option<(Arc<dyn datafusion::logical_expr::TableSource>, SchemaRef)> {
+        let rows = self.row_files.lock().expect("row files").get(id)?.clone();
+        let provider = RowFileProvider {
+            schema: Arc::clone(&rows.schema),
+            url: rows.url.clone(),
+            files: rows
+                .files
+                .iter()
+                .map(|(path, size)| PartitionedFile::new(path.clone(), *size))
+                .collect(),
+        };
+        Some((
+            datafusion::datasource::provider_as_source(Arc::new(provider)),
+            rows.schema,
+        ))
     }
 
     /// Record a plan-level report: `Session::sql` can see the whole plan,
@@ -929,29 +1000,24 @@ impl QuarryTable {
 
         // The cheapest candidate the engine can actually execute. A
         // substituting one is executable only if its rows were supplied to
-        // `with_materialized`; otherwise it is skipped, which is the safe
-        // direction — the answer is right, merely slower.
+        // `with_materialized` or persisted to files; otherwise it is skipped,
+        // which is the safe direction — the answer is right, merely slower.
         // A read guard, held only across planning, which does no I/O.
         let registry = self.registry.read().expect("registry lock");
         let materialized = self.materialized.lock().expect("materialized");
+        let row_files = self.row_files.lock().expect("row files");
         let usable = match compose(
             &registry.candidates(&query, &self.graph, &self.prices),
-            |d| materialized.contains_key(&d.id),
+            |d| materialized.contains_key(&d.id) || row_files.contains_key(&d.id),
         ) {
             Composed::Substitute(candidate) => {
                 let stale = match &candidate.decision {
                     Decision::UseStale { missed, .. } => {
                         let built_at = candidate.derived.source.snapshot;
-                        let missed_bytes = match &self.files {
-                            Files::Parquet { sizes, .. } => {
-                                missed.iter().filter_map(|f| sizes.get(f)).sum()
-                            }
-                            Files::Memory(_) => 0,
-                        };
                         Some(Staleness {
                             built_at,
                             missed_files: missed.clone(),
-                            missed_bytes,
+                            missed_bytes: self.bytes_of(missed),
                         })
                     }
                     _ => None,
@@ -1185,19 +1251,23 @@ impl TableProvider for QuarryTable {
         let mut parts: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
 
         if report.substituted {
-            if let Some(batches) = report
-                .used
-                .first()
-                .map(|id| DerivedId(id.clone()))
-                .and_then(|id| {
+            let id = report.used.first().map(|id| DerivedId(id.clone()));
+            // Stored rows answer the scan. Persisted ones stream from their
+            // files; only state kept purely in memory reads as batches.
+            let part = id.and_then(|id| {
+                if let Some(rows) = self.row_files.lock().expect("row files").get(&id).cloned() {
+                    Some(self.row_file_plan(&rows, projection))
+                } else {
                     self.materialized
                         .lock()
                         .expect("materialized")
                         .get(&id)
                         .cloned()
-                })
-            {
-                parts.push(self.derived_plan(&batches, projection)?);
+                        .map(|batches| self.derived_plan(&batches, projection))
+                }
+            });
+            if let Some(part) = part {
+                parts.push(part?);
             }
         }
 
@@ -1250,16 +1320,28 @@ impl QuarryTable {
         let Some(stored) = batches.first().map(|batch| batch.schema()) else {
             return self.memory_plan(std::slice::from_ref(&batches.to_vec()), projection);
         };
-        if stored == self.schema {
-            return self.memory_plan(std::slice::from_ref(&batches.to_vec()), projection);
-        }
+        let remapped = self.stored_projection(&stored, projection)?;
+        let exec = MemorySourceConfig::try_new_exec(&[batches.to_vec()], stored, remapped)?;
+        Ok(exec)
+    }
 
+    /// The `projection` re-expressed in `stored`-schema positions, or
+    /// `None` where the stored schema is the table's and the projection
+    /// passes through unchanged.
+    fn stored_projection(
+        &self,
+        stored: &SchemaRef,
+        projection: Option<&Vec<usize>>,
+    ) -> DfResult<Option<Vec<usize>>> {
+        if stored == &self.schema {
+            return Ok(projection.cloned());
+        }
         let positions: Vec<usize> = stored
             .fields()
             .iter()
             .map(|field| self.schema.index_of(field.name()))
             .collect::<Result<_, _>>()?;
-        let remapped = match projection {
+        match projection {
             Some(indices) => indices
                 .iter()
                 .map(|index| {
@@ -1273,15 +1355,33 @@ impl QuarryTable {
                             ))
                         })
                 })
-                .collect::<DfResult<Vec<_>>>()?,
-            None => {
-                return Err(DataFusionError::Plan(
-                    "a stored projection cannot serve a whole-table scan".to_owned(),
-                ));
-            }
-        };
-        let exec = MemorySourceConfig::try_new_exec(&[batches.to_vec()], stored, Some(remapped))?;
-        Ok(exec)
+                .collect::<DfResult<Vec<_>>>()
+                .map(Some),
+            None => Err(DataFusionError::Plan(
+                "a stored projection cannot serve a whole-table scan".to_owned(),
+            )),
+        }
+    }
+
+    /// A plan over persisted derived rows — `derived_plan`'s projection
+    /// remap applied to Parquet files rather than held batches.
+    fn row_file_plan(
+        &self,
+        rows: &RowFiles,
+        projection: Option<&Vec<usize>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let remapped = self.stored_projection(&rows.schema, projection)?;
+        let mut builder = FileScanConfigBuilder::new(
+            rows.url.clone(),
+            Arc::clone(&rows.schema),
+            Arc::new(ParquetSource::default()),
+        )
+        .with_projection(remapped);
+        for (path, size) in &rows.files {
+            builder =
+                builder.with_file_group(vec![PartitionedFile::new(path.clone(), *size)].into());
+        }
+        Ok(DataSourceExec::from_data_source(builder.build()))
     }
 
     /// A plan reading exactly `files` — and within them, only the row
@@ -1446,4 +1546,66 @@ fn take_rows(batch: &RecordBatch, rows: &BTreeSet<u64>) -> Option<RecordBatch> {
         .map(|column| take(column, &indices, None).expect("indices are in range"))
         .collect();
     Some(RecordBatch::try_new(batch.schema(), columns).expect("taken batch"))
+}
+
+/// A [`TableProvider`] over persisted derived rows.
+///
+/// What `MemTable` is to materialized rows, this is to [`RowFiles`]: the same
+/// substitute, but the rows stream through the store at exec time rather
+/// than being buffered whole beside the operator that consumes them.
+struct RowFileProvider {
+    schema: SchemaRef,
+    url: ObjectStoreUrl,
+    files: Vec<PartitionedFile>,
+}
+
+impl std::fmt::Debug for RowFileProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowFileProvider")
+            .field("url", &self.url)
+            .field("files", &self.files)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl TableProvider for RowFileProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let mut builder = FileScanConfigBuilder::new(
+            self.url.clone(),
+            Arc::clone(&self.schema),
+            Arc::new(ParquetSource::default()),
+        )
+        .with_projection(projection.cloned());
+        // One file group per shard, so DataFusion reads them in parallel.
+        for file in &self.files {
+            builder = builder.with_file_group(vec![file.clone()].into());
+        }
+        Ok(DataSourceExec::from_data_source(builder.build()))
+    }
 }

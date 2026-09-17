@@ -2087,3 +2087,73 @@ Recovery discards a metadata blob whose rows are missing (a substituting
 kind with no rows would falsely advertise itself), and discards both
 files for a snapshot the table no longer retains. `Store::reclaim`
 deletes both the `.puffin` and `.parquet` when a join hash is retired.
+
+---
+
+## Phase 39 — Lazy, sharded stored rows `[x]`
+
+Persistence phase 38 left two memory costs standing: substitution wrapped
+stored rows in a `MemTable`, so a `HashJoinExec` buffered them *and* built
+its hash table from them — two copies — and recovery read every row file
+eagerly at startup, whether or not the state ever served.
+
+### What changed
+
+`RowFiles` is a descriptor — store URL, `(path, size)` per file, the Arrow
+schema — that sits beside `materialized` rather than inside it. A
+`RowFileProvider` turns it into a `TableProvider` whose scan is a
+`DataSourceExec` over the Parquet files: rows stream into the consuming
+operator at exec time. `store_row_files` registers a descriptor and drops
+the in-memory copy, since the files serve the same rows.
+
+Recovery now records descriptors. `parquet_row_files` `head`s every file
+and reads the first file's footer for the schema — a footer is a few
+kilobytes, and the read doubles as proof the file is Parquet at all.
+`Recovered.rows` is gone: the vector index gets the same treatment as the
+join hash, so a restart no longer pays for rows nothing has asked for.
+
+### Sharding
+
+`write_join_hash` buckets rows by join-key hash — `StableHasher`, the same
+hash the blob's `quarry.hash-version` stamps — into `{snap}.{i:04}.parquet`
+files, one per ~128 MiB of input. The blob records the count as
+`quarry.shards`; `read_join_hash` derives every shard path from it, and a
+`None` property falls back to the single pre-sharding rows path, so blobs
+written before this phase still read.
+
+Key-bucketing is the property that matters, not the parallelism: a shard
+holds every stored row whose key falls in its range, which is why a missing
+shard is a hard failure rather than a partial answer. Bucketing by key does
+*not* make the hash unionable — appended rows hash into every bucket, so
+no shard covers them and appends still reject. What it buys today is
+parallel shard reads and bounded shard size.
+
+### Found: the scan's projection is never narrowed
+
+`join::ask_of` read the columns a hash must cover off `scan.projection` —
+"DataFusion has already narrowed it", the comment said. It has not: the
+`TableScan` in `logical_plan()` carries `projection: None`, so `columns`
+was always the whole field set and a subset-covering hash could never
+match through `Session::sql`. The ask now walks the plan for the columns
+actually referenced through the scan's qualifiers. This is also what makes
+`JoinAsk.columns` — and therefore what `build_join_hash` selects — precise:
+a hash stores only what the join reads.
+
+### Lance, evaluated and declined
+
+The question that motivated this phase was whether Lance should replace
+Parquet for stored rows so large build sides need not load into memory.
+The premise needs correcting: a hash join's build side is materialized as
+a hash table *by the algorithm* — no storage format avoids that. The
+recoverable costs were the extra eager copy and single-file reads, both of
+which Parquet shards now remove.
+
+What Lance would add — fragment pruning, late materialization — pays when
+the scan can skip build-side rows. Nothing here can: the substituted scan
+reads the whole stored relation by definition, and the only selectivity
+available (join-key bucketing) is already the shard layout. In exchange
+the crate would take a heavy dependency with its own file layout, writer,
+and compatibility surface, on top of the Puffin+Parquet story Iceberg
+already gives. Declined; revisit if a kind ever wants persisted rows that
+*are* selectively read.
+

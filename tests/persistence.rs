@@ -1350,7 +1350,8 @@ async fn a_vector_index_round_trips_and_recovers() {
     assert_eq!(rows[0].num_rows(), 3, "three rows recovered");
     assert_eq!(rows[0].schema(), schema, "schema preserved");
 
-    // A restart finds it and registers it with rows.
+    // A restart finds it and registers it with a descriptor for the rows,
+    // not the rows themselves — they stream when a top-k asks for them.
     let recovered = store
         .recover(&events(), &[SnapshotId(1)])
         .await
@@ -1359,13 +1360,9 @@ async fn a_vector_index_round_trips_and_recovers() {
     let derived = recovered.registry.get(&id).expect("registered");
     assert_eq!(derived.source.snapshot, SnapshotId(1));
     assert_eq!(derived.policy, POLICY);
-    let recovered_rows = recovered.rows.get(&id).expect("rows recovered");
-    assert_eq!(recovered_rows.len(), 1, "one batch in recovered rows");
-    assert_eq!(
-        recovered_rows[0].num_rows(),
-        3,
-        "three rows in recovered rows"
-    );
+    let files = recovered.row_files.get(&id).expect("row files recovered");
+    assert_eq!(files.files.len(), 1, "one rows file in the descriptor");
+    assert_eq!(files.schema, schema, "schema from the file's footer");
 }
 
 /// A vector index from a stale snapshot is discarded, and a metadata blob
@@ -1417,8 +1414,8 @@ async fn a_vector_index_from_a_stale_snapshot_is_discarded() {
     );
     assert_eq!(
         recovered.discarded.len(),
-        1,
-        "the stale vector index metadata is discarded"
+        2,
+        "the stale vector index metadata and its rows are both discarded"
     );
 }
 
@@ -1446,35 +1443,39 @@ async fn a_join_hash_survives_being_written_and_read_back() {
     .expect("batch");
 
     let hash = JoinHash::covering(keys.clone(), columns.clone(), 4096);
-    let meta_path = store
+    let (meta_path, shards) = store
         .write_join_hash(
             &events(),
             SnapshotId(1),
             POLICY,
             &hash,
             std::slice::from_ref(&batch),
+            &field_ids(),
         )
         .await
         .expect("write");
+    assert_eq!(shards.len(), 1, "a small build writes one shard");
 
     // Read the metadata back.
-    let (read_keys, read_columns, policy, rows_path) = read_join_hash(&file_io, &meta_path)
+    let (read_keys, read_columns, policy, rows_paths) = read_join_hash(&file_io, &meta_path)
         .await
         .expect("read")
         .expect("a usable join hash");
     assert_eq!(read_keys, keys);
     assert_eq!(read_columns, columns);
     assert_eq!(policy, POLICY);
+    assert_eq!(rows_paths.len(), 1, "one shard path advertised");
 
     // Read the rows back.
-    let rows = read_vector_rows(store.store(), &rows_path)
+    let rows = read_vector_rows(store.store(), &rows_paths[0])
         .await
         .expect("rows");
     assert_eq!(rows.len(), 1, "one batch recovered");
     assert_eq!(rows[0].num_rows(), 3, "three rows recovered");
     assert_eq!(rows[0].schema(), schema(), "schema preserved");
 
-    // A restart finds it and registers it with rows under the stable id.
+    // A restart finds it and registers it with a descriptor for the rows,
+    // not the rows themselves — they stream when a join asks for them.
     let recovered = store
         .recover(&events(), &[SnapshotId(1)])
         .await
@@ -1483,13 +1484,9 @@ async fn a_join_hash_survives_being_written_and_read_back() {
     let derived = recovered.registry.get(&id).expect("registered");
     assert_eq!(derived.source.snapshot, SnapshotId(1));
     assert_eq!(derived.policy, POLICY);
-    let recovered_rows = recovered.rows.get(&id).expect("rows recovered");
-    assert_eq!(recovered_rows.len(), 1, "one batch in recovered rows");
-    assert_eq!(
-        recovered_rows[0].num_rows(),
-        3,
-        "three rows in recovered rows"
-    );
+    let files = recovered.row_files.get(&id).expect("row files recovered");
+    assert_eq!(files.files.len(), 1, "one shard in the descriptor");
+    assert_eq!(files.schema, schema(), "schema from the shard's footer");
 }
 
 /// A join hash from a snapshot the table no longer retains is discarded —
@@ -1512,7 +1509,14 @@ async fn a_join_hash_from_a_stale_snapshot_is_discarded() {
 
     let hash = JoinHash::covering([TENANT_FIELD], [TENANT_FIELD, 7], 64);
     store
-        .write_join_hash(&events(), SnapshotId(1), POLICY, &hash, &[batch])
+        .write_join_hash(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &hash,
+            &[batch],
+            &field_ids(),
+        )
         .await
         .expect("write");
 
@@ -1525,7 +1529,7 @@ async fn a_join_hash_from_a_stale_snapshot_is_discarded() {
     assert_eq!(
         recovered.discarded.len(),
         2,
-        "both the metadata blob and its rows are discarded"
+        "both the metadata blob and its rows shard are discarded"
     );
 }
 
@@ -1548,15 +1552,21 @@ async fn a_join_hash_with_missing_rows_is_discarded() {
     .expect("batch");
 
     let hash = JoinHash::covering([TENANT_FIELD], [TENANT_FIELD, 7], 64);
-    let meta_path = store
-        .write_join_hash(&events(), SnapshotId(1), POLICY, &hash, &[batch])
+    let (_meta_path, shards) = store
+        .write_join_hash(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &hash,
+            &[batch],
+            &field_ids(),
+        )
         .await
         .expect("write");
 
     // Delete the rows, leave the metadata — a crash between the two writes
     // leaves exactly this shape.
-    let rows_path = meta_path.replace(".puffin", ".parquet");
-    file_io.delete(&rows_path).await.expect("delete rows");
+    file_io.delete(&shards[0].0).await.expect("delete rows");
 
     let recovered = store
         .recover(&events(), &[SnapshotId(1)])
@@ -1567,8 +1577,8 @@ async fn a_join_hash_with_missing_rows_is_discarded() {
         "a join hash without its rows must not be registered"
     );
     assert!(
-        recovered.rows.is_empty(),
-        "and no rows should be attached either"
+        recovered.row_files.is_empty(),
+        "and no descriptor should be attached either"
     );
     assert_eq!(
         recovered.discarded.len(),
@@ -1600,8 +1610,15 @@ async fn a_published_join_hash_recovers() {
     .expect("batch");
 
     let hash = JoinHash::covering(keys.clone(), columns.clone(), 64);
-    let meta_path = store
-        .write_join_hash(&events(), SnapshotId(1), POLICY, &hash, &[batch])
+    let (meta_path, _) = store
+        .write_join_hash(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &hash,
+            &[batch],
+            &field_ids(),
+        )
         .await
         .expect("write");
 
@@ -1630,7 +1647,198 @@ async fn a_published_join_hash_recovers() {
     assert_eq!(derived.source.snapshot, SnapshotId(1));
     assert_eq!(derived.policy, POLICY);
     assert!(
-        recovered.rows.contains_key(&id),
-        "rows recovered via manifest"
+        recovered.row_files.contains_key(&id),
+        "row files recovered via manifest"
+    );
+}
+
+/// Sharding buckets rows by join key: every key lands in exactly one
+/// shard, which is what makes each shard complete for its key range.
+#[tokio::test]
+async fn join_hash_shards_bucket_rows_by_key() {
+    use quarry::kinds::JoinHash;
+
+    let fixture = fixture("persist_join_shards");
+    let (_, store) = stacks(&fixture);
+    let store = store.with_join_shard_bytes(512);
+
+    let keys = BTreeSet::from([TENANT_FIELD]);
+    let columns = BTreeSet::from([TENANT_FIELD, 7]);
+
+    let tenants: Vec<i64> = [1i64, 2, 3]
+        .into_iter()
+        .flat_map(|tenant| std::iter::repeat_n(tenant, 200))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(tenants)),
+            Arc::new(StringArray::from(
+                (0..600).map(|i| format!("row {i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("batch");
+
+    let hash = JoinHash::covering(keys, columns, 4096);
+    let (_meta_path, shards) = store
+        .write_join_hash(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &hash,
+            &[batch],
+            &field_ids(),
+        )
+        .await
+        .expect("write");
+    assert!(shards.len() > 1, "a small shard size should shard the rows");
+
+    // No key may be split across shards — that is the invariant a partial
+    // build side would violate.
+    let mut home: HashMap<i64, usize> = HashMap::new();
+    let mut total = 0;
+    for (shard, (path, _)) in shards.iter().enumerate() {
+        let batches = read_vector_rows(store.store(), path)
+            .await
+            .expect("shard rows");
+        for batch in &batches {
+            let tenants = batch
+                .column_by_name("tenant_id")
+                .expect("tenant_id")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64");
+            for row in 0..batch.num_rows() {
+                total += 1;
+                let tenant = tenants.value(row);
+                if let Some(first) = home.insert(tenant, shard) {
+                    assert_eq!(first, shard, "key {tenant} is split across shards");
+                }
+            }
+        }
+    }
+    assert_eq!(total, 600, "every row lands in a shard");
+    assert_eq!(home.len(), 3, "three keys, three homes");
+}
+
+/// A persisted join hash serves a join without holding rows in memory:
+/// the build side streams from its Parquet shards into the hash join.
+#[tokio::test]
+async fn a_persisted_join_hash_serves_a_join_from_files() {
+    use quarry::kinds::JoinHash;
+
+    let fixture = fixture("persist_join_lazy");
+    let (_, store) = stacks(&fixture);
+    let store = store.with_join_shard_bytes(512);
+
+    let keys = BTreeSet::from([TENANT_FIELD]);
+    let columns = BTreeSet::from([TENANT_FIELD]);
+
+    // The build side's stored rows: every event's tenant_id, and only that
+    // column — the schema is a subset of the table's.
+    let stored_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "tenant_id",
+        DataType::Int64,
+        false,
+    )]));
+    let tenants: Vec<i64> = [1i64, 2, 3]
+        .into_iter()
+        .flat_map(|tenant| std::iter::repeat_n(tenant, 200))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&stored_schema),
+        vec![Arc::new(Int64Array::from(tenants))],
+    )
+    .expect("batch");
+
+    let hash = JoinHash::covering(keys.clone(), columns.clone(), 4096);
+    let (_meta_path, shards) = store
+        .write_join_hash(
+            &events(),
+            SnapshotId(1),
+            POLICY,
+            &hash,
+            &[batch],
+            &field_ids(),
+        )
+        .await
+        .expect("write");
+    assert!(shards.len() > 1, "the rows should span several shards");
+
+    // --- Restart: recovery registers a descriptor, not the rows.
+    let recovered = store
+        .recover(&events(), &[SnapshotId(1)])
+        .await
+        .expect("recover");
+    let id = join_hash_id_from(&events(), &keys, &columns);
+    let files = recovered.row_files.get(&id).expect("descriptor").clone();
+    assert_eq!(files.files.len(), shards.len());
+    assert_eq!(files.schema, stored_schema);
+
+    let served = Arc::new(table(&fixture, recovered.registry));
+    served.store_row_files(id.clone(), files);
+    assert!(served.stored(&id).is_none(), "no rows are held in memory");
+
+    // The probe side, in memory: two labels for tenants 1 and 2.
+    let probe = Arc::new(
+        QuarryTable::new(
+            Arc::new(Schema::new(vec![
+                Field::new("tenant_id", DataType::Int64, false),
+                Field::new("label", DataType::Utf8, false),
+            ])),
+            TableId("probe".into()),
+            SnapshotId(1),
+            SnapshotGraph::new()
+                .with(Snapshot::root(SnapshotId(1)).with_clean_file(FileId("p".into()))),
+            BTreeMap::from([
+                ("tenant_id".to_owned(), TENANT_FIELD),
+                ("label".to_owned(), 8),
+            ]),
+        )
+        .with_policy(POLICY)
+        .with_file(
+            FileId("p".into()),
+            vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("tenant_id", DataType::Int64, false),
+                        Field::new("label", DataType::Utf8, false),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1, 2])),
+                        Arc::new(StringArray::from(vec!["one", "two"])),
+                    ],
+                )
+                .expect("probe batch"),
+            ],
+        ),
+    );
+
+    let session = quarry().session();
+    session
+        .register("events", Arc::clone(&served))
+        .expect("register events");
+    session.register("probe", probe).expect("register probe");
+
+    let rows = session
+        .sql(
+            "SELECT p.label, e.tenant_id \
+             FROM events AS e \
+             INNER JOIN probe AS p ON e.tenant_id = p.tenant_id \
+             ORDER BY p.label, e.tenant_id",
+        )
+        .await
+        .expect("query");
+
+    let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 400, "each probe row joins 200 event rows");
+
+    let report = served.last_scan().expect("a scan happened");
+    assert!(report.substituted, "the join hash supplied the rows");
+    assert_eq!(report.used, vec![id.0.clone()]);
+    assert!(
+        report.files_read.is_empty(),
+        "no table files read — the rows streamed from the shards"
     );
 }

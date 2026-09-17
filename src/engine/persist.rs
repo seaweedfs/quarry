@@ -58,8 +58,16 @@
 //! Three segments is all it needs, and that works in either path space.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use datafusion::arrow::array::{RecordBatch, UInt64Array};
+use datafusion::arrow::compute::take;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+use datafusion::scalar::ScalarValue;
 use iceberg::Catalog;
 use iceberg::io::{FileIO, FileRead};
 use iceberg::puffin::{Blob, CompressionCodec, PuffinReader, PuffinWriter};
@@ -73,8 +81,10 @@ use crate::derived::{Derived, DerivedId, FieldId, Filter, Metric, PolicyFingerpr
 use crate::kinds::{Bitmap, FilterSet, Index, JoinHash, TextIndex, VectorIndex};
 use crate::registry::Registry;
 use crate::snapshot::{FileId, SnapshotId, TableId};
-use crate::stable_hash::HASH_VERSION;
+use crate::stable_hash::{HASH_VERSION, StableHasher};
 use crate::workload::{Fingerprint, Seen, Workload};
+
+use super::table::RowFiles;
 
 /// The blob type for an equality index.
 ///
@@ -111,6 +121,21 @@ const FILTER_TEXT_PROPERTY: &str = "quarry.filter";
 const HASH_VERSION_PROPERTY: &str = "quarry.hash-version";
 /// Property carrying the policy the index was built for.
 const POLICY_PROPERTY: &str = "quarry.policy";
+/// Property carrying how many Parquet shards a join hash's rows were
+/// written across. Absent on the earliest blobs, whose single rows file
+/// lives at `{snapshot}.parquet`.
+const SHARDS_PROPERTY: &str = "quarry.shards";
+
+/// The target bytes per join-hash shard when a `Store` writes one.
+///
+/// Rows are bucketed by join key so each shard is a contiguous slice of the
+/// key space; 128 MiB keeps a build of a few gigabytes at tens of files
+/// rather than thousands, each still large enough to read efficiently.
+const JOIN_HASH_SHARD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// An upper bound on shards, so a pathological `shard_bytes` cannot turn a
+/// write into a small-file problem.
+const JOIN_HASH_MAX_SHARDS: u64 = 1024;
 
 /// Where derived state for a table lives.
 ///
@@ -167,12 +192,63 @@ impl Layout {
     /// Where a join hash's rows belong, as Parquet.
     ///
     /// Distinct from [`join_hash_path`](Self::join_hash_path) by extension,
-    /// the same convention as `vector_rows_path`.
+    /// the same convention as `vector_rows_path`. Written only by blobs that
+    /// predate sharding — new writes use [`join_hash_shard_path`](Self::join_hash_shard_path).
     pub fn join_hash_rows_path(&self, table: &TableId, id_hash: u64, at: SnapshotId) -> String {
         format!(
             "{}/{}/jh-{:016x}/{}.parquet",
             self.prefix, table.0, id_hash, at.0
         )
+    }
+
+    /// Where shard `shard` of a join hash's rows belongs, as Parquet.
+    pub fn join_hash_shard_path(
+        &self,
+        table: &TableId,
+        id_hash: u64,
+        at: SnapshotId,
+        shard: u32,
+    ) -> String {
+        format!(
+            "{}/{}/jh-{:016x}/{}.{:04}.parquet",
+            self.prefix, table.0, id_hash, at.0, shard
+        )
+    }
+
+    /// Every rows path a join hash's metadata names: `shards` numbered
+    /// files, or the single pre-sharding path when `None`.
+    pub fn join_hash_rows_paths(
+        &self,
+        table: &TableId,
+        id_hash: u64,
+        at: SnapshotId,
+        shards: Option<u32>,
+    ) -> Vec<String> {
+        match shards {
+            None => vec![self.join_hash_rows_path(table, id_hash, at)],
+            Some(shards) => (0..shards)
+                .map(|shard| self.join_hash_shard_path(table, id_hash, at, shard))
+                .collect(),
+        }
+    }
+
+    /// The `ObjectStoreUrl` a session addresses this layout's store by —
+    /// the prefix's scheme and authority, or the local filesystem when the
+    /// prefix is a bare path.
+    ///
+    /// The `ObjectStoreUrl` is the lookup key for a store registered with
+    /// the session; paths within it are the [`object_path`](crate::from_iceberg::object_path)
+    /// of each location.
+    pub fn object_store_url(&self) -> ObjectStoreUrl {
+        let parsed = match self.prefix.find("://") {
+            // A bare path is a local file.
+            None => Ok(ObjectStoreUrl::local_filesystem()),
+            Some(i) => match self.prefix[i + 3..].find('/') {
+                Some(j) => ObjectStoreUrl::parse(&self.prefix[..i + 3 + j + 1]),
+                None => ObjectStoreUrl::parse(format!("{}/", self.prefix)),
+            },
+        };
+        parsed.unwrap_or_else(|_| ObjectStoreUrl::local_filesystem())
     }
 
     /// Where one filter set belongs — keyed by the filter's hash, not a
@@ -220,6 +296,28 @@ impl Layout {
         crate::from_iceberg::object_path(&self.table_prefix(table))
             .trim_start_matches('/')
             .to_owned()
+    }
+
+    /// The [`RowFiles`] a `write_join_hash` result describes — `files` are
+    /// `(path, size)` in the path space `FileIO` uses; this converts them to
+    /// the space the store addresses.
+    pub fn row_files(&self, files: &[(String, u64)], schema: SchemaRef) -> RowFiles {
+        RowFiles {
+            url: self.object_store_url(),
+            files: files
+                .iter()
+                .map(|(path, size)| (store_path(path), *size))
+                .collect(),
+            schema,
+        }
+    }
+
+    /// The `FileIO` path for an object-space `path` under this table's
+    /// prefix — the inverse of [`object_prefix`](Self::object_prefix), so
+    /// listed objects can be named the way reads and deletes expect.
+    pub fn file_io_path(&self, table: &TableId, object: &str) -> Option<String> {
+        let rel = object.strip_prefix(&self.object_prefix(table))?;
+        Some(format!("{}{rel}", self.table_prefix(table)))
     }
 
     /// Recover `(table, field, snapshot)` from a path this layout produced.
@@ -1129,6 +1227,66 @@ pub async fn read_vector_index(
     Ok(None)
 }
 
+/// The path `store` addresses a `FileIO` location by — the scheme and
+/// authority stripped, any leading slash dropped.
+fn store_path(file_io_path: &str) -> String {
+    crate::from_iceberg::object_path(file_io_path)
+        .trim_start_matches('/')
+        .to_owned()
+}
+
+/// The Arrow schema a Parquet object was written with.
+///
+/// Only the footer is read — a few kilobytes at the file's tail, which
+/// `size` lets the reader seek straight to. `None` for a file that is
+/// missing or does not read as Parquet, which for derived rows means the
+/// state they belong to cannot serve.
+async fn parquet_schema(store: &Arc<dyn ObjectStore>, path: &str, size: u64) -> Option<SchemaRef> {
+    let mut reader =
+        ParquetObjectReader::new(Arc::clone(store), ObjectPath::from(path)).with_file_size(size);
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default())
+        .await
+        .ok()?;
+    Some(Arc::clone(metadata.schema()))
+}
+
+/// The [`RowFiles`] descriptor for a piece of derived state's persisted
+/// rows.
+///
+/// Every path is `head`ed — a missing one is a hard failure, since a
+/// substitute holding partial rows would answer wrongly. The first file's
+/// footer supplies the schema the rows were written with; the footer read
+/// doubles as a check that the file is Parquet at all.
+///
+/// `None` when any file is missing or unreadable — the caller discards the
+/// state rather than registering a substitute with nothing to serve.
+async fn parquet_row_files(
+    store: &Arc<dyn ObjectStore>,
+    layout: &Layout,
+    rows_paths: &[String],
+) -> Option<(RowFiles, u64)> {
+    let mut files = Vec::with_capacity(rows_paths.len());
+    let mut schema = None;
+    let mut total = 0;
+    for path in rows_paths {
+        let object = store_path(path);
+        let meta = store.head(&ObjectPath::from(object.as_str())).await.ok()?;
+        if schema.is_none() {
+            schema = parquet_schema(store, &object, meta.size).await;
+        }
+        total += meta.size;
+        files.push((object, meta.size));
+    }
+    Some((
+        RowFiles {
+            url: layout.object_store_url(),
+            files,
+            schema: schema?,
+        },
+        total,
+    ))
+}
+
 /// Read the Parquet rows a vector index stored, as `RecordBatch`es.
 ///
 /// Called after [`read_vector_index`] locates the rows path. Returns `None`
@@ -1149,19 +1307,116 @@ pub async fn read_vector_rows(
     stream.try_collect().await.ok()
 }
 
-/// Write a join hash: the rows as Parquet, then the metadata as a Puffin
-/// blob beside them.
+/// How many shards `bytes` of rows should be written across.
 ///
-/// Same contract as [`write_vector_index`]: the Parquet file is the bulk of
-/// the index — the build-side rows the kind substitutes for the scan. The
-/// Puffin blob carries only the join keys and covered columns recovery
-/// needs to reconstruct the kind, plus the policy and hash version.
+/// One shard per `shard_bytes`, bounded below by one and above by
+/// [`JOIN_HASH_MAX_SHARDS`].
+fn join_shard_count(bytes: u64, shard_bytes: u64) -> u32 {
+    (bytes.div_ceil(shard_bytes.max(1))).clamp(1, JOIN_HASH_MAX_SHARDS) as u32
+}
+
+/// Split `rows` into `shards` buckets by join key.
+///
+/// Every row lands in exactly one bucket — the key columns' values hashed
+/// with [`StableHasher`], the same hash the blob's `quarry.hash-version`
+/// stamps. The bucket boundaries are a partition of the key space, which is
+/// what makes a shard independently servable: it holds every stored row
+/// whose key falls in its range.
+fn shard_rows(
+    hash: &JoinHash,
+    rows: &[RecordBatch],
+    field_ids: &BTreeMap<String, FieldId>,
+    shards: u32,
+) -> iceberg::Result<Vec<Vec<RecordBatch>>> {
+    let (keys, _) = hash.covers();
+    let Some(schema) = rows.first().map(|b| b.schema()) else {
+        return Ok(Vec::new());
+    };
+    // The batch columns that are join keys, in column order.
+    let key_positions: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| field_ids.get(f.name()).is_some_and(|id| keys.contains(id)))
+        .map(|(i, _)| i)
+        .collect();
+    if key_positions.len() != keys.len() {
+        return Err(iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!(
+                "join hash covers {} keys but the rows hold {}",
+                keys.len(),
+                key_positions.len()
+            ),
+        ));
+    }
+
+    let mut out: Vec<Vec<RecordBatch>> = vec![Vec::new(); shards as usize];
+    for batch in rows {
+        // Bucket each row once, then take its columns per shard.
+        let mut bucket_rows: Vec<Vec<u64>> = vec![Vec::new(); shards as usize];
+        for row in 0..batch.num_rows() {
+            let mut hasher = StableHasher::new();
+            for &position in &key_positions {
+                let value =
+                    ScalarValue::try_from_array(batch.column(position), row).map_err(|e| {
+                        iceberg::Error::new(
+                            iceberg::ErrorKind::Unexpected,
+                            format!("cannot read join key at row {row}: {e}"),
+                        )
+                    })?;
+                value.hash(&mut hasher);
+            }
+            bucket_rows[(hasher.finish() % shards as u64) as usize].push(row as u64);
+        }
+        for (shard, rows) in bucket_rows.into_iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let indices = UInt64Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column, &indices, None))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        format!("cannot take shard rows: {e}"),
+                    )
+                })?;
+            out[shard].push(
+                RecordBatch::try_new(Arc::clone(&batch.schema()), columns).map_err(|e| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        format!("cannot build shard batch: {e}"),
+                    )
+                })?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Write a join hash: the rows as Parquet shards, then the metadata as a
+/// Puffin blob beside them.
+///
+/// Same contract as [`write_vector_index`]: the Parquet files are the bulk
+/// of the index — the build-side rows the kind substitutes for the scan.
+/// The Puffin blob carries the join keys and covered columns recovery needs
+/// to reconstruct the kind, the policy and hash version, and the shard
+/// count the rows were written across.
+///
+/// Rows are bucketed by join-key hash into `shard_bytes`-sized shards, so a
+/// large build side is a set of files read in parallel rather than one
+/// object — and each shard holds every stored row of a key range, which is
+/// what keeps a missing shard a hard failure rather than a partial answer.
 ///
 /// The path key is the same stable hash [`super::build::join_hash_id_from`]
 /// computes, so the blob lands where recovery and `reclaim` look for it.
 ///
-/// Returns the Puffin metadata path; the rows path is derived from it by
-/// swapping `.puffin` for `.parquet`.
+/// Returns the Puffin metadata path and each written shard's `(path, size)`.
+#[allow(clippy::too_many_arguments)]
 pub async fn write_join_hash(
     file_io: &FileIO,
     layout: &Layout,
@@ -1169,8 +1424,10 @@ pub async fn write_join_hash(
     at: SnapshotId,
     policy: PolicyFingerprint,
     hash: &JoinHash,
-    rows: &[datafusion::arrow::record_batch::RecordBatch],
-) -> iceberg::Result<String> {
+    rows: &[RecordBatch],
+    field_ids: &BTreeMap<String, FieldId>,
+    shard_bytes: u64,
+) -> iceberg::Result<(String, Vec<(String, u64)>)> {
     let (keys, columns) = hash.covers();
     let id = super::build::join_hash_id_from(table, keys, columns);
     let id_hash = parse_join_hash_id(&id).ok_or_else(|| {
@@ -1179,11 +1436,8 @@ pub async fn write_join_hash(
             format!("join hash id {id:?} does not carry a hash"),
         )
     })?;
-    let rows_path = layout.join_hash_rows_path(table, id_hash, at);
     let meta_path = layout.join_hash_path(table, id_hash, at);
 
-    // Parquet rows first; the Puffin metadata is the registry entry, and a
-    // recovered metadata blob whose rows are absent is discarded.
     let schema = rows
         .first()
         .ok_or_else(|| {
@@ -1193,16 +1447,32 @@ pub async fn write_join_hash(
             )
         })?
         .schema();
-    let mut buffer = Vec::new();
-    let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)?;
-    for batch in rows {
-        writer.write(batch)?;
+    let total: u64 = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+    let shards = join_shard_count(total, shard_bytes);
+    let sharded = shard_rows(hash, rows, field_ids, shards)?;
+
+    // Parquet shards first; the Puffin metadata is the registry entry, and
+    // a recovered metadata blob whose rows are absent is discarded.
+    let mut written = Vec::with_capacity(shards as usize);
+    for (shard, batches) in sharded.into_iter().enumerate() {
+        let path = layout.join_hash_shard_path(table, id_hash, at, shard as u32);
+        let mut buffer = Vec::new();
+        let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(
+            &mut buffer,
+            Arc::clone(&schema),
+            None,
+        )?;
+        for batch in &batches {
+            writer.write(batch)?;
+        }
+        writer.close()?;
+        let size = buffer.len() as u64;
+        file_io
+            .new_output(&path)?
+            .write(bytes::Bytes::from(buffer))
+            .await?;
+        written.push((path, size));
     }
-    writer.close()?;
-    file_io
-        .new_output(&rows_path)?
-        .write(bytes::Bytes::from(buffer))
-        .await?;
 
     let output = file_io.new_output(&meta_path)?;
     let mut writer = PuffinWriter::new(&output, HashMap::new(), false).await?;
@@ -1217,20 +1487,22 @@ pub async fn write_join_hash(
                 .properties(HashMap::from([
                     (HASH_VERSION_PROPERTY.to_owned(), HASH_VERSION.to_string()),
                     (POLICY_PROPERTY.to_owned(), policy.0.to_string()),
+                    (SHARDS_PROPERTY.to_owned(), shards.to_string()),
                 ]))
                 .build(),
             CompressionCodec::None,
         )
         .await?;
     writer.close().await?;
-    Ok(meta_path)
+    Ok((meta_path, written))
 }
 
 /// Read a join hash's metadata blob, returning the keys, columns, policy,
-/// and the path to its Parquet rows.
+/// and the paths to its Parquet rows.
 ///
-/// `None` for wrong type, wrong hash version, missing policy, or bytes that
-/// do not decode exactly — same discipline as every other kind.
+/// `None` for wrong type, wrong hash version, missing policy, a shard count
+/// that does not parse, or bytes that do not decode exactly — same
+/// discipline as every other kind.
 pub async fn read_join_hash(
     file_io: &FileIO,
     path: &str,
@@ -1239,7 +1511,7 @@ pub async fn read_join_hash(
         BTreeSet<FieldId>,
         BTreeSet<FieldId>,
         PolicyFingerprint,
-        String,
+        Vec<String>,
     )>,
 > {
     if !is_plausible_puffin(file_io, path).await? {
@@ -1270,11 +1542,26 @@ pub async fn read_join_hash(
         let Some((keys, columns)) = decode_join_hash(blob.data()) else {
             continue;
         };
-        let rows_path = path.strip_suffix(".puffin").map(|p| format!("{p}.parquet"));
-        let Some(rows_path) = rows_path else {
+        let Some(stem) = path.strip_suffix(".puffin") else {
             continue;
         };
-        return Ok(Some((keys, columns, policy, rows_path)));
+        // The shard count the writer recorded; absent means the blob
+        // predates sharding and its single rows file sits at `{snap}.parquet`.
+        let rows_paths = match properties.get(SHARDS_PROPERTY) {
+            None => vec![format!("{stem}.parquet")],
+            Some(raw) => {
+                let Ok(shards) = raw.parse::<u32>() else {
+                    continue;
+                };
+                if shards == 0 {
+                    continue;
+                }
+                (0..shards)
+                    .map(|shard| format!("{stem}.{shard:04}.parquet"))
+                    .collect()
+            }
+        };
+        return Ok(Some((keys, columns, policy, rows_paths)));
     }
     Ok(None)
 }
@@ -1489,14 +1776,14 @@ pub struct Recovered {
     pub registry: Registry,
     /// What each recovered piece indexes, so the optimizer can refresh it.
     pub fields: std::collections::BTreeMap<DerivedId, FieldId>,
-    /// Stored rows for substituting kinds, keyed by their derived id.
+    /// Where a substituting kind's rows live, keyed by derived id.
     ///
-    /// A vector index is metadata plus rows; the rows are recovered here so
-    /// the caller can `QuarryTable::store_rows` them before the index serves.
-    /// Kinds that need no rows (equality, bitmap, text, filter set) leave
-    /// this empty.
-    pub rows:
-        std::collections::BTreeMap<DerivedId, Vec<datafusion::arrow::record_batch::RecordBatch>>,
+    /// The rows stay on the store: the descriptor names the files and the
+    /// schema they were written with, so the caller can
+    /// `QuarryTable::store_row_files` and let the substitute stream them
+    /// rather than paying recovery for rows it may never read. Kinds that
+    /// need no rows (equality, bitmap, text, filter set) leave this empty.
+    pub row_files: BTreeMap<DerivedId, RowFiles>,
     /// Objects that are ours but unusable, and should be deleted.
     ///
     /// A stale hash version, a superseded snapshot, or corrupt bytes. Not an
@@ -1519,7 +1806,18 @@ pub async fn recover(
 ) -> iceberg::Result<Recovered> {
     let mut recovered = Recovered::default();
 
+    // `.puffin` paths that registered, in object-store space, and `.parquet`
+    // payloads seen along the way. A rows file whose metadata blob did not
+    // register is an orphan — a crash between the two writes, or a blob
+    // removed by other means — and is discarded at the end.
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    let mut stray_rows: Vec<String> = Vec::new();
+
     for path in list_paths(store, &layout.object_prefix(table)).await {
+        if path.ends_with(".parquet") {
+            stray_rows.push(path);
+            continue;
+        }
         // Two path shapes: a field id names an index or bitmap, an
         // `fset-<hash>` segment names a filter set.
         if let Some((found_table, field, at)) = layout.parse(&path) {
@@ -1573,6 +1871,7 @@ pub async fn recover(
                 Some((kind, bytes, policy)) => {
                     let id = super::index_id(table, field);
                     recovered.fields.insert(id.clone(), field);
+                    kept.insert(store_path(&readable));
                     recovered.registry.register(Derived::new(
                         id,
                         Source {
@@ -1586,15 +1885,18 @@ pub async fn recover(
                 }
                 None => match read_vector_index(file_io, &readable).await? {
                     Some((field, metric, dimension, policy, rows_path)) => {
-                        let Some(rows) = read_vector_rows(store, &rows_path).await else {
+                        let Some((files, bytes)) =
+                            parquet_row_files(store, layout, std::slice::from_ref(&rows_path))
+                                .await
+                        else {
                             recovered.discarded.push(readable);
                             recovered.discarded.push(rows_path);
                             continue;
                         };
-                        let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
                         let id = super::index_id(table, field);
                         recovered.fields.insert(id.clone(), field);
-                        recovered.rows.insert(id.clone(), rows);
+                        recovered.row_files.insert(id.clone(), files);
+                        kept.insert(store_path(&readable));
                         recovered.registry.register(Derived::new(
                             id,
                             Source {
@@ -1622,6 +1924,7 @@ pub async fn recover(
                 Some((set, policy)) => {
                     let bytes = set.bytes_estimate();
                     let id = super::filter_set_id(table, set.filter());
+                    kept.insert(store_path(&readable));
                     recovered.registry.register(Derived::new(
                         id,
                         Source {
@@ -1640,39 +1943,64 @@ pub async fn recover(
                 continue;
             }
             let readable = layout.join_hash_path(table, id_hash, at);
-            let rows_path = layout.join_hash_rows_path(table, id_hash, at);
             if !known_snapshots.contains(&at) {
+                // The row files need no naming: the sweep below discards any
+                // `.parquet` whose `.puffin` was not registered.
                 recovered.discarded.push(readable);
-                recovered.discarded.push(rows_path);
                 continue;
             }
             match read_join_hash(file_io, &readable).await? {
-                Some((keys, columns, policy, _rows_path)) => {
-                    let Some(rows) = read_vector_rows(store, &rows_path).await else {
-                        recovered.discarded.push(readable);
-                        recovered.discarded.push(rows_path);
-                        continue;
-                    };
-                    let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+                Some((keys, columns, policy, rows_paths)) => {
                     let id = super::join_hash_id_from(table, &keys, &columns);
-                    recovered.rows.insert(id.clone(), rows);
-                    recovered.registry.register(Derived::new(
-                        id,
-                        Source {
-                            table: table.clone(),
-                            snapshot: at,
-                        },
-                        policy,
-                        bytes,
-                        Box::new(JoinHash::covering(keys, columns, bytes)),
-                    ));
+                    match parquet_row_files(store, layout, &rows_paths).await {
+                        Some((files, bytes)) => {
+                            recovered.row_files.insert(id.clone(), files);
+                            kept.insert(store_path(&readable));
+                            recovered.registry.register(Derived::new(
+                                id,
+                                Source {
+                                    table: table.clone(),
+                                    snapshot: at,
+                                },
+                                policy,
+                                bytes,
+                                Box::new(JoinHash::covering(keys, columns, bytes)),
+                            ));
+                        }
+                        // A shard missing or unreadable is a hard failure:
+                        // partial rows would answer joins wrongly.
+                        None => {
+                            recovered.discarded.push(readable);
+                            recovered.discarded.extend(rows_paths);
+                        }
+                    }
                 }
-                None => {
-                    recovered.discarded.push(readable);
-                    recovered.discarded.push(rows_path);
-                }
+                None => recovered.discarded.push(readable),
             }
         }
+    }
+
+    // Orphan sweep: a `.parquet` under the prefix is a rows payload for the
+    // `.puffin` of the same stem (`{snap}.parquet`, or `{snap}.{i}.parquet`
+    // for a shard). One whose blob did not register is dropped — it could
+    // only ever be read through that blob.
+    for path in stray_rows {
+        let Some(stem) = path.strip_suffix(".parquet") else {
+            continue;
+        };
+        let Some((dir, name)) = stem.rsplit_once('/') else {
+            continue;
+        };
+        let Some(snap) = name.split('.').next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if kept.contains(&format!("{dir}/{snap}.puffin")) {
+            continue;
+        }
+        let Some(file_io_path) = layout.file_io_path(table, &path) else {
+            continue;
+        };
+        recovered.discarded.push(file_io_path);
     }
     Ok(recovered)
 }
@@ -1841,6 +2169,7 @@ pub struct Store {
     file_io: Arc<FileIO>,
     store: Arc<dyn ObjectStore>,
     layout: Layout,
+    join_shard_bytes: u64,
 }
 
 impl Store {
@@ -1853,7 +2182,15 @@ impl Store {
             file_io,
             store,
             layout,
+            join_shard_bytes: JOIN_HASH_SHARD_BYTES,
         }
+    }
+
+    /// Size join-hash shards at `bytes` — mostly for tests; the default
+    /// targets 128 MiB per shard.
+    pub fn with_join_shard_bytes(mut self, bytes: u64) -> Self {
+        self.join_shard_bytes = bytes;
+        self
     }
 
     /// The layout in use.
@@ -1925,10 +2262,13 @@ impl Store {
         write_vector_index(&self.file_io, &self.layout, table, at, policy, vector, rows).await
     }
 
-    /// Write a join hash down: rows as Parquet, metadata as a Puffin blob.
+    /// Write a join hash down: rows as Parquet shards, metadata as a Puffin
+    /// blob.
     ///
     /// The path key is derived from the join shape the hash covers, so the
-    /// blob lands where recovery and `reclaim` look for it.
+    /// blob lands where recovery and `reclaim` look for it. Returns the
+    /// metadata path and each shard's `(path, size)` — the caller can hand
+    /// them to `QuarryTable::store_row_files` and drop the in-memory copy.
     pub async fn write_join_hash(
         &self,
         table: &TableId,
@@ -1936,8 +2276,20 @@ impl Store {
         policy: PolicyFingerprint,
         hash: &JoinHash,
         rows: &[datafusion::arrow::record_batch::RecordBatch],
-    ) -> iceberg::Result<String> {
-        write_join_hash(&self.file_io, &self.layout, table, at, policy, hash, rows).await
+        field_ids: &BTreeMap<String, FieldId>,
+    ) -> iceberg::Result<(String, Vec<(String, u64)>)> {
+        write_join_hash(
+            &self.file_io,
+            &self.layout,
+            table,
+            at,
+            policy,
+            hash,
+            rows,
+            field_ids,
+            self.join_shard_bytes,
+        )
+        .await
     }
 
     /// Rebuild a table's registry from storage.
@@ -2044,33 +2396,29 @@ impl Store {
             }
             if entry.kind == QUARRY_JOIN_HASH_V1 {
                 match read_join_hash(&self.file_io, &entry.path).await? {
-                    Some((keys, columns, policy, _rows_path)) => {
-                        let rows_path = entry
-                            .path
-                            .strip_suffix(".puffin")
-                            .map(|p| format!("{p}.parquet"));
-                        let Some(rows_path) = rows_path else {
-                            recovered.discarded.push(entry.path);
-                            continue;
-                        };
-                        let Some(rows) = read_vector_rows(&self.store, &rows_path).await else {
-                            recovered.discarded.push(entry.path);
-                            recovered.discarded.push(rows_path);
-                            continue;
-                        };
-                        let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+                    Some((keys, columns, policy, rows_paths)) => {
                         let id = super::join_hash_id_from(table, &keys, &columns);
-                        recovered.rows.insert(id.clone(), rows);
-                        recovered.registry.register(Derived::new(
-                            id,
-                            Source {
-                                table: table.clone(),
-                                snapshot: at,
-                            },
-                            policy,
-                            bytes,
-                            Box::new(JoinHash::covering(keys, columns, bytes)),
-                        ));
+                        match parquet_row_files(&self.store, &self.layout, &rows_paths).await {
+                            Some((files, bytes)) => {
+                                recovered.row_files.insert(id.clone(), files);
+                                recovered.registry.register(Derived::new(
+                                    id,
+                                    Source {
+                                        table: table.clone(),
+                                        snapshot: at,
+                                    },
+                                    policy,
+                                    bytes,
+                                    Box::new(JoinHash::covering(keys, columns, bytes)),
+                                ));
+                            }
+                            // A shard missing or unreadable is a hard
+                            // failure: partial rows would answer wrongly.
+                            None => {
+                                recovered.discarded.push(entry.path);
+                                recovered.discarded.extend(rows_paths);
+                            }
+                        }
                     }
                     None => recovered.discarded.push(entry.path),
                 }
@@ -2092,15 +2440,20 @@ impl Store {
             if entry.kind == QUARRY_VECTOR_INDEX_V1 {
                 match read_vector_index(&self.file_io, &entry.path).await? {
                     Some((field, metric, dimension, policy, rows_path)) => {
-                        let Some(rows) = read_vector_rows(&self.store, &rows_path).await else {
+                        let Some((files, bytes)) = parquet_row_files(
+                            &self.store,
+                            &self.layout,
+                            std::slice::from_ref(&rows_path),
+                        )
+                        .await
+                        else {
                             recovered.discarded.push(entry.path);
                             recovered.discarded.push(rows_path);
                             continue;
                         };
-                        let bytes = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
                         let id = super::index_id(table, field);
                         recovered.fields.insert(id.clone(), field);
-                        recovered.rows.insert(id.clone(), rows);
+                        recovered.row_files.insert(id.clone(), files);
                         recovered.registry.register(Derived::new(
                             id,
                             Source {
@@ -2189,8 +2542,15 @@ impl Store {
             if let Some(field) = r.field {
                 paths.push(self.layout.index_path(table, field, r.at));
             } else if let Some(id_hash) = parse_join_hash_id(&r.id) {
-                paths.push(self.layout.join_hash_path(table, id_hash, r.at));
-                paths.push(self.layout.join_hash_rows_path(table, id_hash, r.at));
+                let meta = self.layout.join_hash_path(table, id_hash, r.at);
+                paths.push(meta.clone());
+                // The shard count lives in the blob. An unreadable one still
+                // has the pre-sharding rows path to try; numbered shards it
+                // cannot name become orphans the next `recover` sweeps.
+                match read_join_hash(&self.file_io, &meta).await? {
+                    Some((_, _, _, rows_paths)) => paths.extend(rows_paths),
+                    None => paths.push(self.layout.join_hash_rows_path(table, id_hash, r.at)),
+                }
             }
         }
         discard(&self.file_io, &paths).await

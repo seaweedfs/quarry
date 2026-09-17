@@ -1,24 +1,24 @@
-//! A join hash: the build-side rows of a join, sorted by the join key and held
-//! in memory so a hash join reads them locally instead of from object storage.
+//! A join hash: the build-side rows of a join, persisted beside the table so
+//! a hash join streams them from local storage instead of object storage.
 //!
 //! DataFusion's `HashJoinExec` keeps its built hash table private, so the
 //! hash table is rebuilt on every query. What *is* persistable and reusable
-//! is the build-side relation itself — and sorting it by the join key at
-//! build time is a pre-computation that costs nothing per query and enables
-//! alternative join strategies (sort-merge, index nested loops) should the
-//! probe side also be sorted.
+//! is the build-side relation itself — and bucketing it by join key at
+//! write time is a pre-computation that costs nothing per query: each
+//! Parquet shard holds a contiguous slice of the key space, read in
+//! parallel with the rest.
 //!
 //! The win is I/O, not computation: the rows are local where the table's
 //! Parquet objects are remote. The hash table build is O(rows in the build
 //! side), which for the typical small-dimension-table build side is negligible
 //! beside the I/O it saves.
 //!
-//! Like [`VectorIndex`](super::VectorIndex), the rows live in the table's
-//! materialized store (through `QuarryTable::store_rows`); this kind only
-//! says which joins may use them. Also like the vector index, it declares
-//! itself non-unionable: the sorted rows cannot simply be concatenated with
-//! appended rows because the sort order would be wrong, and a re-sort is a
-//! rebuild.
+//! The rows live either in the table's materialized store (through
+//! `QuarryTable::store_rows`) or, once persisted, as `RowFiles` the join
+//! streams lazily; this kind only says which joins may use them. It declares
+//! itself non-unionable: stored rows hold the build side of a whole
+//! snapshot, so an appended-to table is rejected by name rather than served
+//! a build side missing the new files' rows.
 
 use std::collections::BTreeSet;
 
@@ -26,7 +26,7 @@ use crate::cost::{Cost, PriceTable};
 use crate::derived::{FieldId, Kind, Query, Refreshed, Rewrite};
 use crate::snapshot::Diff;
 
-/// The build-side rows of a join, sorted by the join key.
+/// The build-side rows of a join, bucketed by join key when persisted.
 #[derive(Debug)]
 pub struct JoinHash {
     /// The join key fields on the build side.
@@ -67,7 +67,7 @@ impl Kind for JoinHash {
     /// projected columns are a subset of what the stored rows cover.
     ///
     /// The join keys must match exactly — a different key set is a different
-    /// join shape, and the stored rows were sorted for this one. The projected
+    /// join shape, and the stored rows were bucketed for this one. The projected
     /// columns must be covered, or the substituted rows would lack a column
     /// the plan references.
     fn matches(&self, query: &Query) -> Option<Rewrite> {
@@ -81,9 +81,10 @@ impl Kind for JoinHash {
             return None;
         }
         Some(Rewrite::Substitute {
-            // The sorted rows cannot be unioned with appended rows without
-            // re-sorting, which is a rebuild. Declaring non-unionable makes
-            // the rule reject an appended-to table by name (Reason::
+            // The stored rows are a complete build side for their snapshot;
+            // they cannot be unioned with appended rows without missing the
+            // new files' rows entirely. Declaring non-unionable makes the
+            // rule reject an appended-to table by name (Reason::
             // ResidualNotUnionable) rather than the serve path declining
             // quietly.
             unionable: false,

@@ -62,5 +62,7 @@ pub use persist::{
 };
 pub use quarry::{Quarry, Session};
 pub use store::{BudgetExceeded, MeteredStore, StoreStats};
-pub use table::{QuarryTable, ScanReport, SharedRegistry, hash_scalar, shared};
+pub use table::{
+    QuarryTable, RowFiles, ScanReport, SharedRegistry, Staleness, hash_scalar, shared,
+};
 pub use text::terms;

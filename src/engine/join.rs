@@ -35,17 +35,18 @@
 //!
 //! # What an append does
 //!
-//! The stored rows are sorted by the join key, so they cannot simply be
-//! concatenated with appended rows — the sort order would be wrong.
-//! [`JoinHash`](crate::kinds::JoinHash) therefore declares itself
-//! non-unionable, so the rule rejects an appended-to table by name and the
-//! query reads the table — correct, and slower until the optimizer's
-//! refresh step rebuilds the hash.
+//! The stored rows are a complete build side for their snapshot — they
+//! cannot be unioned with appended rows without missing the new files'
+//! rows entirely. [`JoinHash`](crate::kinds::JoinHash) therefore declares
+//! itself non-unionable, so the rule rejects an appended-to table by name
+//! and the query reads the table — correct, and slower until the
+//! optimizer's refresh step rebuilds the hash.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{DefaultTableSource, MemTable, provider_as_source};
 use datafusion::error::Result as DfResult;
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, TableScan};
@@ -53,12 +54,16 @@ use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, TableScan};
 use crate::derived::{Decision, DerivedId, FieldId, Query, Rewrite};
 use crate::workload::JoinAsk;
 
-use super::{QuarryTable, ScanReport};
+use super::{QuarryTable, ScanReport, Staleness};
 
 /// What a join subtree asks of the table at its build side.
 pub(crate) struct Ask<'a> {
     /// The build-side table.
     pub table: &'a QuarryTable,
+    /// The scan the ask was read from — matched by identity at swap time so
+    /// a second scan of the same table elsewhere in the plan is not
+    /// mistaken for the build side.
+    pub scan: &'a TableScan,
     /// The join key fields on the build side.
     pub keys: BTreeSet<FieldId>,
     /// All columns the join reads from the build side: join keys plus
@@ -72,12 +77,29 @@ pub(crate) struct Ask<'a> {
 /// `QuarryTable`. Only inner and left joins are recognised: a right or full
 /// join makes the *right* side the build side in DataFusion's physical plan,
 /// and a cross join has no keys to hash on.
+///
+/// The columns a hash must cover are computed against `plan` itself rather
+/// than the scan's `projection` — at logical-plan time the projection is
+/// un-narrowed, so "everything above the scan" is where the real need is.
 pub(crate) fn first_ask(plan: &LogicalPlan) -> Option<Ask<'_>> {
-    ask_of(plan).or_else(|| plan.inputs().iter().find_map(|input| first_ask(input)))
+    ask_of(plan, plan).or_else(|| {
+        plan.inputs()
+            .iter()
+            .find_map(|input| first_ask_at(input, plan))
+    })
+}
+
+/// [`first_ask`] at a subtree, keeping `root` for the reference walk.
+fn first_ask_at<'a>(plan: &'a LogicalPlan, root: &LogicalPlan) -> Option<Ask<'a>> {
+    ask_of(plan, root).or_else(|| {
+        plan.inputs()
+            .iter()
+            .find_map(|input| first_ask_at(input, root))
+    })
 }
 
 /// The join ask at `plan`, if it is a `Join` this rewrite can serve.
-fn ask_of(plan: &LogicalPlan) -> Option<Ask<'_>> {
+fn ask_of<'a>(plan: &'a LogicalPlan, root: &LogicalPlan) -> Option<Ask<'a>> {
     let LogicalPlan::Join(join) = plan else {
         return None;
     };
@@ -115,37 +137,76 @@ fn ask_of(plan: &LogicalPlan) -> Option<Ask<'_>> {
     if on_keys.len() != join.on.len() {
         return None;
     }
-    // All columns the join reads from the build side: the scan's projected
-    // columns, which DataFusion has already narrowed to what the join needs.
-    let table_schema = datafusion::catalog::TableProvider::schema(table);
-    let columns: BTreeSet<FieldId> = scan
-        .projection
-        .as_ref()
-        .map(|proj| {
-            proj.iter()
-                .filter_map(|&i| {
-                    let name = table_schema.field(i).name();
-                    table.field_id_of(name)
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            // No projection: all columns.
-            table_schema
-                .fields()
-                .iter()
-                .filter_map(|f| table.field_id_of(f.name()))
-                .collect()
-        });
-    // The keys must be among the columns.
-    if !keys.is_subset(&columns) {
-        return None;
-    }
+    // All columns the plan reads from the build side: join keys, the scan's
+    // own filters, and whatever the nodes above reference through the scan's
+    // qualifiers. The scan's `projection` is no help — it is un-narrowed at
+    // this stage — so the whole plan is walked instead.
+    let qualifiers = qualifiers(&join.left);
+    let mut columns = referenced_fields(root, &qualifiers, table);
+    columns.extend(keys.iter().copied());
     Some(Ask {
         table,
+        scan,
         keys,
         columns,
     })
+}
+
+/// The names a scan answers to: the aliases wrapping it and its own table
+/// name, collected on the descent from `plan`.
+fn qualifiers(plan: &LogicalPlan) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    fn walk(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+        match plan {
+            LogicalPlan::SubqueryAlias(alias) => {
+                out.insert(alias.alias.to_string());
+                walk(&alias.input, out);
+            }
+            LogicalPlan::Projection(projection) => walk(&projection.input, out),
+            LogicalPlan::TableScan(scan) => {
+                out.insert(scan.table_name.to_string());
+            }
+            _ => {}
+        }
+    }
+    walk(plan, &mut out);
+    out
+}
+
+/// Every field of `table` that a column expression in `plan` refers to.
+///
+/// A qualified column attributes to this table when its relation names one
+/// of `qualifiers`; an unqualified one when its name is a field — the plan
+/// already analysed, so a bare name can only have meant one column, and
+/// guessing more than needed is safe: it demands coverage, it cannot
+/// produce a wrong answer.
+fn referenced_fields(
+    plan: &LogicalPlan,
+    qualifiers: &BTreeSet<String>,
+    table: &QuarryTable,
+) -> BTreeSet<FieldId> {
+    let mut fields = BTreeSet::new();
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        for expr in node.expressions() {
+            let _ = expr.apply(|e| {
+                if let Expr::Column(col) = e {
+                    let ours = match &col.relation {
+                        Some(relation) => qualifiers.contains(&relation.to_string()),
+                        None => table.field_id_of(col.name()).is_some(),
+                    };
+                    if ours {
+                        if let Some(field) = table.field_id_of(col.name()) {
+                            fields.insert(field);
+                        }
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+        }
+        stack.extend(node.inputs());
+    }
+    fields
 }
 
 /// The `TableScan` at `plan`, descending through row-preserving nodes that
@@ -157,6 +218,19 @@ fn table_scan(plan: &LogicalPlan) -> Option<&TableScan> {
         LogicalPlan::Projection(projection) => table_scan(&projection.input),
         _ => None,
     }
+}
+
+/// Whether two scans are the same node seen through a clone.
+///
+/// `TableScan` has no `PartialEq`, so the comparison is by hand: the source
+/// `Arc` is shared across the clone `transform_up` walks, and the rest of
+/// the fields are compared by value.
+fn same_scan(a: &TableScan, b: &TableScan) -> bool {
+    Arc::ptr_eq(&a.source, &b.source)
+        && a.table_name == b.table_name
+        && a.projection == b.projection
+        && a.filters == b.filters
+        && a.fetch == b.fetch
 }
 
 /// The [`QuarryTable`] a scan reads, if it reads one.
@@ -232,11 +306,14 @@ pub(crate) fn rewrite(
 ) -> DfResult<(LogicalPlan, Option<DerivedId>)> {
     // Recognised at the `Join`, but rewritten at the leaf — so the shape is
     // checked once and then the source is swapped where it lives.
-    let Some(source) = first_ask(plan).and_then(|ask| stored_source(&ask, approximate, stale))
-    else {
+    let Some(ask) = first_ask(plan) else {
         return Ok((plan.clone(), None));
     };
-    let (source, id) = source;
+    let Some(source) = stored_source(&ask, approximate, stale) else {
+        return Ok((plan.clone(), None));
+    };
+    let (source, id, stored_schema, report) = source;
+    let table_schema = datafusion::catalog::TableProvider::schema(ask.table);
 
     let mut swapped = false;
     let rewritten = plan
@@ -245,68 +322,130 @@ pub(crate) fn rewrite(
             let LogicalPlan::TableScan(scan) = &node else {
                 return Ok(Transformed::no(node));
             };
-            if swapped || quarry_table(scan).is_none() {
+            // The ask's own scan, matched by structural identity — the source
+            // `Arc` survives the clone that `transform_up` walks, and a
+            // second scan of the same table elsewhere in the plan differs in
+            // name, projection, filters, or fetch.
+            if swapped || !same_scan(scan, ask.scan) {
                 return Ok(Transformed::no(node));
             }
-            // Every field but the source, so the projection, the pushed
-            // filters, and above all the projected schema are the scan's own.
-            let replaced = TableScan {
-                source: Arc::clone(&source),
-                ..scan.clone()
+            // The scan's projection indexes the table's schema; the stored
+            // rows may hold only the covered columns. Remap by name — a
+            // projected column the hash does not cover means it cannot serve
+            // after all, and the scan is left alone.
+            let projection = match &scan.projection {
+                Some(indices) => {
+                    let mut mapped = Vec::with_capacity(indices.len());
+                    for &index in indices {
+                        let Ok(position) = stored_schema.index_of(table_schema.field(index).name())
+                        else {
+                            return Ok(Transformed::no(node));
+                        };
+                        mapped.push(position);
+                    }
+                    Some(mapped)
+                }
+                None => None,
+            };
+            // `try_new` recomputes the projected schema against the
+            // substitute's; every other field stays the scan's own — the
+            // pushed filters and the fetch included.
+            let Ok(replaced) = TableScan::try_new(
+                scan.table_name.clone(),
+                Arc::clone(&source),
+                projection,
+                scan.filters.clone(),
+                scan.fetch,
+            ) else {
+                return Ok(Transformed::no(node));
             };
             swapped = true;
             Ok(Transformed::yes(LogicalPlan::TableScan(replaced)))
         })
         .map(|t| t.data)?;
 
+    // Reported only once the swap took: a scan that stayed a table scan is
+    // not a substitution however admissible the candidate was.
+    if swapped {
+        ask.table.note_scan(report);
+    }
     Ok((rewritten, swapped.then_some(id)))
 }
 
-/// The stored rows a join hash would serve `ask` from, as a table source.
+/// The stored rows a join hash would serve `ask` from, as a table source
+/// over the schema the rows were stored with, plus the report the swap
+/// would produce.
 ///
-/// `None` whenever the rule declines, the rows are absent, or they are not
-/// table-shaped — every one of which leaves the query reading the table.
+/// `None` whenever the rule declines or no usable rows are registered —
+/// either of which leaves the query reading the table.
 fn stored_source(
     ask: &Ask,
     approximate: bool,
     stale: bool,
-) -> Option<(Arc<dyn datafusion::logical_expr::TableSource>, DerivedId)> {
+) -> Option<(
+    Arc<dyn datafusion::logical_expr::TableSource>,
+    DerivedId,
+    SchemaRef,
+    ScanReport,
+)> {
     let table = ask.table;
     let query = query_of(ask, approximate, stale)?;
-    let (id, decision) = table
-        .registry()
-        .read()
-        .ok()?
-        .best(&query, table.graph(), table.prices())
-        .map(|candidate| (candidate.derived.id.clone(), candidate.decision.clone()))?;
+    // The candidate borrows the registry; the guard stays alive across it.
+    let registry = table.registry().read().ok()?;
+    let candidate = registry.best(&query, table.graph(), table.prices())?;
+    let id = candidate.derived.id.clone();
+    let built_at = candidate.derived.source.snapshot;
 
-    // Only a row-shaped substitute serves this. `Use` alone reaches here in
-    // practice — `JoinHash` declares itself non-unionable, so the rule
-    // rejects an appended-to table by name.
-    let Decision::Use(Rewrite::Substitute { rollup: None, .. }) = decision else {
-        return None;
+    // Only a row-shaped substitute serves this. `Use` reaches here when the
+    // snapshot is unchanged; `UseStale` when the session opted in and only
+    // appends happened since the build.
+    let staleness = match &candidate.decision {
+        Decision::Use(Rewrite::Substitute { rollup: None, .. }) => None,
+        Decision::UseStale {
+            rewrite: Rewrite::Substitute { rollup: None, .. },
+            missed,
+        } => Some(Staleness {
+            built_at,
+            missed_files: missed.clone(),
+            missed_bytes: table.bytes_of(missed),
+        }),
+        _ => return None,
     };
 
-    let stored = table.stored(&id)?;
-    if stored.is_empty() {
-        return None;
-    }
-    // Table-shaped, or the join's column references would not resolve.
-    let schema = datafusion::catalog::TableProvider::schema(table);
-    if stored[0].schema() != schema {
-        return None;
-    }
+    // Persisted rows first: they stream through the store rather than
+    // sitting in memory beside the hash table that consumes them.
+    let (source, stored_schema) = match table.row_file_source(&id) {
+        Some(pair) => pair,
+        None => {
+            let stored = table.stored(&id)?;
+            if stored.is_empty() {
+                return None;
+            }
+            let schema = stored[0].schema();
+            let mem = MemTable::try_new(Arc::clone(&schema), vec![stored]).ok()?;
+            (provider_as_source(Arc::new(mem)), schema)
+        }
+    };
 
-    table.note_scan(report(table, &query, &id, ask));
-    let mem = MemTable::try_new(schema, vec![stored]).ok()?;
-    Some((provider_as_source(Arc::new(mem)), id))
+    Some((
+        source,
+        id.clone(),
+        stored_schema,
+        report(table, &query, &id, ask, staleness),
+    ))
 }
 
 /// What the serving path reports.
 ///
 /// `approximate` is deliberately false: a join hash holds every row of the
 /// build side, so the join is exact.
-fn report(table: &QuarryTable, query: &Query, used: &DerivedId, ask: &Ask<'_>) -> ScanReport {
+fn report(
+    table: &QuarryTable,
+    query: &Query,
+    used: &DerivedId,
+    ask: &Ask<'_>,
+    stale: Option<Staleness>,
+) -> ScanReport {
     ScanReport {
         files_read: Default::default(),
         filters: Vec::new(),
@@ -315,7 +454,7 @@ fn report(table: &QuarryTable, query: &Query, used: &DerivedId, ask: &Ask<'_>) -
         also_scanned: Default::default(),
         substituted: true,
         approximate: false,
-        stale: None,
+        stale,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),

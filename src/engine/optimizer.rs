@@ -150,7 +150,7 @@ pub enum BuildKind {
         /// The text ask the index serves.
         ask: TextAsk,
     },
-    /// A join hash: the build-side rows of a join, sorted by the join key.
+    /// A join hash: the build-side rows of a join, bucketed by join key.
     JoinHash {
         /// The join ask the hash serves.
         ask: JoinAsk,

@@ -293,36 +293,52 @@ fn stored_source(
 ) -> Option<(Arc<dyn datafusion::logical_expr::TableSource>, DerivedId)> {
     let table = ask.table;
     let query = query_of(ask, approximate, stale)?;
-    let (id, decision) = table
-        .registry()
-        .read()
-        .ok()?
-        .best(&query, table.graph(), table.prices())
-        .map(|candidate| (candidate.derived.id.clone(), candidate.decision.clone()))?;
+    // The candidate borrows the registry; the guard stays alive across it.
+    let registry = table.registry().read().ok()?;
+    let candidate = registry.best(&query, table.graph(), table.prices())?;
+    let id = candidate.derived.id.clone();
+    let built_at = candidate.derived.source.snapshot;
 
     // A rollup holds partial aggregates, not rows a distance can be computed
-    // against; only a row-shaped substitute serves this. `Use` alone reaches
-    // here in practice — `VectorIndex` declares itself non-unionable, so the
-    // rule rejects an appended-to table by name rather than leaving this to
-    // decline it quietly.
-    let Decision::Use(Rewrite::Substitute { rollup: None, .. }) = decision else {
-        return None;
+    // against; only a row-shaped substitute serves this. `Use` reaches here
+    // when the snapshot is unchanged; `UseStale` when the session opted in
+    // and only appends happened since the build — the answer is exact for
+    // the stored rows and may miss rows added since.
+    let staleness = match &candidate.decision {
+        Decision::Use(Rewrite::Substitute { rollup: None, .. }) => None,
+        Decision::UseStale {
+            rewrite: Rewrite::Substitute { rollup: None, .. },
+            missed,
+        } => Some(super::Staleness {
+            built_at,
+            missed_files: missed.clone(),
+            missed_bytes: table.bytes_of(missed),
+        }),
+        _ => return None,
     };
 
-    let stored = table.stored(&id)?;
-    if stored.is_empty() {
-        return None;
-    }
-    // Table-shaped, or the sort's column reference and the projections above
-    // would not resolve against them.
     let schema = datafusion::catalog::TableProvider::schema(table);
-    if stored[0].schema() != schema {
-        return None;
-    }
+    // Persisted rows first: they stream through the store rather than
+    // sitting in memory beside the sort that consumes them.
+    let source = match table.row_file_source(&id) {
+        Some((source, stored_schema)) => {
+            if stored_schema != schema {
+                return None;
+            }
+            source
+        }
+        None => {
+            let stored = table.stored(&id)?;
+            if stored.is_empty() || stored[0].schema() != schema {
+                return None;
+            }
+            let mem = MemTable::try_new(schema, vec![stored]).ok()?;
+            provider_as_source(Arc::new(mem))
+        }
+    };
 
-    table.note_scan(report(table, &query, &id, ask));
-    let mem = MemTable::try_new(schema, vec![stored]).ok()?;
-    Some((provider_as_source(Arc::new(mem)), id))
+    table.note_scan(report(table, &query, &id, ask, staleness));
+    Some((source, id))
 }
 
 /// What the serving path reports.
@@ -335,6 +351,7 @@ pub(crate) fn report(
     query: &Query,
     used: &DerivedId,
     ask: &Ask<'_>,
+    stale: Option<super::Staleness>,
 ) -> ScanReport {
     ScanReport {
         files_read: Default::default(),
@@ -357,7 +374,7 @@ pub(crate) fn report(
         also_scanned: Default::default(),
         substituted: true,
         approximate: false,
-        stale: None,
+        stale,
         plan_hash: query.plan_hash,
         bytes_if_full_scan: table.live_bytes(),
         fingerprint: crate::workload::Fingerprint::of(query),
